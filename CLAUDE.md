@@ -79,19 +79,16 @@ off で tolerance を満たさず fail するが、release では本番経路と
 - **doc 冒頭の dated header 禁止**: `作成: YYYY-MM-DD`、`改訂: YYYY-MM-DD` 等。
   履歴は git log で見る。ADR のように Status / Date field が doc の意味の一部と
   なる場合は OK。
-- **設計判断 doc (ADR) は `docs/01-decisions/YYYY-MM-DD-<slug>.md`**。連番
+- **設計判断 doc (ADR) は `docs/decisions/YYYY-MM-DD-<slug>.md`**。連番
   (`0NNN-`) は並行 PR で衝突するので使わない。slug は内容トピック。
 - **ADR は現アーキの WHY を残す**。執行済 workflow / 完了済ロードマップを ADR
   に残さない (古くなったら削除して良い、ADR は immutable とは限らない)。
 - **directory tree / 構成図は現状を反映**。「将来こうする」予定や削除済 directory
   を残さない。
 - **dated 検証ブロック禁止**: 「2026-05-11 に X 環境で確認」型の log は
-  `docs/experiments/` 専用、reference doc に混ぜない。
+  reference doc に混ぜない (計測経緯は git log / PR description が担当)。
 - **略語は README の glossary 章で一回だけ定義**。コード内では glossary に登録
   済の略語を素のまま使ってよい。新規略語を増やしたら glossary も更新する。
-
-`docs/experiments/` は計測ログ / 仮説検証経緯の置き場であり、上記制約の対象外
-(Stage N / 日付 / PR 番号を含んでよい history doc)。
 
 ## レビュー観点 checklist
 
@@ -102,6 +99,6 @@ off で tolerance を満たさず fail するが、release では本番経路と
 
 ## 作業前 checklist
 
-- 計測ログ + 仮説検証経緯は `docs/experiments/`、設計判断は `docs/01-decisions/`
+- 設計判断は ADR (`docs/decisions/`) に記録する
 - cuda-oxide / nightly toolchain の構成は壊さない、host 側 unsafe は妥当性を
   コメントで明記する

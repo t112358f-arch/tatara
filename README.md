@@ -49,12 +49,10 @@ GPU crate を exclude した CPU-only check のみ走らせる。
 | `crates/nnue-format/` | NNUE 重みファイル binary IO (header / halfka_psqt / v102 layerstack) |
 | `bins/nnue_train/` | NNUE 本番 trainer (GPU `#[kernel]` 定義はここに inline) |
 | `bins/progress_kpabs_train/` | KP-abs progress trainer (eval 用) |
-| `docs/` | overview / ADR / setup / data layout / kernel catalog |
+| `docs/` | ADR / setup / data layout / kernel catalog |
 
 ## ドキュメント
 
-- [Architecture overview](docs/00-overview.md) — design + リポ構成 + fused kernel
-  戦略
 - [Setup guide](docs/setup.md) — CUDA / LLVM / rustup のインストール、サポート
   GPU マトリクス、CUDA toolkit root 解決
 - [Training quickstart](docs/training-quickstart.md) — PSV データ準備 + 主要
@@ -63,7 +61,7 @@ GPU crate を exclude した CPU-only check のみ走らせる。
   `NNUE_TRAIN_STEP_PROFILE` での自己診断手順
 - [Data layout](docs/data-layout.md) — PSV / progress.bin / .nnue / checkpoint
   の配置・命名規約
-- [ADR (Architecture Decision Records)](docs/01-decisions/) — 設計判断とその
+- [ADR (Architecture Decision Records)](docs/decisions/) — 設計判断とその
   rationale
 - [Fused kernel catalog](docs/kernels/fused-pattern-catalog.md) — どの kernel
   が何を担うか
