@@ -47,7 +47,7 @@
 //! 駆動で順序非依存なので training には影響しない。決定論的順序が必要なら
 //! `cfg.threads = 1` を指定する。
 
-use std::io;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -333,10 +333,24 @@ where
     // 完了を保証する)。同期 backend では実害なしだが、async backend を含めて統一形。
     let mut prev_pending: Option<(Batch, Vec<i32>)> = None;
 
+    // sb 内 batch 進捗 print の頻度 (env var で可変、`0` で disable)。stderr が
+    // TTY なら `\r` で同 line を上書き、それ以外 (pipe / `tee` ファイル等) なら
+    // `\n` で改行して log file が pure text に保たれるようにする。
+    let progress_every = std::env::var("NNUE_TRAIN_BATCH_PROGRESS_EVERY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(128);
+    let progress_terminator = if io::stderr().is_terminal() {
+        '\r'
+    } else {
+        '\n'
+    };
+
     for sb in cfg.start_superbatch..=cfg.end_superbatch {
         let sb_start = Instant::now();
         let mut sb_loss: f64 = 0.0;
         let mut sb_positions: u64 = 0;
+        let mut sb_printed_progress = false;
 
         for batch_idx in 0..cfg.batches_per_superbatch {
             let lr = lr_scheduler.lr(batch_idx, sb);
@@ -358,6 +372,44 @@ where
             prev_pending = Some((batch, buckets));
             sb_loss += loss;
             sb_positions += n_pos as u64;
+
+            // batch 進捗 print: `progress_every` batches ごとに sb 内 pos/s + % +
+            // batch count を stderr に出す。TTY なら `\r` で上書き、pipe なら `\n`
+            // で改行 (`tee` log が editor で binary 判定されないよう)。
+            if progress_every > 0
+                && (batch_idx + 1) % progress_every == 0
+                && batch_idx + 1 < cfg.batches_per_superbatch
+            {
+                let done = batch_idx + 1;
+                let pct = 100.0 * done as f64 / cfg.batches_per_superbatch as f64;
+                let pps = sb_positions as f64 / sb_start.elapsed().as_secs_f64().max(1e-9);
+                let mut stderr = io::stderr().lock();
+                let written = write!(
+                    stderr,
+                    "{}[train] sb {}/{} [{:.1}% ({}/{} batches, {:.0} pos/s)]",
+                    progress_terminator,
+                    sb,
+                    cfg.end_superbatch,
+                    pct,
+                    done,
+                    cfg.batches_per_superbatch,
+                    pps,
+                )
+                .is_ok();
+                if written {
+                    let _ = stderr.flush();
+                    sb_printed_progress = true;
+                }
+            }
+        }
+        // progress line は terminator を **prefix** に置く format で書いている
+        // ため、TTY (`\r` 上書き) でも pipe (`\n` 改行) でも最後の line は末尾
+        // 改行を持たない。sb 完了 println が直後に続くと同一 line に追記されて
+        // しまうので、progress を 1 回でも印字した sb は明示的に改行を入れて
+        // line を terminate する。`sb_printed_progress` で 0 回 sb の余分な
+        // 空行を抑制。
+        if sb_printed_progress {
+            eprintln!();
         }
         // backend が前 step の loss を遅延報告する pipeline 実装 (async loss readback
         // 等) の場合、sb 内最後 batch の loss が未報告のまま残る。`flush_pending_loss`
