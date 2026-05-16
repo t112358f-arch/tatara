@@ -203,7 +203,9 @@ rg -n --type rust 'SAFETY:' -A2
 ```
 
 各 SAFETY コメントが「**なぜ** その unsafe が soundness を保つか」を具体的に
-書いているか確認。「OK」「問題ない」「Stage X と同型」型は NG。
+書いているか確認。「OK」「問題ない」「Stage X と同型」型は NG。述べた根拠が
+結論を論理的に導くかも見る (例: f16 4 要素の 8 byte 整列を「offset が偶数」で
+根拠づけるのは不足、「4 の倍数」が要る)。
 
 ### 3.4 略語の未定義
 
@@ -215,6 +217,22 @@ rg -n --type rust 'SAFETY:' -A2
 GLOSSARY=$(rg -oE '^\| \*\*([A-Z][A-Za-z_]+)\*\*' README.md | sed -E 's/\| \*\*([A-Za-z_]+)\*\*/\1/')
 echo "$GLOSSARY"
 # 新規 PR で登場した略語と突き合わせ
+```
+
+### 3.5 CLI 露出テキスト
+
+clap `#[arg]` / `#[command]` の doc コメントは `--help` に、`Err(...)` /
+`panic!` / `eprintln!` の文字列はエラー時に、いずれも利用者へそのまま表示
+される。開発者でなく利用者が読むものとして確認する:
+
+- rustdoc の intra-doc link を含まない。clap `--help` では解決されず literal で
+  出るため、リンクが要る箇所は平文に直す
+- 内部 dev 用語・未公開シンボル名 (内部 const 名、scaffold 等の作業段階語) を
+  含まない
+
+```bash
+# clap doc コメント中の intra-doc link 候補 (\x60 = backtick)
+rg -n '///.*\[\x60' bins
 ```
 
 ## 4. 命名のルール

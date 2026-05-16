@@ -75,6 +75,11 @@ off で tolerance を満たさず fail するが、release では本番経路と
   移植」、論文 / upstream ライブラリの algorithm 出典)。ただし「準拠」「互換」
   といった検証なしの曖昧な claim は禁止 (情報量ゼロかつ嘘の温床)。
 
+clap の `#[arg]` / `#[command]` doc コメントは `--help` テキストとして、
+`Err(...)` / `panic!` のメッセージはエラー時に、いずれも利用者へそのまま表示
+される。これらに rustdoc の intra-doc link (`--help` では解決されず壊れた
+literal として表示される) や内部シンボル名・作業段階語 (scaffold 等) を書かない。
+
 ## ドキュメント規約
 
 `docs/` / `README.md` / `ATTRIBUTION.md` 等の `.md` も上記コードコメント規約と
