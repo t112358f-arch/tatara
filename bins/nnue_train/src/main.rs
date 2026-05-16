@@ -3569,6 +3569,14 @@ fn compile_ll_to_ptx_via_llc(
     let opt_bc = dir.join(format!("{stem}.opt.bc"));
     let ptx_path = dir.join(format!("{stem}.ptx"));
 
+    // `.ll`→`.ptx` の中間/出力ファイル (linked.bc / opt.bc / .ptx) は stem 固定
+    // パスのため、複数スレッドが同時に compile すると `llc` が書き込み途中の
+    // `.bc` を読んで crash する。`cargo test` は 1 binary のテストを同一プロセスの
+    // 複数スレッドで走らせるので、プロセス内 Mutex で直列化すれば足りる。最初の
+    // スレッドが compile し、後続は lock 取得後に下の mtime cache で skip する。
+    static COMPILE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _compile_guard = COMPILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
     // cache: skip rebuild if .ptx is newer than .ll
     if let (Ok(ll_meta), Ok(ptx_meta)) = (std::fs::metadata(ll_path), std::fs::metadata(&ptx_path))
         && let (Ok(ll_mtime), Ok(ptx_mtime)) = (ll_meta.modified(), ptx_meta.modified())
@@ -3578,9 +3586,10 @@ fn compile_ll_to_ptx_via_llc(
     }
 
     let arch = std::env::var("CUDA_OXIDE_TARGET").unwrap_or_else(|_| "sm_75".to_string());
-    let llvm_link = std::env::var("LLVM_LINK_BIN").unwrap_or_else(|_| "llvm-link-21".to_string());
-    let opt_bin = std::env::var("OPT_BIN").unwrap_or_else(|_| "opt-21".to_string());
-    let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| "llc-21".to_string());
+    let llvm_link =
+        std::env::var("LLVM_LINK_BIN").unwrap_or_else(|_| discover_llvm_tool("llvm-link"));
+    let opt_bin = std::env::var("OPT_BIN").unwrap_or_else(|_| discover_llvm_tool("opt"));
+    let llc_bin = std::env::var("LLC_BIN").unwrap_or_else(|_| discover_llvm_tool("llc"));
     let libdevice = find_libdevice_bc()?;
 
     // module が launch する全 kernel 名。`@<name>` として `.ll` に出ているものを
@@ -3649,6 +3658,27 @@ fn compile_ll_to_ptx_via_llc(
     Ok(ptx_path)
 }
 
+/// `.ll`→`.ptx` 変換に使う LLVM tool 名を解決する。`<tool>-22` → `<tool>-21`
+/// → 無印 `<tool>` の順で `--version` が通る最初の名前を返す (cuda-oxide 本体の
+/// `llc-22 → llc-21` 探索順に揃える)。どれも無ければ `<tool>-21` を返し、spawn
+/// 失敗時に `run_or_err` が導入方法を案内する。`LLVM_LINK_BIN` / `OPT_BIN` /
+/// `LLC_BIN` env が設定されていればそちらが優先される。
+fn discover_llvm_tool(tool: &str) -> String {
+    for suffix in ["-22", "-21", ""] {
+        let name = format!("{tool}{suffix}");
+        let ok = std::process::Command::new(&name)
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ok {
+            return name;
+        }
+    }
+    format!("{tool}-21")
+}
+
 /// `Command::new` + `args` + `status` を 1 行にまとめる helper。
 fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::error::Error>> {
     let status = std::process::Command::new(bin)
@@ -3657,9 +3687,10 @@ fn run_or_err(bin: &str, args: &[&std::ffi::OsStr]) -> Result<(), Box<dyn std::e
         .map_err(|e| {
             format!(
                 "failed to spawn {bin}: {e}. \
-                 LLVM 21 系 (llvm-link-21 / opt-21 / llc-21) を要求 \
-                 (libNVVM が opaque pointer IR を parse できないため)。\
-                 LLVM_LINK_BIN / OPT_BIN / LLC_BIN env で別 binary 指定可。"
+                 .ll→.ptx 変換は LLVM 21+ の llvm-link / opt / llc を使う \
+                 (libNVVM が opaque pointer IR を parse できないため llc 経路)。\
+                 -22 / -21 を自動探索するが、見つからなければ \
+                 LLVM_LINK_BIN / OPT_BIN / LLC_BIN env で明示指定する。"
             )
         })?;
     if !status.success() {
