@@ -96,6 +96,7 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 限らず、アーキテクチャによっては推論部の追加実装をしないとロードできない。
 学習済みの参考 net は
 [GitHub Releases](https://github.com/SH11235/tatara/releases) に添付している。
+自分で net を学習する場合の環境構築は [docs/setup.ja.md](docs/setup.ja.md) を参照。
 
 ## 用語 (glossary)
 

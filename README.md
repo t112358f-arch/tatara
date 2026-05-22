@@ -107,7 +107,8 @@ SCReLU / Pairwise activations are specific to this project, so other shogi
 engines such as YaneuraOu cannot necessarily load it as-is; depending on the
 architecture, some nets need additional inference code before they can be
 loaded. Pre-trained reference nets are attached to the
-[GitHub Releases](https://github.com/SH11235/tatara/releases).
+[GitHub Releases](https://github.com/SH11235/tatara/releases). To train your
+own net, see the [setup guide](docs/setup.md).
 
 ## Glossary
 
