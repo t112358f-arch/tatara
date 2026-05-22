@@ -91,9 +91,10 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
 ## 学習した net の使い方
 
 tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/rshogi)
-エンジンでロードする前提の format。YaneuraOu など他の将棋エンジンとは **互換性が
-ない** — `.bin` header と SCReLU / Pairwise 活性化は本プロジェクト固有で、
-version 駆動の評価関数ローダーは誤読する。学習済みの参考 net は
+エンジンでロードする前提の format。`.bin` header と SCReLU / Pairwise 活性化は
+本プロジェクト固有なので、YaneuraOu など他の将棋エンジンでそのまま読めるとは
+限らず、アーキテクチャによっては推論部の追加実装をしないとロードできない。
+学習済みの参考 net は
 [GitHub Releases](https://github.com/SH11235/tatara/releases) に添付している。
 
 ## 用語 (glossary)

@@ -102,11 +102,12 @@ For building the kernels and running the smoke test, see
 ## Using the trained net
 
 The quantised `.bin` that tatara produces is designed to be loaded by the
-[rshogi](https://github.com/SH11235/rshogi) engine. It is **not** compatible
-with other shogi engines such as YaneuraOu: the `.bin` header and the
-SCReLU / Pairwise activations are specific to this project, so a version-driven
-evaluation-file loader would misread them. Pre-trained reference nets are
-attached to the [GitHub Releases](https://github.com/SH11235/tatara/releases).
+[rshogi](https://github.com/SH11235/rshogi) engine. The `.bin` header and the
+SCReLU / Pairwise activations are specific to this project, so other shogi
+engines such as YaneuraOu cannot necessarily load it as-is; depending on the
+architecture, some nets need additional inference code before they can be
+loaded. Pre-trained reference nets are attached to the
+[GitHub Releases](https://github.com/SH11235/tatara/releases).
 
 ## Glossary
 
