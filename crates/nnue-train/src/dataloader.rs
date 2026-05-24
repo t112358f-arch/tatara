@@ -127,19 +127,13 @@ impl Batch {
         let bi = self.n_positions;
         let row_off = bi * self.max_active;
 
-        // spec は `Copy` なので local に取り出し、`self` の他フィールドを
-        // 借りる closure と借用が衝突しないようにする。
         let spec = self.feature_set;
-        let mut j = 0usize;
-        spec.map_features_board(board, |stm_idx, nstm_idx| {
-            if j < self.max_active {
-                self.stm_indices[row_off + j] = stm_idx as i32;
-                self.nstm_indices[row_off + j] = nstm_idx as i32;
-                j += 1;
-            }
-            // overflow は silent skip (`max_active` は合法局面の駒総数で固定、
-            // 実 PSV では到達不能だが defensive に許容)。
-        });
+        let max_active = self.max_active;
+        let stm_slice = &mut self.stm_indices[row_off..row_off + max_active];
+        let nstm_slice = &mut self.nstm_indices[row_off..row_off + max_active];
+        // 戻り値の write 件数は使わない。`max_active` 越えは silent skip
+        // (合法局面の駒総数固定で実 PSV では到達不能、defensive)。
+        let _ = spec.extract_active_features(board, stm_slice, nstm_slice);
 
         // score / wdl / norm
         self.score[bi] = f32::from(board.score);
