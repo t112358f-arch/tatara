@@ -80,6 +80,16 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
+    // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
+    // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
+    // 非依存に掛かる)、bias wd=0 と同様に許容する。
+    for (name, v) in per_group_optim_flags(cli) {
+        if let Some(v) = v
+            && (!v.is_finite() || v < 0.0)
+        {
+            return Err(format!("{name} must be finite and >= 0 (got {v})").into());
+        }
+    }
     if cli.norm_loss && (!cli.norm_loss_factor.is_finite() || cli.norm_loss_factor < 0.0) {
         return Err(format!(
             "--norm-loss-factor must be finite and >= 0 (got {})",
@@ -261,6 +271,31 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     let init_spec = build_layerstack_init_spec(cli);
+    // optimizer の param-group (ft / dense / bias) ごとの weight_decay と lr_mult を
+    // CLI から resolve する。per-group flag 未指定の group は大域 --weight-decay と
+    // lr_mult=1.0 にフォールバック → 全 flag 未指定なら従来挙動と bit-identical。
+    let optim_groups = OptimGroupConfig::resolve(
+        cli.weight_decay,
+        cli.ft_weight_decay,
+        cli.dense_weight_decay,
+        cli.bias_weight_decay,
+        cli.ft_lr_mult,
+        cli.dense_lr_mult,
+        cli.bias_lr_mult,
+    );
+    let per_group_recorded = per_group_optim_overridden(cli);
+    if per_group_recorded {
+        println!(
+            "[train] per-group optim: ft(wd={}, lr_mult={}) dense(wd={}, lr_mult={}) \
+             bias(wd={}, lr_mult={})",
+            optim_groups.ft.weight_decay,
+            optim_groups.ft.lr_mult,
+            optim_groups.dense.weight_decay,
+            optim_groups.dense.lr_mult,
+            optim_groups.bias.weight_decay,
+            optim_groups.bias.lr_mult,
+        );
+    }
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
     let mut trainer = GpuTrainer::new(
         &ctx,
@@ -274,7 +309,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         ft_fp16_out,
         fp16_opt_state,
         feature_set,
-        cli.weight_decay,
+        optim_groups,
         norm_loss_factor,
         psqt_init_vec.as_deref(),
         &init_spec,
@@ -599,6 +634,26 @@ pub(crate) fn finite_or_zero(x: f32) -> f32 {
     if x.is_finite() { x } else { 0.0 }
 }
 
+/// per-group optimizer override flag の `(CLI 名, 指定値)` 一覧。layerstack 経路の
+/// 値 validation と simple 経路の reject が同じ表を参照する (flag 追加時の漏れ防止)。
+pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 6] {
+    [
+        ("--ft-weight-decay", cli.ft_weight_decay),
+        ("--dense-weight-decay", cli.dense_weight_decay),
+        ("--bias-weight-decay", cli.bias_weight_decay),
+        ("--ft-lr-mult", cli.ft_lr_mult),
+        ("--dense-lr-mult", cli.dense_lr_mult),
+        ("--bias-lr-mult", cli.bias_lr_mult),
+    ]
+}
+
+/// per-group optimizer override flag が一つでも指定されているか。`true` のとき
+/// log と experiment.json に有効 per-group 値を記録する (全 `None` の既定 run では
+/// 記録を省き、大域 `weight_decay` フィールドのみで足りる)。
+pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
+    per_group_optim_flags(cli).iter().any(|(_, v)| v.is_some())
+}
+
 /// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
 /// CLI フラグの finite / 正値チェックは利用者向けのエラーメッセージのため、
 /// layerstack / simple 両 entry で共有するこの helper で前段に行う。
@@ -852,6 +907,18 @@ pub(crate) fn build_experiment_logger(
     });
 
     let is_wrm = cli.win_rate_model;
+    // per-group override 指定時のみ experiment.json に有効 per-group 値を記録する。
+    // resolve は CLI のみに依存する純関数 (`run_training` の trainer 構築と同じ入力)。
+    let per_group_recorded = per_group_optim_overridden(cli);
+    let optim_groups = OptimGroupConfig::resolve(
+        cli.weight_decay,
+        cli.ft_weight_decay,
+        cli.dense_weight_decay,
+        cli.bias_weight_decay,
+        cli.ft_lr_mult,
+        cli.dense_lr_mult,
+        cli.bias_lr_mult,
+    );
     let params = Params {
         architecture: layerstack_architecture(
             layerstack.ft_out,
@@ -882,6 +949,14 @@ pub(crate) fn build_experiment_logger(
         end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
+        // per-group override 指定時のみ resolve 済の有効値を記録 (全未指定の既定 run
+        // では省略、大域 weight_decay フィールドで足りる)。
+        ft_weight_decay: per_group_recorded.then_some(optim_groups.ft.weight_decay),
+        dense_weight_decay: per_group_recorded.then_some(optim_groups.dense.weight_decay),
+        bias_weight_decay: per_group_recorded.then_some(optim_groups.bias.weight_decay),
+        ft_lr_mult: per_group_recorded.then_some(optim_groups.ft.lr_mult),
+        dense_lr_mult: per_group_recorded.then_some(optim_groups.dense.lr_mult),
+        bias_lr_mult: per_group_recorded.then_some(optim_groups.bias.lr_mult),
         norm_loss_factor: cli
             .norm_loss
             .then_some(cli.norm_loss_factor)
@@ -1032,7 +1107,14 @@ pub(crate) fn build_experiment_logger_simple(
         end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
-        // simple subcommand は norm loss 非対応 (`run_training_simple` で reject 済)。
+        // simple subcommand は per-group optimizer 非対応 (`run_simple_training` で reject 済)。
+        ft_weight_decay: None,
+        dense_weight_decay: None,
+        bias_weight_decay: None,
+        ft_lr_mult: None,
+        dense_lr_mult: None,
+        bias_lr_mult: None,
+        // simple subcommand は norm loss 非対応 (`run_simple_training` で reject 済)。
         norm_loss_factor: None,
         qa: id.activation.qa(),
         qb: nnue_format::simple_weights::QB,
@@ -1195,6 +1277,15 @@ pub(crate) fn run_simple_training(
             "--norm-loss is only supported by the layer-stack trainer, not the simple subcommand"
                 .into(),
         );
+    }
+    // per-group flag は global 定義なので parse は通るが、simple trainer は単一
+    // weight_decay 経路のみ。silent no-op (指定 hyperparameter が効かないまま走る)
+    // を防ぐため明示 reject する。
+    if let Some((name, _)) = per_group_optim_flags(cli).iter().find(|(_, v)| v.is_some()) {
+        return Err(format!(
+            "{name} is only supported by the layer-stack trainer, not the simple subcommand"
+        )
+        .into());
     }
     if !cli.batch_size.is_multiple_of(16) {
         return Err(format!(
@@ -1447,5 +1538,46 @@ mod tests {
         // `--init-from` は重みを上書きするので override 指定は実 weight に効かない。
         let cli = parse(&["--init-ft", "uniform:fanin", "--init-from", "base.bin"]);
         assert_eq!(init_summary_for_log(&cli), None);
+    }
+
+    /// per-group optimizer flag の検出 (`per_group_optim_flags` /
+    /// `per_group_optim_overridden`)。既定 run では未指定、いずれか 1 つでも指定すると
+    /// overridden になり、simple 経路の reject が指定 flag 名を特定できる。
+    #[test]
+    fn per_group_optim_flag_detection() {
+        let cli = parse(&[]);
+        assert!(!per_group_optim_overridden(&cli));
+        assert!(per_group_optim_flags(&cli).iter().all(|(_, v)| v.is_none()));
+
+        let cli = parse(&["--bias-weight-decay", "0"]);
+        assert!(per_group_optim_overridden(&cli));
+        let specified: Vec<&str> = per_group_optim_flags(&cli)
+            .iter()
+            .filter(|(_, v)| v.is_some())
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(specified, ["--bias-weight-decay"]);
+
+        // 6 flag 全指定で表の (CLI 名 → Cli field) 配線を値で照合する (table の
+        // copy-paste 取り違えを検出)。
+        let cli = parse(&[
+            "--ft-weight-decay",
+            "0.1",
+            "--dense-weight-decay",
+            "0.2",
+            "--bias-weight-decay",
+            "0.3",
+            "--ft-lr-mult",
+            "1.5",
+            "--dense-lr-mult",
+            "2.0",
+            "--bias-lr-mult",
+            "0.5",
+        ]);
+        let values: Vec<f32> = per_group_optim_flags(&cli)
+            .iter()
+            .map(|(_, v)| v.expect("all six flags set"))
+            .collect();
+        assert_eq!(values, [0.1, 0.2, 0.3, 1.5, 2.0, 0.5]);
     }
 }
