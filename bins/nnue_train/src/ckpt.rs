@@ -79,7 +79,11 @@ pub(crate) const RAW_CKPT_MAGIC: [u8; 4] = *b"RNRC";
 ///   through dense fold / reduce kernels, not through sparse indices). The
 ///   flag pins whether the checkpoint's FT weight rows include the
 ///   training-time virtual factorizer block; resuming across
-///   `--ft-factorize` on/off is rejected.
+///   `--ft-factorize` on/off is rejected. Some factorized v6 files record
+///   `2 × max_active` in this field (written by an implementation that
+///   routed virtual features through the sparse index stream); the reader
+///   accepts that value too, because the tensor payload is identical either
+///   way.
 ///
 /// `load_raw_checkpoint` accepts versions 1..=6. Version 1 is interpreted as
 /// `halfka-hm-merged`; versions 1..=3 predate the arch-kind header and are
@@ -342,8 +346,8 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                  requested '{want_name}' (cannot resume across feature sets)"
             )));
         }
-        // 次元照合より先に factorize 状態を見る (on/off 跨ぎは ft_in /
-        // max_active も必ずずれるが、原因が読めるエラーを先に出す)。
+        // 次元照合より先に factorize 状態を見る (on/off 跨ぎは ft_in も必ず
+        // ずれるが、原因が読めるエラーを先に出す)。
         if ckpt_ft_factorize != want.ft_factorize() {
             return Err(invalid_data(format!(
                 "raw checkpoint ft-factorize mismatch: checkpoint {ckpt_ft_factorize}, \
@@ -363,7 +367,15 @@ pub(crate) fn read_raw_ckpt_header<R: std::io::Read>(
                 expected.ft_out
             )));
         }
-        if ckpt_max_active != want.max_active() as u64 {
+        // factorize 有効時は base に加え 2×base も受理する: v6 の factorized
+        // file には、仮想特徴を sparse index 列に流す実装が書いた 2×base 値の
+        // 個体が存在する (RAW_CKPT_VERSION doc 参照)。tensor payload (group 長
+        // は train_ft_in 由来) は max_active 値に依らず同一で、この field の差
+        // だけで読める checkpoint を弾く理由がない。version 番号では弁別でき
+        // ないため値で受理する。
+        let legacy_factorized_max_active =
+            want.ft_factorize() && ckpt_max_active == 2 * want.max_active() as u64;
+        if ckpt_max_active != want.max_active() as u64 && !legacy_factorized_max_active {
             return Err(invalid_data(format!(
                 "raw checkpoint max_active mismatch: got {ckpt_max_active}, want {}",
                 want.max_active()
