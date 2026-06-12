@@ -16,19 +16,20 @@ use crate::trainer_common::BatchData;
 use crate::trainer_layerstack::{GpuTrainer, OptimGroupConfig};
 
 #[test]
-fn ft_factorize_batch_to_batchdata_uses_train_stride() {
-    // 本番 dataloader 経路 (`Batch` → `BatchData::from_batch_ref`) の stride
-    // 照合が factorized spec の train 値で整合することを検証する (GPU 不要)。
-    // GPU テスト群は `BatchData::smoke_dummy` で `Batch` 型を bypass するため、
-    // この変換だけは単体で押さえる。
+fn ft_factorize_batch_to_batchdata_uses_base_stride() {
+    // 本番 dataloader 経路 (`Batch` → `BatchData::from_batch_ref`) の stride が
+    // factorized spec でも base `max_active` であることを検証する (sparse index
+    // 列は factorizer 非依存、GPU 不要)。GPU テスト群は
+    // `BatchData::smoke_dummy` で `Batch` 型を bypass するため、この変換だけは
+    // 単体で押さえる。
     let fact = FeatureSet::HalfKaHmMerged.spec().with_ft_factorize();
     let mut batch = Batch::with_capacity(4, fact);
     batch.n_positions = 2;
     let bucket_idx = [0_i32, 0];
     let data = BatchData::from_batch_ref(&batch, &bucket_idx);
     assert_eq!(data.n_pos, 2);
-    assert_eq!(data.stm_indices.len(), 2 * fact.train_max_active());
-    assert_eq!(data.nstm_indices.len(), 2 * fact.train_max_active());
+    assert_eq!(data.stm_indices.len(), 2 * fact.max_active());
+    assert_eq!(data.nstm_indices.len(), 2 * fact.max_active());
 }
 
 const B: usize = 64;
@@ -94,18 +95,22 @@ fn ft_factorize_first_step_matches_off_and_virtual_rows_learn()
     let ctx = CudaContext::new(0)?;
     let base = FeatureSet::HalfKaHmMerged.spec();
     let fact = base.with_ft_factorize();
-    // smoke_dummy は実 index 列を factorizer 非依存に生成し、ON では仮想 index を
-    // append する — ON / OFF の batch は同じ実特徴を持つ。VRAM 節約のため
-    // trainer は逐次生成し同時保持しない。
+    // index 列は factorizer 非依存 (smoke_dummy も ON / OFF で同一の実 index 列を
+    // 返す) — ON の仮想行は trainer の fold / reduce kernel だけが配線する。VRAM
+    // 節約のため trainer は逐次生成し同時保持しない。`sync_ft_forward_weights` は
+    // production (`run_training`) と同じく最初の forward 前に必須 (ON の forward
+    // が読む comb は constructor では zero のまま)。
     let b_off = BatchData::smoke_dummy(B, base);
     let b_on = BatchData::smoke_dummy(B, fact);
     let (loss_off, w_off) = {
         let mut t_off = make_trainer(&ctx, base)?;
+        t_off.sync_ft_forward_weights()?;
         let loss = t_off.step(&b_off.as_ref(), 1e-3, 0.5, LOSS)?;
         (loss, t_off.to_layerstack_weights()?)
     };
     let (loss_on, w_on) = {
         let mut t_on = make_trainer(&ctx, fact)?;
+        t_on.sync_ft_forward_weights()?;
         let loss = t_on.step(&b_on.as_ref(), 1e-3, 0.5, LOSS)?;
         (loss, t_on.to_layerstack_weights()?)
     };
@@ -147,6 +152,7 @@ fn ft_factorize_quantised_export_loads_as_base_net() -> Result<(), Box<dyn std::
     let ctx = CudaContext::new(0)?;
     let base = FeatureSet::HalfKaHmMerged.spec();
     let mut t_on = make_trainer(&ctx, base.with_ft_factorize())?;
+    t_on.sync_ft_forward_weights()?;
     let b_on = BatchData::smoke_dummy(B, base.with_ft_factorize());
     let _ = t_on.step(&b_on.as_ref(), 1e-3, 0.5, LOSS)?;
 
