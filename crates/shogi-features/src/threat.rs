@@ -44,6 +44,7 @@ pub const fn threat_dimensions_of(profile: ThreatProfile) -> usize {
         ThreatProfile::Full => 216_720,
         ThreatProfile::SameClass => 192_640,
         ThreatProfile::SameClassMajorPawn => 173_568,
+        ThreatProfile::StepAttacker => 33_408,
         ThreatProfile::CrossSide => 96_320,
     }
 }
@@ -546,6 +547,8 @@ static SHARED_SAME_CLASS: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::SameClass));
 static SHARED_SAME_CLASS_MAJOR_PAWN: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::SameClassMajorPawn));
+static SHARED_STEP_ATTACKER: LazyLock<ThreatIndexer> =
+    LazyLock::new(|| ThreatIndexer::new(ThreatProfile::StepAttacker));
 static SHARED_CROSS_SIDE: LazyLock<ThreatIndexer> =
     LazyLock::new(|| ThreatIndexer::new(ThreatProfile::CrossSide));
 
@@ -631,6 +634,7 @@ impl ThreatIndexer {
             ThreatProfile::Full => &SHARED_FULL,
             ThreatProfile::SameClass => &SHARED_SAME_CLASS,
             ThreatProfile::SameClassMajorPawn => &SHARED_SAME_CLASS_MAJOR_PAWN,
+            ThreatProfile::StepAttacker => &SHARED_STEP_ATTACKER,
             ThreatProfile::CrossSide => &SHARED_CROSS_SIDE,
         }
     }
@@ -900,6 +904,10 @@ mod tests {
             173_568
         );
         assert_eq!(
+            ThreatIndexer::new(ThreatProfile::StepAttacker).threat_dimensions(),
+            33_408
+        );
+        assert_eq!(
             ThreatIndexer::new(ThreatProfile::CrossSide).threat_dimensions(),
             96_320
         );
@@ -911,6 +919,7 @@ mod tests {
             ThreatProfile::Full,
             ThreatProfile::SameClass,
             ThreatProfile::SameClassMajorPawn,
+            ThreatProfile::StepAttacker,
             ThreatProfile::CrossSide,
         ] {
             assert_eq!(
@@ -1036,6 +1045,7 @@ mod tests {
             ThreatProfile::Full,
             ThreatProfile::SameClass,
             ThreatProfile::SameClassMajorPawn,
+            ThreatProfile::StepAttacker,
             ThreatProfile::CrossSide,
         ] {
             assert_indices_in_range(profile, &startpos_board());

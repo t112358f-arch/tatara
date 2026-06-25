@@ -221,6 +221,7 @@ const fn threat_profile_hash(profile: ThreatProfile) -> u32 {
         ThreatProfile::Full => fnv1a32("threat-full"),
         ThreatProfile::SameClass => fnv1a32("threat-same-class"),
         ThreatProfile::SameClassMajorPawn => fnv1a32("threat-same-class-major-pawn"),
+        ThreatProfile::StepAttacker => fnv1a32("threat-step-attacker"),
         ThreatProfile::CrossSide => fnv1a32("threat-cross-side"),
     }
 }
@@ -934,10 +935,11 @@ mod tests {
 
     // ---- Threat 連結 ----
 
-    const ALL_PROFILES: [ThreatProfile; 4] = [
+    const ALL_PROFILES: [ThreatProfile; 5] = [
         ThreatProfile::Full,
         ThreatProfile::SameClass,
         ThreatProfile::SameClassMajorPawn,
+        ThreatProfile::StepAttacker,
         ThreatProfile::CrossSide,
     ];
 
@@ -958,6 +960,7 @@ mod tests {
             (ThreatProfile::Full, 216_720usize),
             (ThreatProfile::SameClass, 192_640),
             (ThreatProfile::SameClassMajorPawn, 173_568),
+            (ThreatProfile::StepAttacker, 33_408),
             (ThreatProfile::CrossSide, 96_320),
         ];
         for fs in FeatureSet::ALL {
@@ -977,7 +980,7 @@ mod tests {
 
     #[test]
     fn threat_profile_hashes_keep_all_specs_distinct() {
-        // 全 base(5) × {off + 4 profile} = 25 通りの合成 feature_hash が pairwise
+        // 全 base(5) × {off + 5 profile} = 30 通りの合成 feature_hash が pairwise
         // distinct (profile compaction で row の意味が変わるため load 時に弾ける)。
         let mut seen = Vec::new();
         for fs in FeatureSet::ALL {
@@ -998,7 +1001,7 @@ mod tests {
         let n = seen.len();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (25 通り)");
+        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (30 通り)");
     }
 
     #[test]
