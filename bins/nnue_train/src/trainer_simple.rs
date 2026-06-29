@@ -397,6 +397,22 @@ impl SimpleGpuTrainer {
             )
             .into());
         }
+        // FT bias grad の per-output tile reduction (`simple_bias_grad_dual[_fp16]`、CReLU /
+        // SCReLU 経路のみ) は `block_dim == ft_out` で起動するため、ft_out が CUDA の block 上限
+        // 1024 を超えると launch できない (opaque な CUDA_ERROR_INVALID_VALUE になる前に明示
+        // reject する)。Pairwise は FT bias grad を `ft_post_perspective_grad[_fp16]` に融合し本
+        // launch を使わないため、この制約は課さない。
+        if matches!(
+            id.activation,
+            SimpleActivation::CReLU | SimpleActivation::SCReLU
+        ) && ft_out > 1024
+        {
+            return Err(format!(
+                "SimpleGpuTrainer: ft_out {ft_out} must be <= 1024 for CReLU/SCReLU \
+                 (FT bias grad reduction launches one thread per output)"
+            )
+            .into());
+        }
         // pairwise の `half = ft_out / 2` 分割が割り切れることを明示確認する
         // (上の 4 の倍数チェックで保証済の不変条件、将来 4→2 緩和時の保険)。
         debug_assert!(
@@ -1670,12 +1686,16 @@ impl SimpleGpuTrainer {
         } else {
             1.0_f32 // unused on FP32 path
         };
-        // FT bias grad: CReLU / SCReLU は per-cell に stm + nstm のローカル和を作って
-        // atomic add 1 回で `ft_b_grad[oi]` に accumulate する (`simple_bias_grad_dual`、
-        // atomic contention は B * ft_dim 回で stm/nstm 別 launch の半分)。Pairwise は
-        // `ft_post_perspective_grad[_fp16]` が `dft_*_out` 書き込みと同 pass で同値を
-        // `ft_b_grad` へ accumulate 済 (FT bias grad = pre-activation 勾配 dft の batch 和)
-        // のため、別 launch しない。
+        // FT bias grad: per-output tile reduction。thread `oi` が出力 oi を専有し、自 block の
+        // `items` positions を register 累積してから `ft_b_grad[oi]` へ atomic 1 回
+        // (`simple_bias_grad_dual[_fp16]`)。global atomic contention は ceil(B/items) * ft_dim で、
+        // 1 thread 1 cell が直接 atomic add する素朴版 (B * ft_dim) より少ない。Pairwise は
+        // `ft_post_perspective_grad[_fp16]` が
+        // `dft_*_out` 書き込みと同 pass で同値を `ft_b_grad` へ accumulate 済 (FT bias grad =
+        // pre-activation 勾配 dft の batch 和) のため、別 launch しない。
+        // block_dim == ft_out で thread→output を対応付ける (ft_out ≤ 1024 を前提)。
+        let bias_grad_items = 64_u32;
+        let bias_grad_blocks = b_u32.div_ceil(bias_grad_items);
         match self.id.activation {
             SimpleActivation::Pairwise => {}
             SimpleActivation::CReLU | SimpleActivation::SCReLU => {
@@ -1692,23 +1712,31 @@ impl SimpleGpuTrainer {
                         .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
                     cuda_launch! {
                         kernel: simple_bias_grad_dual_fp16, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        config: LaunchConfig {
+                            grid_dim: (bias_grad_blocks, 1, 1),
+                            block_dim: (ft_out_u32, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
                         args: [
                             slice(dft_stm_out_h),
                             slice(dft_nstm_out_h),
                             slice(self.ft_b_grad),
-                            b_u32, ft_out_u32, dft_inv_scale_fp16
+                            b_u32, ft_out_u32, dft_inv_scale_fp16, bias_grad_items
                         ]
                     }?;
                 } else {
                     cuda_launch! {
                         kernel: simple_bias_grad_dual, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_n),
+                        config: LaunchConfig {
+                            grid_dim: (bias_grad_blocks, 1, 1),
+                            block_dim: (ft_out_u32, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
                         args: [
                             slice(self.ws.dft_stm_out),
                             slice(self.ws.dft_nstm_out),
                             slice(self.ft_b_grad),
-                            b_u32, ft_out_u32
+                            b_u32, ft_out_u32, bias_grad_items
                         ]
                     }?;
                 }
