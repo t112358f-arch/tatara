@@ -390,6 +390,12 @@ impl SimpleGpuTrainer {
         let ft_out = id.ft_out;
         let l1_out = id.l1_out;
         let l2_out = id.l2_out;
+        // ft_out == 0 は FT 出力が無い退化アーキ。`is_multiple_of(4)` は 0 を通すため
+        // 明示的に弾く。FT bias grad launch の grid.y = ceil(ft_out / min(ft_out, 1024)) が
+        // 0 除算 panic になるのも防ぐ (CLI 経由でなく new を直接呼ぶ test / smoke 経路の保険)。
+        if ft_out == 0 {
+            return Err("SimpleGpuTrainer: ft_out must be greater than 0".into());
+        }
         // sparse_ft_forward は 1 thread = 4 row なので ft_out が 4 の倍数必須。
         // Simple の preset (256/512/1024) は全部 4 の倍数だが、`--l1` override で
         // 4 の倍数でない値が来る可能性があるので early reject する。4 の倍数性は
@@ -398,22 +404,6 @@ impl SimpleGpuTrainer {
             return Err(format!(
                 "SimpleGpuTrainer: ft_out {ft_out} must be a multiple of 4 \
                  (sparse_ft_forward processes 4 rows per thread)"
-            )
-            .into());
-        }
-        // FT bias grad の per-output tile reduction (`simple_bias_grad_dual[_fp16]`、CReLU /
-        // SCReLU 経路のみ) は `block_dim == ft_out` で起動するため、ft_out が CUDA の block 上限
-        // 1024 を超えると launch できない (opaque な CUDA_ERROR_INVALID_VALUE になる前に明示
-        // reject する)。Pairwise は FT bias grad を `ft_post_perspective_grad[_fp16]` に融合し本
-        // launch を使わないため、この制約は課さない。
-        if matches!(
-            id.activation,
-            SimpleActivation::CReLU | SimpleActivation::SCReLU
-        ) && ft_out > 1024
-        {
-            return Err(format!(
-                "SimpleGpuTrainer: ft_out {ft_out} must be <= 1024 for CReLU/SCReLU \
-                 (FT bias grad reduction launches one thread per output)"
             )
             .into());
         }
@@ -1719,9 +1709,13 @@ impl SimpleGpuTrainer {
         // `ft_post_perspective_grad[_fp16]` が
         // `dft_*_out` 書き込みと同 pass で同値を `ft_b_grad` へ accumulate 済 (FT bias grad =
         // pre-activation 勾配 dft の batch 和) のため、別 launch しない。
-        // block_dim == ft_out で thread→output を対応付ける (ft_out ≤ 1024 を前提)。
+        // `block_dim = min(ft_out, 1024)`・`grid.y = ceil(ft_out / block_dim)` の 2D grid で
+        // thread→output を対応付ける (grid.x = position tile、grid.y = output tile)。output を y
+        // タイルに割るので ft_out が CUDA の block 上限 1024 を超えても起動できる。
         let bias_grad_items = 64_u32;
         let bias_grad_blocks = b_u32.div_ceil(bias_grad_items);
+        let bias_grad_block_dim = ft_out_u32.min(1024);
+        let bias_grad_out_tiles = ft_out_u32.div_ceil(bias_grad_block_dim);
         match self.id.activation {
             SimpleActivation::Pairwise => {}
             SimpleActivation::CReLU | SimpleActivation::SCReLU => {
@@ -1739,8 +1733,8 @@ impl SimpleGpuTrainer {
                     cuda_launch! {
                         kernel: simple_bias_grad_dual_fp16, stream: self.stream, module: self.module,
                         config: LaunchConfig {
-                            grid_dim: (bias_grad_blocks, 1, 1),
-                            block_dim: (ft_out_u32, 1, 1),
+                            grid_dim: (bias_grad_blocks, bias_grad_out_tiles, 1),
+                            block_dim: (bias_grad_block_dim, 1, 1),
                             shared_mem_bytes: 0,
                         },
                         args: [
@@ -1754,8 +1748,8 @@ impl SimpleGpuTrainer {
                     cuda_launch! {
                         kernel: simple_bias_grad_dual, stream: self.stream, module: self.module,
                         config: LaunchConfig {
-                            grid_dim: (bias_grad_blocks, 1, 1),
-                            block_dim: (ft_out_u32, 1, 1),
+                            grid_dim: (bias_grad_blocks, bias_grad_out_tiles, 1),
+                            block_dim: (bias_grad_block_dim, 1, 1),
                             shared_mem_bytes: 0,
                         },
                         args: [
