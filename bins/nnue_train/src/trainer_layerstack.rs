@@ -2616,7 +2616,8 @@ impl GpuTrainer {
         // Σ_o dl1_total_sorted[b][o] * w[bucket][o][i]。sorted で計算した dx を bucket_perm で
         // original order に直接 scatter して dcombined_from_l1 へ書き、sorted dx の materialize +
         // 別 inverse-permute kernel の DRAM roundtrip を省く。padding 行 (perm=-1) は write skip。
-        // dcombined_from_l1 は全 real row が書かれる (perm は全 batch row を覆う bijection)。
+        // dcombined_from_l1 は全 real row が書かれる (perm の real entry が原本 batch row を
+        // 1 対 1 で覆うため。padding 行は -1 で上記の write skip 対象)。
         // 16-row tile あたり w[bucket] を 1 回 shared load して L2 trip を削減する。
         // grid = (in-tile = ft_out/16, batch-tile = padded_b/16)。
         cuda_launch! {
