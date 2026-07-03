@@ -51,8 +51,8 @@ use clap::Parser;
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU64};
 use cuda_device::{DisjointSlice, kernel, thread};
 use gpu_runtime::{
-    BLOCK_DIM, CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch,
-    grid_dim_1d,
+    BLOCK_DIM, CudaContext, CudaEvent, CudaModule, CudaStream, DeviceBuffer, LaunchConfig,
+    cuda_launch, grid_dim_1d,
 };
 use progress_kpabs_train::host::{
     ADAM_BETA1, ADAM_BETA2, ADAM_EPS, MAX_INDS_PER_POS,
@@ -62,6 +62,37 @@ use progress_kpabs_train::host::{
     progress_bin::{read_progress_bin, write_progress_bin},
 };
 use shogi_features::SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS;
+
+const INITIAL_POSITIONS_PER_GAME: usize = 256;
+
+fn copy_host_to_device_async<T>(
+    stream: &CudaStream,
+    dst: &DeviceBuffer<T>,
+    src: &[T],
+) -> gpu_runtime::Result<()> {
+    assert!(
+        src.len() <= dst.len(),
+        "host input length {} exceeds device capacity {}",
+        src.len(),
+        dst.len()
+    );
+    let bytes = std::mem::size_of_val(src);
+    if bytes == 0 {
+        return Ok(());
+    }
+    // SAFETY: `dst` は `stream` と同じ context の確保済み device buffer で、直上の
+    // assert により `bytes` は容量内。転送元 slice は H2D 発行後に record する
+    // `GpuTrainer::input_upload_done` の同期まで生存し、書き換えられない。
+    unsafe {
+        cuda_core::memory::memcpy_htod_async(
+            dst.cu_deviceptr(),
+            src.as_ptr(),
+            bytes,
+            stream.cu_stream(),
+        )?;
+    }
+    Ok(())
+}
 
 /// Forward kernel (KP-abs sigmoid prediction per position)。
 ///
@@ -311,11 +342,8 @@ fn load_kernel_module_with_fallback(
 /// - `loss_acc`: `DeviceBuffer<f64>` (size = 1)
 /// - `hist`: `DeviceBuffer<u64>` (size = 8)
 ///
-/// 入力 (`indices` / `targets` / `per_pos_norm` / `preds`) は `step` /
-/// `eval_forward` 内で `DeviceBuffer::from_host` / `zeroed` する (scratch reuse
-/// は cuda-oxide の `DeviceBuffer<T>::from_host` が新規 allocation のみ提供
-/// するため未実装、`Stream::memcpy_h2d` を直接呼び出す形で将来再利用化する
-/// 想定の TODO)。
+/// 入力 (`indices` / `targets` / `per_pos_norm`) と `preds` は起動時に確保し、
+/// 各 batch では同一 stream 上の H2D と kernel launch に再利用する。
 struct GpuTrainer {
     stream: std::sync::Arc<CudaStream>,
     module: std::sync::Arc<CudaModule>,
@@ -326,6 +354,12 @@ struct GpuTrainer {
     grad: DeviceBuffer<f32>,
     loss_acc: DeviceBuffer<f64>,
     hist: DeviceBuffer<u64>,
+    indices: DeviceBuffer<i32>,
+    targets: DeviceBuffer<f32>,
+    per_pos_norm: DeviceBuffer<f32>,
+    preds: DeviceBuffer<f32>,
+    input_capacity: usize,
+    input_upload_done: CudaEvent,
 
     /// Adam の `beta^t` 累積値 (`bc1 = 1 - beta1_pow` を kernel に渡す)。
     beta1_pow: f32,
@@ -337,6 +371,7 @@ impl GpuTrainer {
     fn new(
         ctx: &std::sync::Arc<CudaContext>,
         init_weights: Option<&[f32]>,
+        games_per_step: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let stream = ctx.default_stream();
         let module = load_kernel_module_with_fallback(ctx, "progress_kpabs_train")?;
@@ -358,6 +393,18 @@ impl GpuTrainer {
         let grad = DeviceBuffer::<f32>::zeroed(&stream, n)?;
         let loss_acc = DeviceBuffer::<f64>::zeroed(&stream, 1)?;
         let hist = DeviceBuffer::<u64>::zeroed(&stream, 8)?;
+        let input_capacity = games_per_step
+            .checked_mul(INITIAL_POSITIONS_PER_GAME)
+            .ok_or("input buffer capacity overflow")?
+            .max(1);
+        let indices_len = input_capacity
+            .checked_mul(MAX_INDS_PER_POS)
+            .ok_or("index buffer capacity overflow")?;
+        let indices = DeviceBuffer::<i32>::zeroed(&stream, indices_len)?;
+        let targets = DeviceBuffer::<f32>::zeroed(&stream, input_capacity)?;
+        let per_pos_norm = DeviceBuffer::<f32>::zeroed(&stream, input_capacity)?;
+        let preds = DeviceBuffer::<f32>::zeroed(&stream, input_capacity)?;
+        let input_upload_done = ctx.new_event(None)?;
 
         Ok(Self {
             stream,
@@ -368,6 +415,12 @@ impl GpuTrainer {
             grad,
             loss_acc,
             hist,
+            indices,
+            targets,
+            per_pos_norm,
+            preds,
+            input_capacity,
+            input_upload_done,
             beta1_pow: 1.0,
             beta2_pow: 1.0,
         })
@@ -375,9 +428,41 @@ impl GpuTrainer {
 
     /// `loss_acc` / `hist` を 0 に reset する (epoch 開始時 / log 区間切り替え時)。
     fn zero_loss_hist(&mut self) -> gpu_runtime::Result<()> {
-        // `DeviceBuffer<T>::zeroed` で作り直すのが一番素直 (memset より移植性が高い)。
-        self.loss_acc = DeviceBuffer::<f64>::zeroed(&self.stream, 1)?;
-        self.hist = DeviceBuffer::<u64>::zeroed(&self.stream, 8)?;
+        // SAFETY: 両 pointer は `self.stream` と同じ context の生存中の buffer を指し、
+        // byte count は各 buffer が報告する確保領域全体の大きさ。
+        unsafe {
+            cuda_core::memory::memset_d8_async(
+                self.loss_acc.cu_deviceptr(),
+                0,
+                self.loss_acc.num_bytes(),
+                self.stream.cu_stream(),
+            )?;
+            cuda_core::memory::memset_d8_async(
+                self.hist.cu_deviceptr(),
+                0,
+                self.hist.num_bytes(),
+                self.stream.cu_stream(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_input_capacity(&mut self, n_pos: usize) -> Result<(), Box<dyn std::error::Error>> {
+        if n_pos <= self.input_capacity {
+            return Ok(());
+        }
+        self.stream.synchronize()?;
+        let capacity = n_pos
+            .checked_next_power_of_two()
+            .ok_or("input buffer capacity overflow")?;
+        let indices_len = capacity
+            .checked_mul(MAX_INDS_PER_POS)
+            .ok_or("index buffer capacity overflow")?;
+        self.indices = DeviceBuffer::<i32>::zeroed(&self.stream, indices_len)?;
+        self.targets = DeviceBuffer::<f32>::zeroed(&self.stream, capacity)?;
+        self.per_pos_norm = DeviceBuffer::<f32>::zeroed(&self.stream, capacity)?;
+        self.preds = DeviceBuffer::<f32>::zeroed(&self.stream, capacity)?;
+        self.input_capacity = capacity;
         Ok(())
     }
 
@@ -388,12 +473,11 @@ impl GpuTrainer {
             return Ok(());
         }
 
-        // 入力 buffer は per-step に新規 alloc。perf 計測時に `Stream::memcpy_h2d`
-        // を直接呼んで再利用化する想定 (TODO)。
-        let indices_dev = DeviceBuffer::from_host(&self.stream, &batch.indices)?;
-        let targets_dev = DeviceBuffer::from_host(&self.stream, &batch.targets)?;
-        let norm_dev = DeviceBuffer::from_host(&self.stream, &batch.per_pos_norm)?;
-        let mut preds_dev = DeviceBuffer::<f32>::zeroed(&self.stream, n_pos)?;
+        self.ensure_input_capacity(n_pos)?;
+        copy_host_to_device_async(&self.stream, &self.indices, &batch.indices)?;
+        copy_host_to_device_async(&self.stream, &self.targets, &batch.targets)?;
+        copy_host_to_device_async(&self.stream, &self.per_pos_norm, &batch.per_pos_norm)?;
+        self.input_upload_done.record(&self.stream)?;
 
         let n_pos_u32 = n_pos as u32;
         let max_inds_u32 = MAX_INDS_PER_POS as u32;
@@ -412,9 +496,9 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_pos,
             args: [
-                slice(indices_dev),
+                slice(self.indices),
                 slice(self.weights),
-                slice_mut(preds_dev),
+                slice_mut(self.preds),
                 n_pos_u32,
                 max_inds_u32
             ]
@@ -427,10 +511,10 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_pos,
             args: [
-                slice(indices_dev),
-                slice(preds_dev),
-                slice(targets_dev),
-                slice(norm_dev),
+                slice(self.indices),
+                slice(self.preds),
+                slice(self.targets),
+                slice(self.per_pos_norm),
                 slice(self.grad),
                 slice(self.loss_acc),
                 slice(self.hist),
@@ -474,7 +558,6 @@ impl GpuTrainer {
             ]
         }?;
 
-        self.stream.synchronize()?;
         Ok(())
     }
 
@@ -485,9 +568,10 @@ impl GpuTrainer {
             return Ok(());
         }
 
-        let indices_dev = DeviceBuffer::from_host(&self.stream, &batch.indices)?;
-        let targets_dev = DeviceBuffer::from_host(&self.stream, &batch.targets)?;
-        let mut preds_dev = DeviceBuffer::<f32>::zeroed(&self.stream, n_pos)?;
+        self.ensure_input_capacity(n_pos)?;
+        copy_host_to_device_async(&self.stream, &self.indices, &batch.indices)?;
+        copy_host_to_device_async(&self.stream, &self.targets, &batch.targets)?;
+        self.input_upload_done.record(&self.stream)?;
 
         let n_pos_u32 = n_pos as u32;
         let max_inds_u32 = MAX_INDS_PER_POS as u32;
@@ -503,9 +587,9 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_pos,
             args: [
-                slice(indices_dev),
+                slice(self.indices),
                 slice(self.weights),
-                slice_mut(preds_dev),
+                slice_mut(self.preds),
                 n_pos_u32,
                 max_inds_u32
             ]
@@ -516,16 +600,20 @@ impl GpuTrainer {
             module: self.module,
             config: cfg_pos,
             args: [
-                slice(preds_dev),
-                slice(targets_dev),
+                slice(self.preds),
+                slice(self.targets),
                 slice(self.loss_acc),
                 slice(self.hist),
                 n_pos_u32
             ]
         }?;
 
-        self.stream.synchronize()?;
         Ok(())
+    }
+
+    /// 直前の `step` / `eval_forward` が発行した入力 H2D の完了を host で待つ。
+    fn synchronize_input_upload(&self) -> gpu_runtime::Result<()> {
+        Ok(self.input_upload_done.synchronize()?)
     }
 
     fn read_loss_hist(&self) -> gpu_runtime::Result<(f64, [u64; 8])> {
@@ -649,6 +737,9 @@ fn run_data_pass(
                 samples_total += batch.n_positions;
                 run_batch(trainer, &batch, mode)?;
                 steps += 1;
+                // H2D 完了後だけ転送元 `Batch` storage を再利用する。event は kernel
+                // より前に record 済みなので、GPU compute の完了は待たない。
+                trainer.synchronize_input_upload()?;
                 batch.clear();
 
                 if matches!(mode, PassMode::Train(_))
@@ -746,7 +837,7 @@ fn run_training(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         "CUDA device {} ready, kernel module loading...",
         args.device
     );
-    let mut trainer = GpuTrainer::new(&ctx, init_weights.as_deref())?;
+    let mut trainer = GpuTrainer::new(&ctx, init_weights.as_deref(), args.games_per_step)?;
     println!(
         "GpuTrainer ready: {} weights, batch={} games, lr={} (effective={})",
         SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS,
@@ -1212,7 +1303,7 @@ mod gpu_cpu_equivalence_tests {
     #[test]
     fn samples_per_sec_baseline_on_sample_psv() -> Result<(), Box<dyn std::error::Error>> {
         let (ctx, _module, _stream) = open_module()?;
-        let mut trainer = GpuTrainer::new(&ctx, None)?;
+        let mut trainer = GpuTrainer::new(&ctx, None, 1)?;
 
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../crates/shogi-format/tests/data/sample.psv");
