@@ -18,9 +18,9 @@ use nnue_train::schedule::{LrSchedulerEnum, WdlSchedulerEnum};
 #[cfg(feature = "gpu")]
 use nnue_train::trainer::{LossKind, TrainingConfig};
 #[cfg(feature = "gpu")]
-use shogi_features::ThreatProfile;
-#[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+#[cfg(feature = "gpu")]
+use shogi_features::{EffectBucketConfig, FtFactorizeMode, ThreatProfile};
 #[cfg(any(feature = "gpu", test))]
 use shogi_features::{FeatureSet, FeatureSetSpec};
 
@@ -29,10 +29,17 @@ use crate::cli::*;
 #[cfg(feature = "gpu")]
 use crate::{arch::*, trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
 
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Default)]
+struct OomFeatureConfig<'a> {
+    threat_profile: Option<&'a str>,
+    effect_bucket_config: Option<&'a str>,
+}
+
 /// GPU buffer 確保が OOM した時の actionable error。tunable な current config と
 /// メモリ削減手段を列挙する。`gpu_runtime::is_out_of_memory` で OOM と判定した
 /// ときだけ呼ぶ。`accumulator_flag` は FT 出力次元を下げる flag (LayerStack
-/// `--ft-out` / Simple `--l1`)、`threat_profile` は LayerStack のみ Some。
+/// `--ft-out` / Simple `--l1`)、feature 拡張 config は LayerStack のみ Some。
 /// `--ft-fp16` / `--ft-fp16-out` は棋力 trade-off のため remedy には挙げず
 /// (診断用に current 値だけ表示)、メモリ専用の `--fp16-opt-state` を推奨する。
 #[cfg(feature = "gpu")]
@@ -43,7 +50,7 @@ fn gpu_oom_error(
     fp16_opt_state: bool,
     accumulator_flag: &str,
     accumulator_dim: usize,
-    threat_profile: Option<&str>,
+    feature_config: OomFeatureConfig<'_>,
 ) -> Box<dyn std::error::Error> {
     use std::fmt::Write as _;
     let mut msg = String::from("GPU out of memory while allocating training buffers (");
@@ -53,8 +60,11 @@ fn gpu_oom_error(
         msg,
         ", ft-fp16={ft_fp16}, ft-fp16-out={ft_fp16_out}, fp16-opt-state={fp16_opt_state}"
     );
-    if let Some(p) = threat_profile {
+    if let Some(p) = feature_config.threat_profile {
         let _ = write!(msg, ", threat-profile={p}");
+    }
+    if let Some(c) = feature_config.effect_bucket_config {
+        let _ = write!(msg, ", effect-bucket={c}");
     }
     msg.push_str(").\nReduce GPU memory by one or more of:\n");
     if !fp16_opt_state {
@@ -64,10 +74,13 @@ fn gpu_oom_error(
         msg,
         "  - lower `{accumulator_flag}` (FT 出力次元。buffer はこれに概ね線形)"
     );
-    if matches!(threat_profile, Some(p) if p != "off") {
+    if matches!(feature_config.threat_profile, Some(p) if p != "off") {
         msg.push_str(
             "  - smaller `--threat-profile` (dims 降順: full > same-class > same-class-major-pawn > cross-side > step-attacker、または off)\n",
         );
+    }
+    if matches!(feature_config.effect_bucket_config, Some(c) if c != "off") {
+        msg.push_str("  - smaller `--effect-bucket` (2x2 uses fewer FT rows than 3x3, or off)\n");
     }
     msg.push_str("  - smaller `--batch-size`");
     msg.into()
@@ -86,6 +99,27 @@ struct SharedPrecisionFlags {
 struct SharedCliValidation {
     feature_set: FeatureSetSpec,
     precision: SharedPrecisionFlags,
+}
+
+#[cfg(feature = "gpu")]
+fn parse_effect_bucket_config(
+    name: &str,
+) -> Result<Option<EffectBucketConfig>, Box<dyn std::error::Error>> {
+    let config = match name {
+        "off" => None,
+        "2x2-kingfixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
+        "2x2-kingbucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
+        "3x3-kingfixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
+        "3x3-kingbucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
+        _ => {
+            return Err(format!(
+                "--effect-bucket '{name}' is not a known config (expected one of: off, \
+                 2x2-kingfixed, 2x2-kingbucketed, 3x3-kingfixed, 3x3-kingbucketed)"
+            )
+            .into());
+        }
+    };
+    Ok(config)
 }
 
 #[cfg(any(feature = "gpu", test))]
@@ -243,9 +277,13 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             },
         )?),
     };
-    // PSQT は threat と排他のまま据え置く。PSQT shortcut は全 FT row に material
-    // prior を載せる設計で、threat row には material 概念が無いため base row 限定の
-    // 境界処理が要る (未配線)。factorizer との併用は本 path で解禁する。
+    let effect_bucket_config = parse_effect_bucket_config(&layerstack.effect_bucket_config)?;
+    if threat_profile.is_some() && effect_bucket_config.is_some() {
+        return Err("--effect-bucket is mutually exclusive with --threat-profile".into());
+    }
+    // PSQT shortcut は全 FT row に material prior を載せる設計で、base row 限定の
+    // 境界処理が要る feature 拡張とは同時に使わない。factorizer と threat の併用は
+    // threat path で解禁する。
     if threat_profile.is_some() && layerstack.psqt {
         return Err(
             "--threat-profile is mutually exclusive with --psqt for now (the PSQT shortcut \
@@ -254,19 +292,36 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 .into(),
         );
     }
-
+    if effect_bucket_config.is_some() && layerstack.psqt {
+        return Err(
+            "--effect-bucket is mutually exclusive with --psqt for now (the PSQT shortcut \
+             must be restricted to effect bucket FT rows explicitly)"
+                .into(),
+        );
+    }
     // spec の modifier 適用 (確定はこの 1 箇所)。threat と factorizer は独立に
-    // 連結でき、両 ON の FT layout は `[base real | threat real | virtual P]`。
-    // factorizer は default ON で `--no-ft-factorize` が opt-out。`--init-from` は
+    // 連結でき、両 ON の FT layout は `[base real | threat real | virtual piece-input rows]`。
+    // effect bucket は base row 全体を bucket 数倍に展開し、factorizer は共有 mode に応じた
+    // piece-input 仮想行 を後ろへ連結する。factorizer は default ON で `--no-ft-factorize` が opt-out。`--init-from` は
     // factorizer と排他で auto-suppress する (量子化 .bin は仮想行を持たないため
     // 初期化元にできない)。threat profile は init-from でも保持する (threat row は
     // .bin に書かれており初期化できる)。
-    let feature_set = match threat_profile {
-        Some(profile) => {
+    let feature_set = match (threat_profile, effect_bucket_config) {
+        (Some(profile), None) => {
             println!("[train] --threat-profile {profile} → FT input extended by threat dims");
             feature_set.with_threat_profile(profile)
         }
-        None => feature_set,
+        (None, Some(config)) => {
+            println!(
+                "[train] --effect-bucket {} → FT input extended by effect buckets",
+                layerstack.effect_bucket_config
+            );
+            feature_set.with_effect_bucket_config(config)
+        }
+        (None, None) => feature_set,
+        (Some(_), Some(_)) => {
+            unreachable!("effect bucket and threat are rejected before spec construction")
+        }
     };
     let feature_set = if layerstack.ft_factorize_enabled() {
         if cli.init_from.is_some() {
@@ -276,7 +331,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             );
             feature_set
         } else {
-            feature_set.with_ft_factorize()
+            let mode = if feature_set.effect_bucket_config().is_some() {
+                match layerstack.ft_factorize_effect_bucket_share {
+                    EffectBucketFactorizeShare::PoolBuckets => FtFactorizeMode::PoolEffectBuckets,
+                    EffectBucketFactorizeShare::PerBucket => FtFactorizeMode::PerEffectBucket,
+                }
+            } else {
+                FtFactorizeMode::Base
+            };
+            feature_set.with_ft_factorize_mode(mode)
         }
     } else {
         feature_set
@@ -532,7 +595,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 fp16_opt_state,
                 "--ft-out",
                 layerstack.ft_out,
-                Some(layerstack.threat_profile.as_str()),
+                OomFeatureConfig {
+                    threat_profile: Some(layerstack.threat_profile.as_str()),
+                    effect_bucket_config: Some(layerstack.effect_bucket_config.as_str()),
+                },
             )
         } else {
             e
@@ -1664,7 +1730,7 @@ pub(crate) fn run_simple_training(
                 fp16_opt_state,
                 "--l1",
                 ft_out,
-                None,
+                OomFeatureConfig::default(),
             )
         } else {
             e
@@ -1986,8 +2052,19 @@ mod tests {
     #[test]
     fn gpu_oom_error_lists_relevant_remedies() {
         // fp16-opt-state off + threat on: current 値を出し、全 remedy を提示。
-        let m =
-            gpu_oom_error(65536, false, false, false, "--ft-out", 1536, Some("full")).to_string();
+        let m = gpu_oom_error(
+            65536,
+            false,
+            false,
+            false,
+            "--ft-out",
+            1536,
+            OomFeatureConfig {
+                threat_profile: Some("full"),
+                effect_bucket_config: Some("off"),
+            },
+        )
+        .to_string();
         assert!(m.contains("--ft-out=1536"));
         assert!(m.contains("threat-profile=full"));
         assert!(m.contains("add `--fp16-opt-state`"));
@@ -1996,7 +2073,16 @@ mod tests {
         assert!(m.contains("smaller `--batch-size`"));
 
         // fp16-opt-state 既に on + threat off (Simple): 該当しない remedy は省く。
-        let m2 = gpu_oom_error(4096, true, false, true, "--l1", 256, None).to_string();
+        let m2 = gpu_oom_error(
+            4096,
+            true,
+            false,
+            true,
+            "--l1",
+            256,
+            OomFeatureConfig::default(),
+        )
+        .to_string();
         assert!(m2.contains("--l1=256"));
         assert!(!m2.contains("add `--fp16-opt-state`"));
         assert!(!m2.contains("smaller `--threat-profile`"));

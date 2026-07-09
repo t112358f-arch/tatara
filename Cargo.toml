@@ -10,6 +10,8 @@ members = [
     "bins/progress_kpabs_train",
     "bins/nnue_train",
     "bins/progress_bucket_survey",
+    "bins/eval_sfen",
+    "bins/net_header_rewrite",
     "bins/threat_symmetric_survey",
 ]
 

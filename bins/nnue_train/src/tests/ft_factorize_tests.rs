@@ -5,11 +5,15 @@
 //! 実 GPU trainer で検証する。dataloader `Batch` → `BatchData` の stride 整合
 //! のみ CPU で検証する。
 
+use gpu_kernels::sparse::ft_factorize::{
+    FT_FACTORIZE_BASE, FT_FACTORIZE_PER_EFFECT_BUCKET, FT_FACTORIZE_POOL_EFFECT_BUCKETS,
+    FtFactorizeLayout,
+};
 use gpu_runtime::CudaContext;
 use nnue_train::dataloader::Batch;
 use nnue_train::init::LayerStackInit;
 use nnue_train::trainer::LossKind;
-use shogi_features::FeatureSet;
+use shogi_features::{EffectBucketConfig, FeatureSet, FtFactorizeMode};
 
 use crate::arch::*;
 use crate::trainer_common::{BatchData, PrecisionFlags};
@@ -106,10 +110,84 @@ fn ft_fold_virtual_cpu_matches_export_coalesce() {
     gpu_kernels::sparse::ft_factorize::ft_fold_virtual_cpu(
         &w,
         &mut comb,
-        spec.base_ft_in(),
-        spec.ft_in(),
-        ft_out,
-        spec.piece_inputs(),
+        FtFactorizeLayout {
+            base_ft_in: spec.base_ft_in(),
+            ft_in: spec.ft_in(),
+            ft_out,
+            piece_inputs: spec.piece_inputs(),
+            nb: 1,
+            mode: FT_FACTORIZE_BASE,
+        },
+    );
+    let coalesced = nnue_format::layerstack_weights::coalesce_ft_factorized(&spec, ft_out, &w);
+    assert_eq!(comb, coalesced);
+}
+
+#[test]
+fn effect_bucket_ft_fold_virtual_cpu_matches_export_coalesce() {
+    for (mode, kernel_mode) in [
+        (
+            FtFactorizeMode::PoolEffectBuckets,
+            FT_FACTORIZE_POOL_EFFECT_BUCKETS,
+        ),
+        (
+            FtFactorizeMode::PerEffectBucket,
+            FT_FACTORIZE_PER_EFFECT_BUCKET,
+        ),
+    ] {
+        let spec = FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2)
+            .with_ft_factorize_mode(mode);
+        let ft_out = 4;
+        let train_n = spec.train_ft_in() * ft_out;
+        let w: Vec<f32> = (0..train_n)
+            .map(|i| ((i * 37 % 211) as f32 - 105.0) * 0.007)
+            .collect();
+
+        let mut comb = vec![0.0_f32; spec.ft_in() * ft_out];
+        gpu_kernels::sparse::ft_factorize::ft_fold_virtual_cpu(
+            &w,
+            &mut comb,
+            FtFactorizeLayout {
+                base_ft_in: spec.ft_in(),
+                ft_in: spec.ft_in(),
+                ft_out,
+                piece_inputs: spec.piece_inputs(),
+                nb: spec.effect_bucket_config().unwrap().nb,
+                mode: kernel_mode,
+            },
+        );
+        let coalesced = nnue_format::layerstack_weights::coalesce_ft_factorized(&spec, ft_out, &w);
+        assert_eq!(comb, coalesced, "{mode:?}");
+    }
+}
+
+#[test]
+fn threat_ft_fold_virtual_cpu_keeps_threat_rows_and_matches_export_coalesce() {
+    use shogi_features::ThreatProfile;
+    let spec = FeatureSet::HalfKaHmMerged
+        .spec()
+        .with_threat_profile(ThreatProfile::CrossSide)
+        .with_ft_factorize();
+    let ft_out = 4;
+    let train_n = spec.train_ft_in() * ft_out;
+    let w: Vec<f32> = (0..train_n)
+        .map(|i| ((i * 41 % 223) as f32 - 111.0) * 0.005)
+        .collect();
+
+    let mut comb = vec![0.0_f32; spec.ft_in() * ft_out];
+    gpu_kernels::sparse::ft_factorize::ft_fold_virtual_cpu(
+        &w,
+        &mut comb,
+        FtFactorizeLayout {
+            base_ft_in: spec.base_ft_in(),
+            ft_in: spec.ft_in(),
+            ft_out,
+            piece_inputs: spec.piece_inputs(),
+            nb: 1,
+            mode: FT_FACTORIZE_BASE,
+        },
     );
     let coalesced = nnue_format::layerstack_weights::coalesce_ft_factorized(&spec, ft_out, &w);
     assert_eq!(comb, coalesced);
@@ -162,6 +240,50 @@ fn ft_factorize_first_step_matches_off_and_virtual_rows_learn()
         assert!(
             (d0 - d1).abs() <= d0.abs().max(d1.abs()) * 1e-5 + 1e-7,
             "残差が仮想行由来なら plane 間で一致する: p={p} d0={d0:e} d1={d1:e}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn effect_bucket_ft_factorize_first_step_matches_off_and_virtual_rows_learn()
+-> Result<(), Box<dyn std::error::Error>> {
+    let ctx = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKaHmMerged
+        .spec()
+        .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2);
+    let fact = base.with_ft_factorize();
+    let batch = BatchData::smoke_dummy(B, base);
+    let (loss_off, w_off) = {
+        let mut t_off = make_trainer(&ctx, base)?;
+        let loss = t_off.step(&batch.as_ref(), 1e-3, 0.5, LOSS)?;
+        (loss, t_off.to_layerstack_weights()?)
+    };
+    let (loss_on, w_on) = {
+        let mut t_on = make_trainer(&ctx, fact)?;
+        let loss = t_on.step(&batch.as_ref(), 1e-3, 0.5, LOSS)?;
+        (loss, t_on.to_layerstack_weights()?)
+    };
+
+    let tol = loss_off.abs() * 1e-6 + 1e-12;
+    assert!(
+        (loss_on - loss_off).abs() <= tol,
+        "effect bucket step-1 loss must match: on={loss_on:e} off={loss_off:e}"
+    );
+    assert_eq!(w_on.feature_set, base);
+    assert_eq!(w_on.ft_w.len(), w_off.ft_w.len());
+    assert!(w_on.ft_w != w_off.ft_w);
+
+    let pi = base.piece_inputs();
+    let nb = base.effect_bucket_config().unwrap().nb;
+    for p in 0..8 {
+        let feat0 = p * nb;
+        let feat1 = (pi + p) * nb;
+        let d0 = w_on.ft_w[feat0 * FT_OUT_TEST] - w_off.ft_w[feat0 * FT_OUT_TEST];
+        let d1 = w_on.ft_w[feat1 * FT_OUT_TEST] - w_off.ft_w[feat1 * FT_OUT_TEST];
+        assert!(
+            (d0 - d1).abs() <= d0.abs().max(d1.abs()) * 1e-5 + 1e-7,
+            "effect bucket 残差が同じ piece-input ordinal で一致する: p={p} d0={d0:e} d1={d1:e}"
         );
     }
     Ok(())
@@ -271,7 +393,7 @@ fn ft_factorize_threat_coexist_first_step_matches_threat_only()
 }
 
 /// PSQT 有効の trainer を作る (psqt_init は base 形状)。factorize 有効 spec を
-/// 渡すと PSQT block も仮想 P 行を持ち、`psqt_init` の base 行を実 block に置いて
+/// 渡すと PSQT block もpiece-input 仮想行を持ち、`psqt_init` の base 行を実 block に置いて
 /// 仮想 block は zero append される。
 fn make_trainer_psqt_init(
     ctx: &std::sync::Arc<CudaContext>,

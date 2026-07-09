@@ -648,12 +648,12 @@ pub(crate) struct LayerstackArgs {
     /// FT factorizer (training-time virtual features). **Default ON.** Pass
     /// `--no-ft-factorize` to disable.
     ///
-    /// The FT weight table gains a king-bucket-independent virtual row per
-    /// piece plane. Each virtual row accumulates the gradients of every real
-    /// row sharing its piece plane (~king-bucket-count times more data per
-    /// row), so rarely visited king-square cells inherit a sensible shared
-    /// prior instead of staying near their initial values. The virtual rows
-    /// are folded into the real rows when the quantised `.bin` is saved, so
+    /// The FT weight table gains virtual piece-input rows for piece values independent
+    /// of the king position. Each virtual row accumulates the gradients of
+    /// every real row sharing its piece-input ordinal, so rarely visited king-square
+    /// cells inherit a sensible shared prior instead of staying near their
+    /// initial values. The virtual rows are folded into the real rows when the
+    /// quantised `.bin` is saved, so
     /// the exported net is identical in shape to a non-factorized net and
     /// inference engines need no changes.
     ///
@@ -679,6 +679,12 @@ pub(crate) struct LayerstackArgs {
     #[arg(long = "no-ft-factorize", overrides_with = "ft_factorize")]
     pub(crate) no_ft_factorize: bool,
 
+    /// effect bucket FT factorizer sharing mode. `pool-buckets` shares one virtual row
+    /// for each piece across effect buckets; `per-bucket` keeps effect buckets
+    /// separate.
+    #[arg(long = "ft-factorize-effect-bucket-share", value_enum, default_value_t = EffectBucketFactorizeShare::PoolBuckets)]
+    pub(crate) ft_factorize_effect_bucket_share: EffectBucketFactorizeShare,
+
     /// Threat sparse feature profile. One of: off (default), full, same-class,
     /// same-class-major-pawn, step-attacker, full-symdedup, cross-side. When not
     /// `off`, threat edge features (one piece attacking another) are concatenated
@@ -697,6 +703,14 @@ pub(crate) struct LayerstackArgs {
     /// OOMs.
     #[arg(long = "threat-profile", default_value = "off")]
     pub(crate) threat_profile: String,
+
+    /// effect bucket feature config. One of: off (default),
+    /// 2x2-kingfixed, 2x2-kingbucketed, 3x3-kingfixed,
+    /// 3x3-kingbucketed. effect bucket rewrites every base feature row as
+    /// `base_index * NB + bucket`, so it is mutually exclusive with
+    /// `--threat-profile` and `--psqt`.
+    #[arg(long = "effect-bucket", default_value = "off")]
+    pub(crate) effect_bucket_config: String,
 }
 
 impl LayerstackArgs {
@@ -718,6 +732,12 @@ pub(crate) enum PsqtInit {
     Zeroed,
     /// Pre-load PSQT with centipawn piece values / out_scaling (Material prior).
     Material,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum EffectBucketFactorizeShare {
+    PoolBuckets,
+    PerBucket,
 }
 
 /// Simple 4 層アーキ固有の引数。

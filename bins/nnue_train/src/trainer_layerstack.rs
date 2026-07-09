@@ -1,15 +1,30 @@
 use std::path::Path;
 
+use gpu_kernels::sparse::ft_factorize::{
+    FT_FACTORIZE_BASE, FT_FACTORIZE_PER_EFFECT_BUCKET, FT_FACTORIZE_POOL_EFFECT_BUCKETS,
+};
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::ArchKind;
 use nnue_format::LayerStackWeights;
 use nnue_train::init::{self, LayerStackInit, WeightShape};
 use nnue_train::optimizer::radam_compute_step_size_denom;
 use nnue_train::trainer::LossKind;
-use shogi_features::FeatureSetSpec;
+use shogi_features::{FeatureSetSpec, FtFactorizeMode};
 
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
+
+fn ft_factorize_kernel_mode(feature_set: &FeatureSetSpec) -> u32 {
+    match feature_set.ft_factorize_mode() {
+        FtFactorizeMode::Base => FT_FACTORIZE_BASE,
+        FtFactorizeMode::PoolEffectBuckets => FT_FACTORIZE_POOL_EFFECT_BUCKETS,
+        FtFactorizeMode::PerEffectBucket => FT_FACTORIZE_PER_EFFECT_BUCKET,
+    }
+}
+
+fn ft_factorize_kernel_pack(nb: usize, mode: u32) -> u32 {
+    (nb as u32) | (mode << 16)
+}
 
 struct StepContext<'a> {
     lr: f32,
@@ -258,8 +273,8 @@ pub(crate) struct GpuTrainer {
 /// `Option<PsqtState>` で gated。`w` shape は `(train_ft_in, num_buckets)` row-major
 /// (`w[feat * num_buckets + bucket]`)。factorizer 無効時は `train_ft_in == ft_in`。
 /// `m` / `v` は f32 固定 (PSQT weight 自体が小さく FP16 化の利得が小さいため)。
-/// factorizer 有効時は FT と同じ仮想 P 行を持ち、forward は畳み込み済み comb
-/// (`w_fold`) を、backward は実 grad の king-bucket 方向縮約で仮想 grad を埋める。
+/// factorizer 有効時は FT と同じpiece-input 仮想行を持ち、forward は畳み込み済み comb
+/// (`w_fold`) を、backward は同じ仮想行に対応する実 grad の縮約で仮想 grad を埋める。
 pub(crate) struct PsqtState {
     pub(crate) w: DeviceBuffer<f32>,
     pub(crate) w_m: DeviceBuffer<f32>,
@@ -770,7 +785,7 @@ impl GpuTrainer {
         // `--num-buckets` 依存。`l2_in` は `l1_out` から導出)。
         // ここでの `base_ft_in` は実 FT row 数 = `ft_in()` (threat 連結時は
         // base + threat)。FT weight init と buffer 確保の「実行部の行数」であり、
-        // **factorizer の仮想境界ではない**。fold/reduce が虚行を base king-bucket
+        // **factorizer の仮想境界ではない**。fold/reduce が虚行を base 実行
         // セルへ畳む境界は launch 側で別途 `feature_set.base_ft_in()` を使う
         // (threat 行を跨がないため両者は別物)。
         let base_ft_in = feature_set.ft_in();
@@ -832,7 +847,7 @@ impl GpuTrainer {
         // PSQT shortcut の初期 weight (有効時のみ確保)。入力 `psqt_init` は base 形状
         // (`base_ft_in * num_buckets`) を caller が validation 済 (CLI / `run_training`)。
         // factorizer 有効時は FT weight と同じく実 block を base 形状で受けて仮想 block
-        // を zero append し、forward 用 comb を確保する (PSQT も同一の仮想 P 行を持つ)。
+        // を zero append し、forward 用 comb を確保する (PSQT も同一のpiece-input 仮想行を持つ)。
         let psqt = match psqt_init {
             Some(init) => {
                 let base_expected = base_ft_in * num_buckets;
@@ -1151,7 +1166,7 @@ impl GpuTrainer {
     pub(crate) fn to_layerstack_weights(
         &self,
     ) -> Result<LayerStackWeights, Box<dyn std::error::Error>> {
-        // factorizer 有効時は psqt_w (train 形状) も仮想 P 行を実行へ畳み込み base
+        // factorizer 有効時は psqt_w (train 形状) もpiece-input 仮想行を実行へ畳み込み base
         // 形状で返す (FT と同じ coalesce を「列 = num_buckets」で再利用)。量子化・
         // 飽和検査は畳み込み後の値に掛かる。
         let psqt_w = match self.psqt.as_ref() {
@@ -1178,16 +1193,19 @@ impl GpuTrainer {
             // 戻すと threat が silent に drop され次元不整合になる)。
             feature_set: if self.feature_set.ft_factorize() {
                 let base = self.feature_set.feature_set().spec();
-                match self.feature_set.threat_profile() {
-                    Some(profile) => base.with_threat_profile(profile),
-                    None => base,
+                if let Some(profile) = self.feature_set.threat_profile() {
+                    base.with_threat_profile(profile)
+                } else if let Some(config) = self.feature_set.effect_bucket_config() {
+                    base.with_effect_bucket_config(config)
+                } else {
+                    base
                 }
             } else {
                 self.feature_set
             },
             num_buckets: self.num_buckets,
             ft_w: {
-                // factorizer 有効時は仮想 P 行を実行へ畳み込み、base 形状で返す
+                // factorizer 有効時はpiece-input 仮想行を実行へ畳み込み、base 形状で返す
                 // (`save_quantised` の飽和検査・量子化は畳み込み後の値に掛かる)。
                 let ft_w = self.ft_w.to_host_vec(&self.stream)?;
                 if self.feature_set.ft_factorize() {
@@ -1497,20 +1515,39 @@ impl GpuTrainer {
         // では train 形状 mirror へ base 想定の fold が走り OOB read になるため、
         // 入口で止める (呼び出し 2 箇所はどちらも factorize を gate 済み)。
         assert!(self.feature_set.ft_factorize());
-        // `base_ft_in` = 仮想行を持つ base king-bucket セル数 (fold 対象)。
-        // `ft_in_total` = base + threat (= comb サイズ / 仮想 P plane の手前)。
+        // `base_ft_in` = 仮想行を持つ base 実行の行数 (fold 対象)。
+        // `ft_in_total` = base + threat (= comb サイズ / piece-input 仮想行 の手前)。
         // threat 無効時は両者一致。FT comb は base+threat 全行 (threat 行は素通し)。
-        let base_ft_in = self.feature_set.base_ft_in();
         let ft_in_total = self.feature_set.ft_in();
+        let base_ft_in = if self.feature_set.effect_bucket_config().is_some() {
+            ft_in_total
+        } else {
+            self.feature_set.base_ft_in()
+        };
         let pi = self.feature_set.piece_inputs();
-        // fold/reduce kernel は base 実行を king-bucket (`p = feat % pi`) で仮想行へ
-        // 対応付ける。base 行が piece plane で割り切れない feature set は仮想行の
+        let nb = self
+            .feature_set
+            .effect_bucket_config()
+            .map_or(1, |cfg| cfg.nb);
+        let mode = ft_factorize_kernel_mode(&self.feature_set);
+        let fold_mode = ft_factorize_kernel_pack(nb, mode);
+        // fold/reduce kernel は base 実行をpiece-input 仮想行 へ対応付ける。effect bucket では
+        // PoolEffectBuckets が `virtual_row = (feat/NB)%piece_inputs`、
+        // PerEffectBucket が `virtual_row = ((feat/NB)%piece_inputs)*NB + feat%NB`
+        // を使う。base 行が piece-input ordinal で割り切れない feature set は仮想行の
         // 対応が崩れるので release でも弾く (全 feature set で成立する不変条件)。
         assert_eq!(
             base_ft_in % pi,
             0,
             "base_ft_in must be a multiple of piece_inputs for the factorizer"
         );
+        if mode == FT_FACTORIZE_POOL_EFFECT_BUCKETS || mode == FT_FACTORIZE_PER_EFFECT_BUCKET {
+            assert_eq!(
+                base_ft_in % (pi * nb),
+                0,
+                "base_ft_in must be a multiple of piece_inputs * effect_buckets for EffectBucket factorizer modes"
+            );
+        }
         let n = ft_in_total * self.ws.ft_out;
         if self.ft_fp16 {
             let mut comb = self
@@ -1525,8 +1562,9 @@ impl GpuTrainer {
                     stream: self.stream,
                     module: self.module,
                     config: cfg_1d(n),
-                    args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
-                           ft_in_total as u32, self.ws.ft_out as u32, pi as u32, n as u32]
+                    args: [slice(self.ft_w), slice_mut(comb),
+                           base_ft_in as u32, ft_in_total as u32, self.ws.ft_out as u32,
+                           pi as u32, fold_mode]
                 }
             }?;
         } else {
@@ -1542,12 +1580,13 @@ impl GpuTrainer {
                     stream: self.stream,
                     module: self.module,
                     config: cfg_1d(n),
-                    args: [slice(self.ft_w), slice_mut(comb), base_ft_in as u32,
-                           ft_in_total as u32, self.ws.ft_out as u32, pi as u32, n as u32]
+                    args: [slice(self.ft_w), slice_mut(comb),
+                           base_ft_in as u32, ft_in_total as u32, self.ws.ft_out as u32,
+                           pi as u32, fold_mode]
                 }
             }?;
         }
-        // PSQT shortcut も factorizer 有効時は同じ仮想 P 行を持つ。FT と同じ
+        // PSQT shortcut も factorizer 有効時は同じpiece-input 仮想行を持つ。FT と同じ
         // `ft_fold_virtual` を「列 = num_buckets」で psqt_w (train) → w_fold (base) に
         // 適用する (kernel は列数 runtime 引数なので再利用)。PSQT は threat と CLI
         // 排他なので psqt_w に threat 行は無く、fold 範囲 = 仮想 offset = base_ft_in。
@@ -1565,8 +1604,9 @@ impl GpuTrainer {
                     stream: self.stream,
                     module: self.module,
                     config: cfg_1d(psqt_n),
-                    args: [slice(psqt.w), slice_mut(comb), base_ft_in as u32,
-                           base_ft_in as u32, self.num_buckets as u32, pi as u32, psqt_n as u32]
+                    args: [slice(psqt.w), slice_mut(comb),
+                           base_ft_in as u32, base_ft_in as u32, self.num_buckets as u32,
+                           pi as u32, ft_factorize_kernel_pack(1, FT_FACTORIZE_BASE)]
                 }
             }?;
         }
@@ -2627,7 +2667,7 @@ impl GpuTrainer {
                 }
             }?;
             // factorizer 有効時: psqt_diff_sparse_bwd は実 block (base 行) のみ atomic
-            // add した。仮想行の grad を同 piece plane の実行 grad 和で埋める (FT と
+            // add した。仮想行の grad を同 piece-input ordinal の実行 grad 和で埋める (FT と
             // 同じ `ft_reduce_virtual_grad` を「列 = num_buckets」で再利用、overwrite)。
             if self.feature_set.ft_factorize() {
                 let pi = self.feature_set.piece_inputs();
@@ -2643,7 +2683,8 @@ impl GpuTrainer {
                         config: cfg_1d(pi * self.num_buckets),
                         args: [
                             slice(psqt.w_grad),
-                            base_ft_in, base_ft_in, self.num_buckets as u32, pi as u32
+                            base_ft_in, base_ft_in, self.num_buckets as u32, pi as u32,
+                            1_u32, 0_u32
                         ]
                     }
                 }?;
@@ -3536,23 +3577,46 @@ impl GpuTrainer {
                 prof_tick!("phD_nstm");
             }
         }
-        // factorizer: 仮想行の勾配 = 同 piece plane を持つ **base** 実行の勾配和。
+        // factorizer: 仮想行の勾配 = 同 piece-input ordinal を持つ **base** 実行の勾配和。
         // stm / nstm 両方の gather が実 block を確定させた後に 1 launch で仮想 block を
         // 埋める (仮想 index を sparse pipeline に流す方式と数学的に等価、kernel doc
         // 参照)。threat real 行は仮想行に寄与しないので縮約範囲は base_ft_in のみ。
         if self.feature_set.ft_factorize() {
             let pi = self.feature_set.piece_inputs();
-            let base_ft_in = self.feature_set.base_ft_in();
+            let base_ft_in = if self.feature_set.effect_bucket_config().is_some() {
+                ft_in
+            } else {
+                self.feature_set.base_ft_in()
+            };
+            let nb = self
+                .feature_set
+                .effect_bucket_config()
+                .map_or(1, |cfg| cfg.nb);
+            let mode = ft_factorize_kernel_mode(&self.feature_set);
+            assert_eq!(
+                base_ft_in % pi,
+                0,
+                "base_ft_in must be a multiple of piece_inputs for the factorizer"
+            );
+            if mode == FT_FACTORIZE_POOL_EFFECT_BUCKETS || mode == FT_FACTORIZE_PER_EFFECT_BUCKET {
+                assert_eq!(
+                    base_ft_in % (pi * nb),
+                    0,
+                    "base_ft_in must be a multiple of piece_inputs * effect_buckets for EffectBucket factorizer modes"
+                );
+            }
+            let virtual_rows = self.feature_set.ft_factorize_virtual_rows();
             unsafe {
                 // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
                 // stream の完了を待つ同期点まで生存する device allocation。
                 cuda_launch! {
                     kernel: ft_reduce_virtual_grad,
                     stream: self.stream, module: self.module,
-                    config: cfg_1d(pi * ft_out),
+                    config: cfg_1d(virtual_rows * ft_out),
                     args: [
                         slice(self.ft_w_grad),
-                        base_ft_in as u32, ft_in as u32, ft_out as u32, pi as u32
+                        base_ft_in as u32, ft_in as u32, ft_out as u32, pi as u32,
+                        nb as u32, mode
                     ]
                 }
             }?;
@@ -3627,7 +3691,7 @@ impl GpuTrainer {
             // PSQT shortcut weight (任意): psqt_w[feat*num_buckets + bucket] を
             // bucket 列ごと (= per-output-neuron) に正規化する (pitch=1 /
             // elem_stride=num_buckets)。行数は FT と同じ train 値 (`ft_w_rows`) —
-            // factorizer 有効時は仮想 P 行も同じ group に含める。
+            // factorizer 有効時はpiece-input 仮想行も同じ group に含める。
             let psqt_num_buckets = self.num_buckets;
             if let Some(psqt) = self.psqt.as_mut() {
                 norm_loss_group!(psqt.w, psqt_num_buckets, 1, psqt_num_buckets, ft_w_rows);
