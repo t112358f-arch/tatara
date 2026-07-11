@@ -399,6 +399,11 @@ pub struct TrainingConfig {
     pub loss: LossKind,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (`--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
+    /// `Some(c)` のとき drop を生き残った position の score を `[-c, c]` に飽和
+    /// させる (`--score-clamp-abs`)。教師の encode 変種 (clip 上限の違い等) を
+    /// 単一の上限へ正規化する用途。i16 なのは PSV score の表現域に合わせ、
+    /// 消費側の縮小 cast (wrap) を型で不可能にするため。
+    pub score_clamp_abs: Option<i16>,
     /// dataloader の prefetch worker 数 (`--threads`)。`0` は `1` 扱い。
     /// `1` で決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
     /// position 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
@@ -477,6 +482,22 @@ impl TrainingConfig {
         {
             return Err(io::Error::other(format!(
                 "score_drop_abs must be >= 1 (got {t}); a non-positive threshold would drop every position"
+            )));
+        }
+        if let Some(c) = self.score_clamp_abs
+            && c < 1
+        {
+            return Err(io::Error::other(format!(
+                "score_clamp_abs must be >= 1 (got {c}); a non-positive bound would saturate \
+                 every score to it"
+            )));
+        }
+        if let (Some(t), Some(c)) = (self.score_drop_abs, self.score_clamp_abs)
+            && i64::from(c) >= i64::from(t)
+        {
+            return Err(io::Error::other(format!(
+                "score_clamp_abs ({c}) must be < score_drop_abs ({t}); every position surviving \
+                 the drop filter already has |score| < {t}, so the clamp would never fire"
             )));
         }
         if self.test_data.is_some() && self.test_positions == 0 {
@@ -646,6 +667,7 @@ where
         data_path,
         cfg.batch_size,
         cfg.score_drop_abs,
+        cfg.score_clamp_abs,
         cfg.threads,
         *progress,
         cfg.feature_set,
@@ -657,7 +679,7 @@ where
 
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
-         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | dataloader threads {}",
+         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | dataloader threads {}",
         data_path.display(),
         cfg.net_id,
         cfg.start_superbatch,
@@ -666,6 +688,7 @@ where
         cfg.batch_size,
         cfg.loss,
         cfg.score_drop_abs,
+        cfg.score_clamp_abs,
         cfg.threads.max(1),
     );
 
@@ -679,6 +702,7 @@ where
                 test_path,
                 cfg.batch_size,
                 cfg.score_drop_abs,
+                cfg.score_clamp_abs,
                 cfg.test_positions,
                 progress,
                 cfg.feature_set,
@@ -700,6 +724,7 @@ where
                 file_size,
                 cfg.batch_size,
                 cfg.score_drop_abs,
+                cfg.score_clamp_abs,
                 cfg.test_positions,
                 progress,
                 cfg.feature_set,
@@ -1235,6 +1260,7 @@ mod tests {
             keep_raw_checkpoints: None,
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             score_drop_abs: None,
+            score_clamp_abs: None,
             threads: 2,
             test_data: None,
             test_positions: 0,
@@ -1446,6 +1472,7 @@ mod tests {
             wrm_weight_boost_w1: None,
             wrm_weight_boost_w2: None,
             score_drop_abs: None,
+            score_clamp_abs: None,
             init_from: None,
             init_preset: None,
             test_data: None,
@@ -2222,6 +2249,46 @@ mod tests {
         assert!(
             TrainingConfig {
                 score_drop_abs: Some(32000),
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
+        );
+        // score-clamp-abs は >= 1 (上限 i16::MAX は型で保証)。
+        for bad in [0, -1] {
+            assert!(
+                TrainingConfig {
+                    score_clamp_abs: Some(bad),
+                    ..base_cfg()
+                }
+                .validate()
+                .is_err(),
+                "score_clamp_abs {bad} must be rejected"
+            );
+        }
+        assert!(
+            TrainingConfig {
+                score_clamp_abs: Some(4144),
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
+        );
+        // clamp >= drop は「drop 生存者に clamp が一度も発火しない」silent no-op
+        // 構成なので reject。clamp < drop は OK。
+        assert!(
+            TrainingConfig {
+                score_drop_abs: Some(3000),
+                score_clamp_abs: Some(4144),
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TrainingConfig {
+                score_drop_abs: Some(32000),
+                score_clamp_abs: Some(4144),
                 ..base_cfg()
             }
             .validate()

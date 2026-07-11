@@ -687,6 +687,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         score_drop_abs: cli.score_drop_abs,
+        score_clamp_abs: cli.score_clamp_abs,
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
@@ -706,6 +707,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         // 通常学習は trainer::run 内の cfg.validate() が held-out 数を検証するが、
         // eval-only はそこへ到達せず HeldoutSet::load を直接呼ぶため、ここで等価の
         // 下限を弾く (test_positions==0 は 1 batch に切上げられ無言で縮退する)。
+        // cfg.validate() 丸ごとは呼べない: eval-only では resume 由来の
+        // start_superbatch が --superbatches を超えていても正当なため。
+        // score_clamp_abs は CLI parser (i16 + range 1..) が値域を保証する。
         if cfg.test_positions == 0 {
             return Err("--eval-only requires --test-positions >= 1 (held-out batch count)".into());
         }
@@ -715,6 +719,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 test_path,
                 cfg.batch_size,
                 cfg.score_drop_abs,
+                cfg.score_clamp_abs,
                 cfg.test_positions,
                 &progress,
                 cfg.feature_set,
@@ -740,6 +745,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     file_size,
                     cfg.batch_size,
                     cfg.score_drop_abs,
+                    cfg.score_clamp_abs,
                     cfg.test_positions,
                     &progress,
                     cfg.feature_set,
@@ -1349,6 +1355,7 @@ pub(crate) fn build_experiment_logger(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
+        score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         // test_data / test_positions / test_tail_positions は対応する CLI フラグ
@@ -1507,6 +1514,7 @@ pub(crate) fn build_experiment_logger_simple(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
+        score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         test_data: cli.test_data.as_deref().map(file_basename),
@@ -1790,6 +1798,7 @@ pub(crate) fn run_simple_training(
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         score_drop_abs: cli.score_drop_abs,
+        score_clamp_abs: cli.score_clamp_abs,
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
