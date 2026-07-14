@@ -5,7 +5,8 @@ use nnue_format::{ArchKind, SimpleActivation};
 
 use crate::cli::*;
 use crate::training::{
-    per_group_optim_flags, reject_simple_unsupported_flags, validate_bucket_mode,
+    per_group_optim_flags, reject_simple_unsupported_flags, require_simple_win_rate_model,
+    validate_bucket_mode,
 };
 
 use clap::CommandFactory;
@@ -84,6 +85,39 @@ fn simple_accepts_consumed_global_flags() {
         .is_ok()
     );
     assert!(reject_simple_unsupported_flags(&simple_cli(&["--ft-fp16", "--all-optim"])).is_ok());
+}
+
+#[test]
+fn simple_rejects_loss_wdl_requires_win_rate_model() {
+    // --win-rate-model 無し = loss_wdl 経路。dense int8 clamp と非整合なので reject。
+    assert!(require_simple_win_rate_model(&simple_cli(&[])).is_err());
+    // WRM の出力 scale と export の scale が不一致なら reject。
+    let err = require_simple_win_rate_model(&simple_cli(&["--win-rate-model"]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--scale (290) must equal --wrm-nnue2score (600)"));
+    // 一致する WRM は accept (identity 退化の設定でも受理される)。
+    assert!(
+        require_simple_win_rate_model(&simple_cli(&["--win-rate-model", "--scale", "600"])).is_ok()
+    );
+    assert!(
+        require_simple_win_rate_model(&simple_cli(&[
+            "--win-rate-model",
+            "--scale",
+            "600",
+            "--wrm-in-offset",
+            "0",
+            "--wrm-target-offset",
+            "0",
+            "--wrm-in-scaling",
+            "600",
+            "--wrm-target-scaling",
+            "600",
+            "--wrm-nnue2score",
+            "600",
+        ]))
+        .is_ok()
+    );
 }
 
 /// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch
