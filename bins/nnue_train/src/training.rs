@@ -225,19 +225,6 @@ fn validate_shared_cli(
 
 #[cfg(feature = "gpu")]
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // eval-only / threat ablation は LayerStack 専用。Simple arch は別 driver
-    // ([`run_simple_training`]) でこれらを解釈しないため、黙って通常学習に落ちる
-    // 取り違えを避けて明示的に弾く (dispatch より前)。
-    if matches!(cli.arch, ArchCommand::Simple(_))
-        && (cli.eval_only || cli.threat_ablate.is_some() || cli.threat_norm_dump)
-    {
-        return Err(
-            "--eval-only / --threat-ablate / --threat-norm-dump are only supported with the \
-             layerstack subcommand"
-                .into(),
-        );
-    }
-
     // アーキ種別で host pipeline を分岐する。Simple は別 driver
     // ([`run_simple_training`]) で受け、LayerStack 側はそのまま既存の flow を継続する。
     let layerstack = match &cli.arch {
@@ -1006,7 +993,7 @@ pub(crate) fn finite_or_zero(x: f32) -> f32 {
 
 /// per-group optimizer override flag の `(CLI 名, 指定値)` 一覧。layerstack 経路の
 /// 値 validation と simple 経路の reject が同じ表を参照する (flag 追加時の漏れ防止)。
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 6] {
     [
         ("--ft-weight-decay", cli.ft_weight_decay),
@@ -1024,6 +1011,40 @@ pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 
 #[cfg(feature = "gpu")]
 pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
     per_group_optim_flags(cli).iter().any(|(_, v)| v.is_some())
+}
+
+/// simple サブコマンドが解釈しない global フラグを明示エラーで弾く (silent no-op 回避)。
+///
+/// simple driver ([`run_simple_training`]) と `SimpleGpuTrainer` は、global フラグの
+/// 大半 (data / feature-set / LR・WDL schedule / loss・WRM パラメータ / precision
+/// (`--ft-fp16` / `--fp16-opt-state` / `--all-optim`) / init (`--init-ft` / `--init-l1..3`) /
+/// checkpoint / monitor / `--ft-factorize` / `--norm-loss`) を消費する。layerstack 専用で
+/// simple が解釈しないのは本関数が弾く 2 群だけ:
+///   - `--eval-only` / `--threat-ablate` / `--threat-norm-dump`: layerstack の eval / threat
+///     経路専用。
+///   - per-group optimizer override (`--ft/dense/bias-weight-decay` / `--ft/dense/bias-lr-mult`):
+///     simple は単一 `weight_decay` 経路のみ。
+///
+/// 他の layerstack 専用 flag の enforce は別所が担う: `--optimizer` は
+/// [`validate_shared_cli`] が `ranger` 以外を reject、`--init-l1f` は
+/// [`build_simple_init_spec`] が reject (simple に L1f 層は無い)。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.eval_only || cli.threat_ablate.is_some() || cli.threat_norm_dump {
+        return Err(
+            "--eval-only / --threat-ablate / --threat-norm-dump are only supported with the \
+             layerstack subcommand"
+                .into(),
+        );
+    }
+    if let Some((name, _)) = per_group_optim_flags(cli).iter().find(|(_, v)| v.is_some()) {
+        return Err(format!(
+            "{name} is only supported with the layerstack subcommand, not the simple trainer \
+             (simple uses a single --weight-decay path)"
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
@@ -1492,15 +1513,15 @@ pub(crate) fn build_experiment_logger_simple(
         end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
-        // simple subcommand は per-group optimizer 非対応 (`run_simple_training` で reject 済)。
+        // simple は per-group optimizer 非対応 ([`reject_simple_unsupported_flags`] が弾く)。
         ft_weight_decay: None,
         dense_weight_decay: None,
         bias_weight_decay: None,
         ft_lr_mult: None,
         dense_lr_mult: None,
         bias_lr_mult: None,
-        // simple subcommand は norm loss 非対応 (`run_simple_training` で reject 済)。
-        norm_loss_factor: None,
+        // `--norm-loss` 有効時のみ factor を記録する (無効時 None)。
+        norm_loss_factor: cli.norm_loss.then_some(cli.norm_loss_factor),
         qa: id.activation.qa(),
         qb: nnue_format::simple_weights::QB,
         loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
@@ -1607,6 +1628,11 @@ pub(crate) fn run_simple_training(
     cli: &Cli,
     simple_args: &SimpleArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // simple が解釈しない layerstack 専用 global フラグ (eval/threat 系・per-group optim) を
+    // silent no-op せず明示 reject する。`--data` 展開より前に弾く: main は `--eval-only`
+    // 等では `--data` 不在でも本 driver に dispatch するため、後段の `data.expect` より前で
+    // reject しないと clean error が panic に化ける。監査内容は関数 doc を参照。
+    reject_simple_unsupported_flags(cli)?;
     let data = cli
         .data
         .as_ref()
@@ -1614,18 +1640,10 @@ pub(crate) fn run_simple_training(
 
     let shared = validate_shared_cli(cli, simple_args.ft_fp16_out, simple_args.tf32)?;
     let feature_set = shared.feature_set;
-    if cli.norm_loss {
-        return Err(
-            "--norm-loss is only supported by the layer-stack trainer, not the simple subcommand"
-                .into(),
-        );
-    }
-    // per-group flag は global 定義なので parse は通るが、simple trainer は単一
-    // weight_decay 経路のみ。silent no-op (指定 hyperparameter が効かないまま走る)
-    // を防ぐため明示 reject する。
-    if let Some((name, _)) = per_group_optim_flags(cli).iter().find(|(_, v)| v.is_some()) {
+    if cli.norm_loss && (!cli.norm_loss_factor.is_finite() || cli.norm_loss_factor < 0.0) {
         return Err(format!(
-            "{name} is only supported by the layer-stack trainer, not the simple subcommand"
+            "--norm-loss-factor must be finite and >= 0 (got {})",
+            cli.norm_loss_factor
         )
         .into());
     }
@@ -1719,6 +1737,15 @@ pub(crate) fn run_simple_training(
     // fv_scale も活性化非依存 (round(FT_OUTPUT_QA × QB / 学習 scale))。`cli.scale`
     // は前段で有限・正値を保証済。
     let fv_scale = nnue_format::simple_weights::simple_fv_scale(cli.scale);
+    let norm_loss_factor = if cli.norm_loss {
+        println!(
+            "[train] norm loss active (factor = {})",
+            cli.norm_loss_factor
+        );
+        Some(cli.norm_loss_factor)
+    } else {
+        None
+    };
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
     // 実効値は起動時 log に展開出力し reproducibility 確保 (--all-optim だけでなく
     // どの flag が ON になったかを後で `tail train.log` で見て experiment.json の
@@ -1740,6 +1767,7 @@ pub(crate) fn run_simple_training(
         cli.batch_size,
         id,
         cli.weight_decay,
+        norm_loss_factor,
         fv_scale,
         PrecisionFlags {
             tf32,
