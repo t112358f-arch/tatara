@@ -19,6 +19,7 @@ pub mod arch_kind;
 pub mod halfka_psqt;
 pub mod header;
 pub mod layerstack_weights;
+pub mod layerstack_v3_weights;
 pub mod simple_weights;
 
 pub use arch_kind::ArchKind;

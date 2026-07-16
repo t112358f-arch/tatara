@@ -679,6 +679,24 @@ pub(crate) struct LayerstackArgs {
     /// OOMs.
     #[arg(long = "threat-profile", default_value = "off")]
     pub(crate) threat_profile: String,
+
+    /// bucket ごとに異なる実効 L1 出力次元を持たせる (`layerstack_v3` として
+    /// export する) ためのカンマ区切り9個の自然数
+    /// (例: `15,15,15,20,20,20,25,25,25`)。指定した場合、`--l1` はこの配列の
+    /// 最大値で上書きされ (uniform trainer をそのまま使うため)、学習開始前に
+    /// 余剰の L1/L2 行・列を 0 に固定する (「bucket dim freeze」方式、詳細は
+    /// `docs/decisions/2026-07-16-layerstack-v3-freeze-bucket-dims.md`)。
+    /// `.bin` の書き出しはこの実効サイズを持つ `layerstack_v3` フォーマットに
+    /// なる (padding された最大サイズではない)。`--l2-per-bucket` と併用必須。
+    /// `--psqt` / `--threat-profile` (off 以外) とは併用不可 (layerstack_v3
+    /// はどちらも非対応)。
+    #[arg(long, requires = "l2_per_bucket")]
+    pub(crate) l1_per_bucket: Option<String>,
+
+    /// bucket ごとに異なる実効 L2 出力次元。`--l1-per-bucket` と同じ規約
+    /// (カンマ区切り9個の自然数、`--l2` はこの配列の最大値で上書きされる)。
+    #[arg(long, requires = "l1_per_bucket")]
+    pub(crate) l2_per_bucket: Option<String>,
 }
 
 impl LayerstackArgs {
@@ -690,6 +708,50 @@ impl LayerstackArgs {
     #[cfg(any(feature = "gpu", test))]
     pub(crate) fn ft_factorize_enabled(&self) -> bool {
         !self.no_ft_factorize
+    }
+
+    /// `--l1-per-bucket`/`--l2-per-bucket` を解決する。両方 `None` なら
+    /// `Ok(None)` (通常の uniform layerstack training)。両方 `Some` なら
+    /// `(l1_out_per_bucket, l2_out_per_bucket, l1_max, l2_max)` を返す
+    /// (`clap` の `requires` 制約により片方だけ指定されることは無い)。
+    #[cfg(any(feature = "gpu", test))]
+    pub(crate) fn resolve_bucket_dim_freeze(
+        &self,
+    ) -> Result<
+        Option<(
+            [usize; nnue_format::layerstack_v3_weights::NUM_BUCKETS_V3],
+            [usize; nnue_format::layerstack_v3_weights::NUM_BUCKETS_V3],
+            usize,
+            usize,
+        )>,
+        Box<dyn std::error::Error>,
+    > {
+        let (l1_csv, l2_csv) = match (&self.l1_per_bucket, &self.l2_per_bucket) {
+            (Some(a), Some(b)) => (a, b),
+            (None, None) => return Ok(None),
+            _ => unreachable!("clap `requires` constraint guarantees both or neither are set"),
+        };
+        let l1_out = nnue_format::layerstack_v3_weights::parse_bucket_dims_csv(l1_csv, "--l1-per-bucket")
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let l2_out = nnue_format::layerstack_v3_weights::parse_bucket_dims_csv(l2_csv, "--l2-per-bucket")
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let l1_max = *l1_out.iter().max().unwrap();
+        let l2_max = *l2_out.iter().max().unwrap();
+        if self.num_buckets != nnue_format::layerstack_v3_weights::NUM_BUCKETS_V3 {
+            return Err(format!(
+                "--l1-per-bucket/--l2-per-bucket require --num-buckets {} (got {})",
+                nnue_format::layerstack_v3_weights::NUM_BUCKETS_V3,
+                self.num_buckets
+            )
+            .into());
+        }
+        if self.psqt {
+            return Err("--l1-per-bucket/--l2-per-bucket are not compatible with --psqt (layerstack_v3 has no PSQT block)".into());
+        }
+        if self.threat_profile != "off" {
+            return Err("--l1-per-bucket/--l2-per-bucket are not compatible with --threat-profile (layerstack_v3 does not support threat features)".into());
+        }
+        Ok(Some((l1_out, l2_out, l1_max, l2_max)))
     }
 }
 

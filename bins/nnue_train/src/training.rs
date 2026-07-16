@@ -211,6 +211,20 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         ArchCommand::Simple(args) => return run_simple_training(cli, args),
     };
 
+    // `--l1-per-bucket`/`--l2-per-bucket` ("bucket dim freeze"): 既存の uniform
+    // layerstack trainer をそのまま使い、l1/l2 を per-bucket 最大値で学習した
+    // 上で余剰 dims を 0 固定し、export だけ layerstack_v3 (実効サイズ) にする
+    // 方式 (詳細は docs/decisions/2026-07-16-layerstack-v3-freeze-bucket-dims.md)。
+    // `--resume`/`--init-from` は対応済み (下の resume/init-from ブロック参照)。
+    // `--eval-only` は (export 経路を通らない読み取り専用モードで freeze の
+    // 意味が薄く、检証もしていないため) 引き続き明示的に未対応にする。
+    let bucket_dim_freeze = layerstack.resolve_bucket_dim_freeze()?;
+    if bucket_dim_freeze.is_some() && cli.eval_only {
+        return Err(
+            "--l1-per-bucket/--l2-per-bucket does not support --eval-only yet".into(),
+        );
+    }
+
     // --data は通常学習と --eval-only --test-tail-positions では必須だが、
     // --threat-norm-dump と --eval-only --test-data は学習データを読まないので任意。
     // 必須経路では参照点で明示 error にする (None のまま誤って学習に進ませない)。
@@ -503,13 +517,19 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             optim_groups.bias.lr_mult,
         );
     }
+    // `--l1-per-bucket`/`--l2-per-bucket` 指定時は、その最大値で uniform trainer を
+    // 構築する (実効サイズへの縮小は `apply_bucket_dim_freeze` + export 側で行う)。
+    let (effective_l1, effective_l2) = match &bucket_dim_freeze {
+        Some((_, _, l1_max, l2_max)) => (*l1_max, *l2_max),
+        None => (layerstack.l1, layerstack.l2),
+    };
     // workspace を batch_size 分で確保 (partial 末尾 batch は grow-only で対応)。
     let mut trainer = GpuTrainer::new(
         &ctx,
         cli.batch_size,
         layerstack.ft_out,
-        layerstack.l1,
-        layerstack.l2,
+        effective_l1,
+        effective_l2,
         layerstack.num_buckets,
         PrecisionFlags {
             tf32,
@@ -540,6 +560,19 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     })?;
     // resume / init-from の処理 → 開始 superbatch と (resume なら) 親 run id /
     // 保存済 LR horizon を決める。
+    //
+    // bucket dim freeze との組み合わせ方 (詳細は
+    // docs/decisions/2026-07-16-layerstack-v3-freeze-bucket-dims.md):
+    // - fresh (どちらも無し): 構築直後に apply_bucket_dim_freeze (以下の関数末尾)。
+    // - --init-from: 読み込んだ (padding 済み・非 frozen かもしれない) weight で
+    //   trainer を上書きした **後** に apply_bucket_dim_freeze を呼ぶ (先に呼ぶと
+    //   load_layerstack_weights の上書きで freeze が消える)。
+    // - --resume: raw checkpoint には (freeze が正しく機能していれば) 既に
+    //   0 固定された状態 + optimizer state がそのまま保存されているので、
+    //   apply_bucket_dim_freeze は呼ばない (呼ぶと Ranger の m/v/slow を丸ごと
+    //   0 にリセットしてしまい、resume の意味が無くなる)。`freeze_l1f` フラグ
+    //   だけは checkpoint に含まれない in-memory 状態なので、明示的に
+    //   再度 true にする。
     let (resumed_superbatch, resume_parent_id, resumed_lr_horizon): (
         Option<usize>,
         Option<String>,
@@ -554,8 +587,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             &mut reader,
             feature_set,
             layerstack.ft_out,
-            layerstack.l1,
-            layerstack.l2,
+            effective_l1,
+            effective_l2,
             layerstack.num_buckets,
             layerstack.psqt,
         )?;
@@ -570,6 +603,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             );
         }
         trainer.load_layerstack_weights(&weights)?;
+        if let Some((l1_out, l2_out, _, _)) = bucket_dim_freeze {
+            println!(
+                "[train] bucket dim freeze (applied after --init-from): l1={l1_out:?} (max {effective_l1}) l2={l2_out:?} (max {effective_l2})"
+            );
+            trainer.apply_bucket_dim_freeze(l1_out, l2_out)?;
+        }
         (None, None, None)
     } else if let Some(ckpt) = &cli.resume {
         let (sb, parent_id, lr_horizon) = trainer.load_raw_checkpoint(ckpt)?;
@@ -585,8 +624,27 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 ckpt.display()
             );
         }
+        if bucket_dim_freeze.is_some() {
+            // checkpoint の重み・optimizer state はそのまま使う (再 freeze しない
+            // — Ranger の m/v/slow を消してしまうため)。`freeze_l1f` は
+            // in-memory only の flag なので明示的に立て直すだけでよい。
+            // 注意: `--resume` 時は今回の起動でも同じ `--l1-per-bucket`/
+            // `--l2-per-bucket` を渡すこと (checkpoint 自体にはどの bucket が
+            // 何次元だったかの記録が無いため、export 時の repack サイズは
+            // この起動時の CLI 引数がそのまま使われる)。
+            println!(
+                "[train] bucket dim freeze: resuming (excess dims already frozen in checkpoint, re-enabling l1f zeroing)"
+            );
+            trainer.set_freeze_l1f(true);
+        }
         (Some(sb), parent_id, lr_horizon)
     } else {
+        if let Some((l1_out, l2_out, _, _)) = bucket_dim_freeze {
+            println!(
+                "[train] bucket dim freeze: l1={l1_out:?} (max {effective_l1}) l2={l2_out:?} (max {effective_l2})"
+            );
+            trainer.apply_bucket_dim_freeze(l1_out, l2_out)?;
+        }
         (None, None, None)
     };
 
@@ -710,15 +768,32 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
-    let result = nnue_train::trainer::run(
-        &mut trainer,
-        data,
-        &progress,
-        &lr_scheduler,
-        &wdl_scheduler,
-        &cfg,
-        Some(&mut experiment),
-    );
+    let result = if let Some((l1_out, l2_out, _, _)) = bucket_dim_freeze {
+        let mut wrapped = BucketDimFreezeExport {
+            inner: trainer,
+            l1_out_per_bucket: l1_out,
+            l2_out_per_bucket: l2_out,
+        };
+        nnue_train::trainer::run(
+            &mut wrapped,
+            data,
+            &progress,
+            &lr_scheduler,
+            &wdl_scheduler,
+            &cfg,
+            Some(&mut experiment),
+        )
+    } else {
+        nnue_train::trainer::run(
+            &mut trainer,
+            data,
+            &progress,
+            &lr_scheduler,
+            &wdl_scheduler,
+            &cfg,
+            Some(&mut experiment),
+        )
+    };
     if result.is_err() {
         // run が error 終了したことを experiment.json に残す (status は "running"
         // のまま、results.interrupted を立てる)。`run` は正常終了時のみ

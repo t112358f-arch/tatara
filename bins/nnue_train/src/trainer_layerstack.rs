@@ -240,6 +240,15 @@ pub(crate) struct GpuTrainer {
     /// 起動時に決まり、以降不変。
     num_buckets: usize,
     step_count: u64,
+    /// `true` の場合、`step()` の末尾で毎回 l1f_w/l1f_b (+ optimizer state) を
+    /// 0 に再上書きする ([`GpuTrainer::zero_l1f`] 参照)。per-bucket に異なる
+    /// l1_out/l2_out を持たせる "layerstack_v3 via freeze" training mode
+    /// (`--l1-per-bucket`/`--l2-per-bucket`) でのみ立てる。L1f は shared
+    /// (bucket 非依存) な加算項なので、素の 0-init だけでは gradient が
+    /// 自然に 0 のまま留まらない (自己無矛盾な不動点にならない) ため、
+    /// 明示的な再ゼロ化が必要 (詳細は
+    /// `docs/decisions/2026-07-16-layerstack-v3-freeze-bucket-dims.md`)。
+    freeze_l1f: bool,
 }
 
 /// PSQT shortcut の weight + Ranger optimizer state を集約した sub-struct。
@@ -954,6 +963,7 @@ impl GpuTrainer {
             norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
             step_count: 0,
+            freeze_l1f: false,
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
         // step / validate 可能にする (zero のままの buffer を初回 forward が読む
@@ -1566,7 +1576,7 @@ impl GpuTrainer {
                 prof_t0: &mut prof_t0,
             },
         )?;
-        // step_impl の per-step device buffer はここまでに全部 drop 済 (cuMemFree)。
+        // step-profile 用 (テストアーキ): stream sync 前 ok
         if profile_step {
             self.stream.synchronize()?;
             eprintln!(
@@ -1575,7 +1585,189 @@ impl GpuTrainer {
                 prof_t0.elapsed().as_secs_f64() * 1000.0
             );
         }
+        if self.freeze_l1f {
+            // L1f (shared, bucket 非依存の加算項) は「0 でも forward には現れるが
+            // gradient は自然には 0 のまま留まらない」ため (加算分岐は
+            // CReLU 等の乗算ゲートと違って「0 入力 → 0 gradient」が成立しない)、
+            // 毎 step 明示的に 0 へ再上書きする。optimizer が計算した (無視される)
+            // 更新を都度捨てるだけなので計算コストは無駄になるが、これにより
+            // 「L1f の寄与は常に厳密 0」という bucket-dim freeze スキームの前提を
+            // 崩さずに維持できる (詳細は decision doc 参照)。
+            self.zero_l1f()?;
+        }
         Ok(result.loss)
+    }
+
+    /// l1f_w / l1f_b (+ Ranger optimizer state: m/v/slow/grad) を 0 に再上書きする。
+    /// `freeze_l1f` mode で `step()` の末尾から毎回呼ばれる。gradient/optimizer
+    /// state も合わせて 0 にしておくことで、万一 `freeze_l1f` を later 落として
+    /// 再開する誤用があっても RAdam の momentum に「捨てたはずの学習履歴」が
+    /// 残らないようにする (防御的、必須ではない)。
+    pub(crate) fn zero_l1f(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let l1f_w_n = self.ws.ft_out * self.ws.l1_out;
+        let l1f_b_n = self.ws.l1_out;
+        self.l1f_w = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_w_n)?;
+        self.l1f_w_m = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_w_n)?;
+        self.l1f_w_v = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_w_n)?;
+        self.l1f_w_slow = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_w_n)?;
+        self.l1f_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_w_n)?;
+        self.l1f_b = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_b_n)?;
+        self.l1f_b_m = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_b_n)?;
+        self.l1f_b_v = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_b_n)?;
+        self.l1f_b_slow = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_b_n)?;
+        self.l1f_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1f_b_n)?;
+        Ok(())
+    }
+
+    /// `true` を渡すと、以後 `step()` の末尾で毎回 [`GpuTrainer::zero_l1f`] を呼ぶ
+    /// ようになる。[`GpuTrainer::apply_bucket_dim_freeze`] とセットで使う (bucket
+    /// dim freeze スキームは L1f の寄与が厳密 0 であることに依存するため)。
+    pub(crate) fn set_freeze_l1f(&mut self, freeze: bool) {
+        self.freeze_l1f = freeze;
+    }
+
+    /// per-bucket に異なる実効 `l1_out`/`l2_out` を持たせるための「0 固定」を
+    /// 適用する。**学習開始前に一度だけ** 呼ぶこと (毎 step 呼び直す必要は無い —
+    /// 詳細は module doc 冒頭のリンク先 decision doc 参照。要約すると、CReLU /
+    /// SqrCReLU による乗算ゲートを挟んだ経路は「0 で初期化された重みは以後も
+    /// gradient が厳密 0 のまま」という自己無矛盾な不動点になるため、一度 0 で
+    /// 初期化すれば (L1f さえ `freeze_l1f` で無効化してあれば) 以後 optimizer が
+    /// 回っても厳密に 0 のまま動かない)。
+    ///
+    /// `l1_out_per_bucket[g]` / `l2_out_per_bucket[g]` は bucket `g` の実効サイズ
+    /// (export したい `layerstack_v3` の per-bucket サイズ)。各要素は
+    /// `2 <= l1_out_per_bucket[g] <= self.ws.l1_out` (現在の `--l1`、つまり
+    /// `l1_out_max` 相当) と `1 <= l2_out_per_bucket[g] <= self.ws.l2_out`
+    /// を満たすこと (満たさない場合 error を返す)。
+    ///
+    /// 0 固定する範囲 (bucket `g`、`l1_max = self.ws.l1_out`,
+    /// `l2_max = self.ws.l2_out`, `l1_eff_max = l1_max - 1`,
+    /// `l1_eff_g = l1_out_per_bucket[g] - 1`):
+    /// - `l1_w[g, row, :]` / `l1_b[g, row]` for `row in [l1_eff_g, l1_eff_max)`
+    ///   (skip 行 = `l1_max - 1` は対象外、常に real)。
+    /// - `l2_w[g, r, c]` for `r in [l2_out_per_bucket[g], l2_max)` (全 `c`)
+    ///   OR `c` が「上記で 0 固定した L1 main 行に対応する L2 入力列」
+    ///   (sqr 半分 `[l1_eff_g, l1_eff_max)` と main 半分
+    ///   `[l1_eff_max + l1_eff_g, l1_eff_max + l1_eff_max)` の union) の場合
+    ///   (全 `r`)。
+    /// - `l2_b[g, r]` for `r in [l2_out_per_bucket[g], l2_max)`。
+    /// - `l3_w[g, r]` for `r in [l2_out_per_bucket[g], l2_max)`。
+    ///
+    /// (`l2_w` の「行 OR 列」の両方向 0 固定が必要な理由: 列方向だけだと
+    /// forward 結果は 0 になるが、backward で「その列」の gradient が該当行の
+    /// 出力 gradient 経由で非 0 になり得るため、行方向も合わせて 0 固定しないと
+    /// 全体の不動点が崩れる。詳細は decision doc の導出参照。)
+    pub(crate) fn apply_bucket_dim_freeze(
+        &mut self,
+        l1_out_per_bucket: [usize; 9],
+        l2_out_per_bucket: [usize; 9],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let l1_max = self.ws.l1_out;
+        let l2_max = self.ws.l2_out;
+        let ft_out = self.ws.ft_out;
+        let l1_eff_max = l1_max - 1;
+        let l2_in_max = l1_eff_max * 2;
+        let num_buckets = self.num_buckets;
+        if num_buckets != 9 {
+            return Err(format!(
+                "apply_bucket_dim_freeze assumes num_buckets == 9, got {num_buckets}"
+            )
+            .into());
+        }
+        for g in 0..9 {
+            if !(2..=l1_max).contains(&l1_out_per_bucket[g]) {
+                return Err(format!(
+                    "l1_out_per_bucket[{g}] = {} must be in [2, {l1_max}]",
+                    l1_out_per_bucket[g]
+                )
+                .into());
+            }
+            if !(1..=l2_max).contains(&l2_out_per_bucket[g]) {
+                return Err(format!(
+                    "l2_out_per_bucket[{g}] = {} must be in [1, {l2_max}]",
+                    l2_out_per_bucket[g]
+                )
+                .into());
+            }
+        }
+
+        let mut l1_w = self.l1_w.to_host_vec(&self.stream)?;
+        let mut l1_b = self.l1_b.to_host_vec(&self.stream)?;
+        let mut l2_w = self.l2_w.to_host_vec(&self.stream)?;
+        let mut l2_b = self.l2_b.to_host_vec(&self.stream)?;
+        let mut l3_w = self.l3_w.to_host_vec(&self.stream)?;
+
+        for g in 0..9 {
+            let l1_eff_g = l1_out_per_bucket[g] - 1;
+            let l2_out_g = l2_out_per_bucket[g];
+
+            // l1_w[g, row, :] / l1_b[g, row] を row in [l1_eff_g, l1_eff_max) で 0 化。
+            for row in l1_eff_g..l1_eff_max {
+                let base = (g * l1_max + row) * ft_out;
+                for x in &mut l1_w[base..base + ft_out] {
+                    *x = 0.0;
+                }
+                l1_b[g * l1_max + row] = 0.0;
+            }
+
+            // l2_w[g, r, c] を r>=l2_out_g (全c) OR c が excess L1 列 (全r) で 0 化。
+            for r in 0..l2_max {
+                let row_base = (g * l2_max + r) * l2_in_max;
+                let row_excess = r >= l2_out_g;
+                for c in 0..l2_in_max {
+                    let in_sqr_excess = c < l1_eff_max && c >= l1_eff_g;
+                    let in_main_excess =
+                        c >= l1_eff_max && (c - l1_eff_max) >= l1_eff_g;
+                    if row_excess || in_sqr_excess || in_main_excess {
+                        l2_w[row_base + c] = 0.0;
+                    }
+                }
+                if row_excess {
+                    l2_b[g * l2_max + r] = 0.0;
+                }
+            }
+
+            // l3_w[g, r] を r>=l2_out_g で 0 化。
+            for r in l2_out_g..l2_max {
+                l3_w[g * l2_max + r] = 0.0;
+            }
+        }
+
+        self.l1_w = DeviceBuffer::from_host(&self.stream, &l1_w)?;
+        self.l1_b = DeviceBuffer::from_host(&self.stream, &l1_b)?;
+        self.l2_w = DeviceBuffer::from_host(&self.stream, &l2_w)?;
+        self.l2_b = DeviceBuffer::from_host(&self.stream, &l2_b)?;
+        self.l3_w = DeviceBuffer::from_host(&self.stream, &l3_w)?;
+        // 対応する grad/m/v/slow も 0 にしておく (念のため、既に construction 直後
+        // なら全部 0 のはずだが、resume 経路等からの誤用に対する防御)。
+        let l1_w_n = l1_max * ft_out * num_buckets;
+        let l1_b_n = l1_max * num_buckets;
+        let l2_w_n = l2_max * l2_in_max * num_buckets;
+        let l2_b_n = l2_max * num_buckets;
+        let l3_w_n = l2_max * num_buckets;
+        self.l1_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1_w_n)?;
+        self.l1_w_m = DeviceBuffer::<f32>::zeroed(&self.stream, l1_w_n)?;
+        self.l1_w_v = DeviceBuffer::<f32>::zeroed(&self.stream, l1_w_n)?;
+        self.l1_w_slow = DeviceBuffer::<f32>::zeroed(&self.stream, l1_w_n)?;
+        self.l1_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l1_b_n)?;
+        self.l1_b_m = DeviceBuffer::<f32>::zeroed(&self.stream, l1_b_n)?;
+        self.l1_b_v = DeviceBuffer::<f32>::zeroed(&self.stream, l1_b_n)?;
+        self.l1_b_slow = DeviceBuffer::<f32>::zeroed(&self.stream, l1_b_n)?;
+        self.l2_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l2_w_n)?;
+        self.l2_w_m = DeviceBuffer::<f32>::zeroed(&self.stream, l2_w_n)?;
+        self.l2_w_v = DeviceBuffer::<f32>::zeroed(&self.stream, l2_w_n)?;
+        self.l2_w_slow = DeviceBuffer::<f32>::zeroed(&self.stream, l2_w_n)?;
+        self.l2_b_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l2_b_n)?;
+        self.l2_b_m = DeviceBuffer::<f32>::zeroed(&self.stream, l2_b_n)?;
+        self.l2_b_v = DeviceBuffer::<f32>::zeroed(&self.stream, l2_b_n)?;
+        self.l2_b_slow = DeviceBuffer::<f32>::zeroed(&self.stream, l2_b_n)?;
+        self.l3_w_grad = DeviceBuffer::<f32>::zeroed(&self.stream, l3_w_n)?;
+        self.l3_w_m = DeviceBuffer::<f32>::zeroed(&self.stream, l3_w_n)?;
+        self.l3_w_v = DeviceBuffer::<f32>::zeroed(&self.stream, l3_w_n)?;
+        self.l3_w_slow = DeviceBuffer::<f32>::zeroed(&self.stream, l3_w_n)?;
+        self.set_freeze_l1f(true);
+        self.zero_l1f()?;
+        Ok(())
     }
 
     /// held-out validation の 1 batch を実行する。[`GpuTrainer::step_impl`] を
@@ -3464,6 +3656,108 @@ trainer_backend_impl! {
     flush_error: "GpuTrainer::loss_ring.flush_pending_loss failed: {}",
     weights_error: "GpuTrainer::to_layerstack_weights failed: {}",
     resume_error: "GpuTrainer::save_raw_checkpoint failed: {}",
+}
+
+/// `--l1-per-bucket`/`--l2-per-bucket` ("bucket dim freeze") 使用時に
+/// [`GpuTrainer`] をラップし、[`nnue_train::trainer::TrainerBackend::save_checkpoint`]
+/// (量子化 `.bin` export) だけを `layerstack_v3` フォーマット (bucket ごとの
+/// 実効サイズ、[`nnue_format::layerstack_v3_weights::repack_from_uniform`] で
+/// 変換) に差し替える薄い decorator。
+///
+/// `train_step` / `validate_step` / `save_resume_checkpoint` /
+/// `flush_pending_loss` / `read_fp16_clamp_count` は上の macro が生成した
+/// `GpuTrainer` 自身の `TrainerBackend` 実装にそのまま委譲する (UFCS 経由、
+/// ロジックの複製ではなく単純な呼び出し委譲なので実装を二重管理しない)。
+/// `--resume` の raw checkpoint は今まで通り padding 済 (`l1_out`/`l2_out` の
+/// 最大値、全 bucket 均一) の形式で保存する — resume は学習の続きなので
+/// export 形式と一致している必要が無く、`GpuTrainer::apply_bucket_dim_freeze`
+/// が resume 読み込み後も呼ばれる前提であれば安全 (呼び出し側 `training.rs`
+/// が保証する)。
+pub(crate) struct BucketDimFreezeExport {
+    pub(crate) inner: GpuTrainer,
+    pub(crate) l1_out_per_bucket: [usize; 9],
+    pub(crate) l2_out_per_bucket: [usize; 9],
+}
+
+impl nnue_train::trainer::TrainerBackend for BucketDimFreezeExport {
+    fn train_step(
+        &mut self,
+        batch: &nnue_train::dataloader::Batch,
+        bucket_idx: &[i32],
+        lr: f32,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> std::io::Result<f64> {
+        <GpuTrainer as nnue_train::trainer::TrainerBackend>::train_step(
+            &mut self.inner,
+            batch,
+            bucket_idx,
+            lr,
+            wdl_lambda,
+            loss,
+        )
+    }
+
+    fn validate_step(
+        &mut self,
+        batch: &nnue_train::dataloader::Batch,
+        bucket_idx: &[i32],
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> std::io::Result<nnue_train::trainer::ValidationStepOutput> {
+        <GpuTrainer as nnue_train::trainer::TrainerBackend>::validate_step(
+            &mut self.inner,
+            batch,
+            bucket_idx,
+            wdl_lambda,
+            loss,
+        )
+    }
+
+    fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
+        <GpuTrainer as nnue_train::trainer::TrainerBackend>::flush_pending_loss(&mut self.inner)
+    }
+
+    fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+        let uniform = self.inner.to_layerstack_weights().map_err(|e| {
+            std::io::Error::other(format!("GpuTrainer::to_layerstack_weights failed: {e}"))
+        })?;
+        let v3 = nnue_format::layerstack_v3_weights::repack_from_uniform(
+            &uniform,
+            self.l1_out_per_bucket,
+            self.l2_out_per_bucket,
+        )
+        .map_err(std::io::Error::other)?;
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+        v3.save_quantised(&mut writer)?;
+        std::io::Write::flush(&mut writer)?;
+        Ok(())
+    }
+
+    fn save_resume_checkpoint(
+        &mut self,
+        path: &std::path::Path,
+        superbatch: usize,
+        run_id: &str,
+        lr_horizon: Option<usize>,
+    ) -> std::io::Result<()> {
+        <GpuTrainer as nnue_train::trainer::TrainerBackend>::save_resume_checkpoint(
+            &mut self.inner,
+            path,
+            superbatch,
+            run_id,
+            lr_horizon,
+        )
+    }
+
+    fn read_fp16_clamp_count(&mut self) -> std::io::Result<(u64, u64)> {
+        <GpuTrainer as nnue_train::trainer::TrainerBackend>::read_fp16_clamp_count(&mut self.inner)
+    }
 }
 
 #[cfg(test)]
