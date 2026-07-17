@@ -21,26 +21,53 @@
 //!
 //! ## file layout (top-level)
 //!
-//! 1. header: version (4 LE u32, [`NNUE_V3_VERSION`]) + network_hash (4 LE u32)
-//!    + arch_len (4 LE u32) + arch_str (人間可読、[`build_arch_str_v3`] 参照。
-//!    load 時の構造化 field 照合は下記の explicit フィールドで行うので、arch_str
-//!    自体は feature set 名の prefix 照合にのみ使う)
-//! 2. num_buckets (4 LE u32、常に [`NUM_BUCKETS_V3`] (=9))
-//! 3. ft_out (4 LE u32)
-//! 4. l1_out\[9\] (4 LE u32 ×9、bucketごとのL1出力次元)
-//! 5. l2_out\[9\] (4 LE u32 ×9、bucketごとのL2出力次元)
-//! 6. ft_hash (4 LE u32)
-//! 7. ft_biases LEB128 (`crate::layerstack_weights` と同じ magic/形式)
-//! 8. ft_weights LEB128 (同上、`base_ft_in * ft_out` 個)
-//! 9. layerstacks: 9 bucket分、各 bucket は
-//!    `{fc_hash (4 LE u32), L1 (bias i32×l1_out\[i\] + weight i8×l1_out\[i\]×pad32(ft_out)),
-//!      L2 (bias i32×l2_out\[i\] + weight i8×l2_out\[i\]×pad32(l2_in\[i\])),
-//!      L3 (bias i32×1 + weight i8×pad32(l2_out\[i\]))}`
-//!    (`l2_in[i] = (l1_out[i] - 1) * 2`)
+//! **この layout は yaneuraou の generic loader
+//! (`evaluate_nnue.cpp::LoadAndShare` / `ReadHeader` /
+//! `Detail::ReadParameters<T>`) が実際に読む byte 列と 1:1 で対応するように
+//! 書く。ここに書いていないフィールドを追加したり、書いてある通りの順序・個数
+//! から外れたりすると、hard error にはならず (yaneuraou 側の hash/version
+//! mismatch はいずれも warning のみ) **読み込みだけ成功してゴミ weight で
+//! 動く** という、気づきにくい壊れ方をする (実際にこの bug で発生した:
+//! `--ft-out`/`--l1-per-bucket`/`--l2-per-bucket` の値を header に埋めて
+//! 自己記述的にしようとして余計な bytes を挟んでいた版があった。dims は
+//! (yaneuraou 側が `nnue_arch_gen.py` でコンパイル時に決め打ちするのと同様)
+//! **完全に呼び出し側の `expected_*` 引数から来るもので、file には一切
+//! 含めない**。)**
+//!
+//! 1. header ([`crate::layerstack_weights`] と共通の `ReadHeader`/`WriteHeader`
+//!    contract): version (4 LE u32, [`NNUE_V3_VERSION`]) + hash_value
+//!    (4 LE u32、yaneuraou 側は info string warning のみに使う cosmetic な
+//!    値、値そのものの一致は要求されない) + arch_len (4 LE u32) + arch_str
+//!    (人間可読、[`build_arch_str_v3`] 参照。load 時の構造化照合は
+//!    feature set 名の prefix のみ、他は呼び出し側の `expected_*` 引数で
+//!    行う。**ここに `num_buckets`/`ft_out`/`l1_out`/`l2_out` 等の追加
+//!    フィールドを絶対に挟まないこと** — yaneuraou 側はこの直後
+//!    ノーマージンで FT の hash を読みにいく)。
+//! 2. `Detail::ReadParameters<FeatureTransformer>` wrapper: ft_hash
+//!    (4 LE u32、cosmetic) + ft_biases LEB128 + ft_weights LEB128
+//!    (`base_ft_in * ft_out` 個、`crate::layerstack_weights` と同じ
+//!    magic/形式)。
+//! 3. `Detail::ReadParameters<Network>` wrapper (V3 は 9 bucket 分を
+//!    `Network` 1個に集約しているのでこの wrapper は **1回だけ**):
+//!    network_hash (4 LE u32、cosmetic) に続けて、9 bucket 分を
+//!    ノーマージンで並べる。**bucket ごとの hash は無い**
+//!    (`NetworkBucket::ReadParameters` は hash を読まない、
+//!    `nnue_arch_gen.py` 生成コード参照) — bucket ごとに hash を書くと
+//!    4 bytes × 9 だけ file がずれ、以降すべてのデータがゴミになる。
+//!    各 bucket `i` の内容:
+//!    `L1 (bias i32×l1_out[i] + weight i8×l1_out[i]×pad32(ft_out)),
+//!     L2 (bias i32×l2_out[i] + weight i8×l2_out[i]×pad32(l2_in[i])),
+//!     L3 (bias i32×1 + weight i8×pad32(l2_out[i]))`
+//!    (`l2_in[i] = (l1_out[i] - 1) * 2`)。
 //!
 //! 量子化スケールは [`crate::layerstack_weights`] と同一 (`QA` = FT scale, `QB` =
 //! dense weight scale, bias は `QA*QB` または `127*QB`)。`pad32` も同じ (32 の
-//! 倍数 pad、SIMD load align 要求)。
+//! 倍数 pad、SIMD load align 要求)。dense 層の weight の file 上のバイト順は
+//! yaneuraou 側の SIMD 用 scramble 済み内部レイアウトとは別物の、素直な
+//! row-major (`weight[out][in]`) で良い — `AffineTransform{,SparseInput}Explicit
+//! ::ReadParameters` が file 上は row-major な列を読みながら内部の scramble
+//! 済み位置に書き込む (`get_weight_index`) ので、file 側が scramble を意識
+//! する必要は無い。
 //!
 //! この byte layout は yaneuraou の `nnue_arch_gen.py --l1 --l2` が生成する
 //! `SFNNwoP_V3` architecture header (`NetworkBucket<L1,L2,Hash>` を9個集約した
@@ -235,15 +262,16 @@ impl LayerStackV3Weights {
         writer.write_all(&(arch_bytes.len() as u32).to_le_bytes())?;
         writer.write_all(arch_bytes)?;
 
-        writer.write_all(&(NUM_BUCKETS_V3 as u32).to_le_bytes())?;
-        writer.write_all(&(ft_out as u32).to_le_bytes())?;
-        for &v in &self.l1_out {
-            writer.write_all(&(v as u32).to_le_bytes())?;
-        }
-        for &v in &self.l2_out {
-            writer.write_all(&(v as u32).to_le_bytes())?;
-        }
-
+        // NOTE: ここで num_buckets/ft_out/l1_out[9]/l2_out[9] 等を書いては
+        // いけない。yaneuraou 側 (`evaluate_nnue.cpp::LoadAndShare`) は
+        // `ReadHeader` (version + hash + arch_len + arch_str) の直後、
+        // 一切追加フィールドを挟まずに
+        // `Detail::ReadParameters<FeatureTransformer>` (= ft_hash (4 LE u32)
+        // + FT の LEB128 bias/weight) を読みにいく。ここで余計な bytes を
+        // 挟むと、そのぶん FT の LEB128 ストリームの先頭がずれて全体が
+        // 破壊される (かつ hard error にはならず、ゴミ weight のまま
+        // "info string Warning: NNUE file has trailing data (ignored)" と
+        // 共に読み込みだけは成功してしまうので発見しづらい)。
         writer.write_all(&ft_hash(feature_hash, ft_out).to_le_bytes())?;
 
         // ---- FT biases / weights (LEB128 i16, scale=QA) ----
@@ -270,7 +298,14 @@ impl LayerStackV3Weights {
         let ft_w_i16: Vec<i16> = ft_w_base.iter().map(|&v| quantise_i16(v, qa_f)).collect();
         crate::layerstack_weights::write_leb128_tensor_i16(writer, &ft_w_i16)?;
 
-        // ---- LayerStacks (9 × {fc_hash, L1, L2, L3}, per-bucket サイズ) ----
+        // ---- LayerStacks (9 buckets、per-bucket サイズ) ----
+        // ここで書く1個の hash が yaneuraou 側 `Detail::ReadParameters<Network>`
+        // wrapper が読む hash (= `Network::GetHashValue()` との比較、mismatch でも
+        // warning のみ) に対応する。V2 の per-bucket と違い、V3 は9bucket分を
+        // Network 1個に集約しているので、bucket ごとの hash は無い (bucket 単体の
+        // `NetworkBucket::ReadParameters` は hash を読まない、
+        // yaneuraou 側 `nnue_arch_gen.py` 生成コード参照)。
+        writer.write_all(&network_hash_v3(feature_hash, ft_out, &self.l2_out).to_le_bytes())?;
         let qb_f = QB as f64;
         let l1_bias_scale = (QA * QB) as f64; // = 8128
         let l2_bias_scale = 127.0 * qb_f; // = 8128 (QA == 127 前提)
@@ -285,9 +320,6 @@ impl LayerStackV3Weights {
             check_len(&self.l2_b[buc], l2_out, "l2_b", buc)?;
             check_len(&self.l2_w[buc], l2_out * l2_in, "l2_w", buc)?;
             check_len(&self.l3_w[buc], l2_out, "l3_w", buc)?;
-
-            let fc_hash = compute_fc_hash(ft_out, l2_out);
-            writer.write_all(&fc_hash.to_le_bytes())?;
 
             // --- L1 ---
             for &b in &self.l1_b[buc] {
@@ -409,47 +441,6 @@ impl LayerStackV3Weights {
         }
 
         reader.read_exact(&mut buf4)?;
-        let file_num_buckets = u32::from_le_bytes(buf4) as usize;
-        if file_num_buckets != NUM_BUCKETS_V3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("num_buckets mismatch: file {file_num_buckets}, expected {NUM_BUCKETS_V3}"),
-            ));
-        }
-
-        reader.read_exact(&mut buf4)?;
-        let file_ft_out = u32::from_le_bytes(buf4) as usize;
-        if file_ft_out != expected_ft_out {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("ft_out mismatch: file {file_ft_out}, expected {expected_ft_out}"),
-            ));
-        }
-
-        let mut file_l1_out = [0usize; NUM_BUCKETS_V3];
-        for slot in &mut file_l1_out {
-            reader.read_exact(&mut buf4)?;
-            *slot = u32::from_le_bytes(buf4) as usize;
-        }
-        if file_l1_out != expected_l1_out {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("l1_out mismatch: file {file_l1_out:?}, expected {expected_l1_out:?}"),
-            ));
-        }
-        let mut file_l2_out = [0usize; NUM_BUCKETS_V3];
-        for slot in &mut file_l2_out {
-            reader.read_exact(&mut buf4)?;
-            *slot = u32::from_le_bytes(buf4) as usize;
-        }
-        if file_l2_out != expected_l2_out {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("l2_out mismatch: file {file_l2_out:?}, expected {expected_l2_out:?}"),
-            ));
-        }
-
-        reader.read_exact(&mut buf4)?;
         let file_ft_hash = u32::from_le_bytes(buf4);
         let expected_ft_hash = ft_hash(expected.feature_hash(), expected_ft_out);
         if file_ft_hash != expected_ft_hash {
@@ -486,13 +477,28 @@ impl LayerStackV3Weights {
         let mut l3_w: [Vec<f32>; NUM_BUCKETS_V3] = std::array::from_fn(|_| Vec::new());
         let mut l3_b = [0.0_f32; NUM_BUCKETS_V3];
 
+        // yaneuraou 側 `Detail::ReadParameters<Network>` wrapper が読む hash
+        // (save_quantised の対応するコメント参照)。bucket 単体の
+        // `NetworkBucket::ReadParameters` は hash を読まないので、ここで
+        // 1回だけ読む (bucket ごとには読まない)。
+        reader.read_exact(&mut buf4)?;
+        let file_network_level_hash = u32::from_le_bytes(buf4);
+        let expected_network_level_hash =
+            network_hash_v3(expected.feature_hash(), expected_ft_out, &expected_l2_out);
+        if file_network_level_hash != expected_network_level_hash {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "network hash (Detail::ReadParameters<Network> wrapper) mismatch: file \
+                     {file_network_level_hash:#x}, expected {expected_network_level_hash:#x}"
+                ),
+            ));
+        }
+
         for buc in 0..NUM_BUCKETS_V3 {
             let l1_out = expected_l1_out[buc];
             let l2_out = expected_l2_out[buc];
             let l2_in = l2_in_for(l1_out);
-
-            // fc_hash (skip; per-bucket network_hash 照合で既に検証済み)
-            reader.read_exact(&mut buf4)?;
 
             let mut bucket_l1_b = vec![0.0_f32; l1_out];
             for out in 0..l1_out {
@@ -846,7 +852,16 @@ mod tests {
     }
 
     #[test]
-    fn load_rejects_l1_out_mismatch() {
+    fn load_with_mismatched_l1_out_fails_via_byte_misalignment() {
+        // l1_out/l2_out はもう file に自己記述されていない (yaneuraou 側も
+        // 同様に dims を file から読まず、コンパイル時の `nnue_arch_gen.py`
+        // 引数から決め打ちする — 詳細はこの module の doc 冒頭のコメント参照)。
+        // そのため呼び出し側が間違った `expected_l1_out` を渡しても、file
+        // フォーマット的に「file が壊れている」ことを検出する仕組みは無く、
+        // 単純にバイト列の消費位置がずれて読み込みが破綻する (典型的には
+        // 途中で EOF に達して `UnexpectedEof` になる)。この test は
+        // 「必ず何らかの error になる (=garbage を静かに読み込んで
+        // 成功したことにはならない)」ことだけを確認する。
         let feature_set = shogi_features::FeatureSet::HalfKp.spec();
         let ft_out = 128;
         let l1_out = uniform(16);
@@ -857,14 +872,16 @@ mod tests {
 
         let mut bad_l1 = l1_out;
         bad_l1[0] = 24;
-        let err = LayerStackV3Weights::load_quantised(
+        let result = LayerStackV3Weights::load_quantised(
             &mut buf.as_slice(),
             feature_set,
             ft_out,
             bad_l1,
             l2_out,
-        )
-        .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        );
+        assert!(
+            result.is_err(),
+            "loading with a mismatched l1_out must fail (byte stream misalignment), not silently succeed"
+        );
     }
 }
