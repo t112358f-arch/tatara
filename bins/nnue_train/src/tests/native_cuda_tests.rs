@@ -1,11 +1,12 @@
 use gpu_runtime::CudaContext;
 use nnue_format::{SimpleActivation, SimpleId};
 use nnue_train::{
-    init::SimpleInit,
+    dataloader::BucketMode,
+    init::{LayerStackInit, SimpleInit},
     optimizer::OptimizerKind,
     trainer::{LossKind, TrainerBackend},
 };
-use shogi_features::FeatureSet;
+use shogi_features::{EffectBucketConfig, FeatureSet, FtFactorizeMode, ThreatProfile};
 
 #[cfg(feature = "native-cuda")]
 use crate::kernel_module::with_test_native_backend;
@@ -14,6 +15,7 @@ use crate::trainer_simple::SimpleRawCheckpointState;
 use crate::{
     arch::{SMOKE_BATCH, SMOKE_LOSS_WRM},
     trainer_common::{BatchData, PrecisionFlags},
+    trainer_layerstack::{GpuTrainer as LayerStackGpuTrainer, OptimGroupConfig},
     trainer_simple::SimpleGpuTrainer,
 };
 
@@ -61,6 +63,499 @@ fn every_simple_native_kernel_is_exported() {
         .collect();
     assert_eq!(required.len(), 49, "Simple kernel inventory changed");
     assert!(missing.is_empty(), "native CUDA is missing: {missing:?}");
+}
+
+#[test]
+fn every_layerstack_native_kernel_is_exported() {
+    let launch_sources = [
+        include_str!("../trainer_layerstack.rs"),
+        include_str!("../ft_factorize_host.rs"),
+    ];
+    let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
+    let mut required = std::collections::BTreeSet::new();
+    for source in launch_sources {
+        for line in source.lines() {
+            let Some(suffix) = line.trim_start().strip_prefix("kernel:") else {
+                continue;
+            };
+            let symbol = suffix
+                .trim_start()
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .next()
+                .unwrap_or_default();
+            if !symbol.is_empty() {
+                required.insert(symbol);
+            }
+        }
+    }
+    let missing: Vec<_> = required
+        .iter()
+        .copied()
+        .filter(|symbol| !native.contains(&format!("extern \"C\" __global__ void {symbol}(")))
+        .collect();
+    assert_eq!(required.len(), 61, "LayerStack kernel inventory changed");
+    assert!(missing.is_empty(), "native CUDA is missing: {missing:?}");
+}
+
+#[derive(Clone, Copy)]
+struct LayerStackTestOptions {
+    feature_set: shogi_features::FeatureSetSpec,
+    ft_out: usize,
+    l1_out: usize,
+    l2_out: usize,
+    num_buckets: usize,
+    bucket_mode: BucketMode,
+    precision: PrecisionFlags,
+    optimizer: OptimizerKind,
+    norm_loss_factor: Option<f32>,
+    psqt: bool,
+}
+
+impl LayerStackTestOptions {
+    fn standard() -> Self {
+        Self {
+            feature_set: FeatureSet::HalfKp.spec(),
+            ft_out: 128,
+            l1_out: 16,
+            l2_out: 32,
+            num_buckets: 2,
+            bucket_mode: BucketMode::Progress8KpAbs,
+            precision: PrecisionFlags::default(),
+            optimizer: OptimizerKind::Ranger,
+            norm_loss_factor: None,
+            psqt: false,
+        }
+    }
+}
+
+fn create_layerstack_trainer(
+    context: &std::sync::Arc<CudaContext>,
+    native: bool,
+) -> Result<LayerStackGpuTrainer, Box<dyn std::error::Error>> {
+    create_layerstack_trainer_with_options(context, native, LayerStackTestOptions::standard())
+}
+
+fn create_layerstack_trainer_with_options(
+    context: &std::sync::Arc<CudaContext>,
+    native: bool,
+    options: LayerStackTestOptions,
+) -> Result<LayerStackGpuTrainer, Box<dyn std::error::Error>> {
+    create_layerstack_trainer_with_batch(context, native, options, SMOKE_BATCH)
+}
+
+fn create_layerstack_trainer_with_batch(
+    context: &std::sync::Arc<CudaContext>,
+    native: bool,
+    options: LayerStackTestOptions,
+    batch_size: usize,
+) -> Result<LayerStackGpuTrainer, Box<dyn std::error::Error>> {
+    let psqt_init = options
+        .psqt
+        .then(|| vec![0.0_f32; options.feature_set.ft_in() * options.num_buckets]);
+    let operation = || {
+        LayerStackGpuTrainer::new(
+            context,
+            batch_size,
+            options.ft_out,
+            options.l1_out,
+            options.l2_out,
+            options.num_buckets,
+            options.bucket_mode,
+            options.precision,
+            options.feature_set,
+            options.optimizer,
+            OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
+            options.norm_loss_factor,
+            psqt_init.as_deref(),
+            &LayerStackInit::default_uniform(),
+        )
+    };
+    #[cfg(feature = "native-cuda")]
+    return with_test_native_backend(native, operation);
+    #[cfg(feature = "native-cuda-host")]
+    {
+        assert!(
+            native,
+            "native-host build cannot create a cuda-oxide trainer"
+        );
+        operation()
+    }
+}
+
+#[test]
+fn standard_layerstack_runs_one_native_training_step() -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let mut trainer = create_layerstack_trainer(&context, true)?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, FeatureSet::HalfKp.spec());
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % 2) as i32;
+    }
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+    let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    let loss = trainer.validate(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?.loss;
+    assert!(
+        loss.is_finite(),
+        "native LayerStack loss is not finite: {loss}"
+    );
+    trainer.assert_all_weights_finite()?;
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn standard_layerstack_native_matches_cuda_oxide_after_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    assert_layerstack_native_matches_cuda_oxide(
+        LayerStackTestOptions::standard(),
+        SMOKE_LOSS_WRM,
+        1,
+    )
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn complete_layerstack_native_configuration_matrix_matches_cuda_oxide()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (name, options, loss) in layerstack_configuration_matrix() {
+        eprintln!("[native-parity] LayerStack configuration: {name}");
+        assert_layerstack_native_matches_cuda_oxide(options, loss, 1)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn complete_layerstack_native_configuration_matrix_runs_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    for (name, options, loss) in layerstack_configuration_matrix() {
+        eprintln!("[native-host] LayerStack configuration: {name}");
+        let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+        for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+            *bucket = (row % options.num_buckets) as i32;
+        }
+        batch.score.fill(200.0);
+        batch.wdl.fill(0.8);
+        let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+        let validation = trainer.validate(&batch.as_ref(), 0.0, loss)?;
+        assert!(validation.loss.is_finite());
+        trainer.assert_all_weights_finite()?;
+    }
+    Ok(())
+}
+
+fn layerstack_configuration_matrix() -> Vec<(&'static str, LayerStackTestOptions, LossKind)> {
+    let standard = LayerStackTestOptions::standard();
+    let extended_wrm = match SMOKE_LOSS_WRM {
+        LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            ..
+        } => LossKind::Wrm {
+            nnue2score,
+            in_scaling,
+            in_offset,
+            target_offset,
+            target_scaling,
+            pow_exp: 2.5,
+            qp_asymmetry: 0.2,
+            weight_boost_w1: 1.5,
+            weight_boost_w2: 0.75,
+        },
+        LossKind::Sigmoid { .. } => unreachable!(),
+    };
+    vec![
+        (
+            "tf32",
+            LayerStackTestOptions {
+                precision: PrecisionFlags {
+                    tf32: true,
+                    ..PrecisionFlags::default()
+                },
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            "all-fp16",
+            LayerStackTestOptions {
+                precision: PrecisionFlags {
+                    ft_fp16: true,
+                    ft_fp16_out: true,
+                    fp16_opt_state: true,
+                    ..PrecisionFlags::default()
+                },
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            "radam-norm-sigmoid",
+            LayerStackTestOptions {
+                optimizer: OptimizerKind::RAdam,
+                norm_loss_factor: Some(0.25),
+                ..standard
+            },
+            LossKind::Sigmoid { scale: 1.0 / 600.0 },
+        ),
+        (
+            "adamw-extended-wrm",
+            LayerStackTestOptions {
+                optimizer: OptimizerKind::AdamW,
+                ..standard
+            },
+            extended_wrm,
+        ),
+        (
+            "psqt",
+            LayerStackTestOptions {
+                psqt: true,
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            "factorized",
+            LayerStackTestOptions {
+                feature_set: standard.feature_set.with_ft_factorize(),
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            "threat-factorized",
+            LayerStackTestOptions {
+                feature_set: standard
+                    .feature_set
+                    .with_threat_profile(ThreatProfile::CrossSide)
+                    .with_ft_factorize(),
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            "effect-factorized-pool",
+            LayerStackTestOptions {
+                feature_set: standard
+                    .feature_set
+                    .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2)
+                    .with_ft_factorize_mode(FtFactorizeMode::PoolEffectBuckets),
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            "effect-factorized-per-bucket",
+            LayerStackTestOptions {
+                feature_set: standard
+                    .feature_set
+                    .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2)
+                    .with_ft_factorize_mode(FtFactorizeMode::PerEffectBucket),
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            "kingrank9",
+            LayerStackTestOptions {
+                num_buckets: 9,
+                bucket_mode: BucketMode::KingRank9,
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            "minimum-hidden",
+            LayerStackTestOptions {
+                l1_out: 2,
+                l2_out: 2,
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+        (
+            "maximum-hidden",
+            LayerStackTestOptions {
+                l1_out: 256,
+                l2_out: 256,
+                ..standard
+            },
+            SMOKE_LOSS_WRM,
+        ),
+    ]
+}
+
+#[test]
+fn complete_layerstack_native_feature_matrix_runs_one_step()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let base = FeatureSet::HalfKp.spec();
+    let threats = [
+        ThreatProfile::Full,
+        ThreatProfile::SameClass,
+        ThreatProfile::SameClassMajorPawn,
+        ThreatProfile::StepAttacker,
+        ThreatProfile::FullSymDedup,
+        ThreatProfile::CrossSide,
+    ];
+    let effects = [
+        EffectBucketConfig::KINGFIXED_2X2,
+        EffectBucketConfig::KINGBUCKETED_2X2,
+        EffectBucketConfig::KINGFIXED_3X3,
+        EffectBucketConfig::KINGBUCKETED_3X3,
+    ];
+    let mut configurations = Vec::new();
+    for feature_set in FeatureSet::ALL {
+        configurations.push(("base", feature_set.spec()));
+    }
+    for profile in threats {
+        let spec = base.with_threat_profile(profile);
+        configurations.push(("threat", spec));
+        configurations.push(("threat-factorized", spec.with_ft_factorize()));
+    }
+    for effect in effects {
+        let spec = base.with_effect_bucket_config(effect);
+        configurations.push(("effect", spec));
+        configurations.push((
+            "effect-factorized-pool",
+            spec.with_ft_factorize_mode(FtFactorizeMode::PoolEffectBuckets),
+        ));
+        configurations.push((
+            "effect-factorized-per-bucket",
+            spec.with_ft_factorize_mode(FtFactorizeMode::PerEffectBucket),
+        ));
+    }
+
+    for (name, feature_set) in configurations {
+        eprintln!(
+            "[native-host] LayerStack feature configuration: {name}, {}",
+            feature_set.arch_feature_name()
+        );
+        let options = LayerStackTestOptions {
+            feature_set,
+            l1_out: 2,
+            l2_out: 2,
+            ..LayerStackTestOptions::standard()
+        };
+        let mut trainer = create_layerstack_trainer_with_options(&context, true, options)?;
+        let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, feature_set);
+        for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+            *bucket = (row % options.num_buckets) as i32;
+        }
+        let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+        trainer.assert_all_weights_finite()?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "native-cuda")]
+fn assert_layerstack_native_matches_cuda_oxide(
+    options: LayerStackTestOptions,
+    loss: LossKind,
+    steps: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let mut oxide = create_layerstack_trainer_with_options(&context, false, options)?;
+    let mut native = create_layerstack_trainer_with_options(&context, true, options)?;
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % options.num_buckets) as i32;
+    }
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+
+    for _ in 0..steps {
+        let _ = oxide.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+        let _ = native.step(&batch.as_ref(), 1.0e-3, 0.0, loss)?;
+    }
+    let oxide_loss = oxide.validate(&batch.as_ref(), 0.0, loss)?.loss;
+    let native_loss = native.validate(&batch.as_ref(), 0.0, loss)?.loss;
+    let loss_difference = (oxide_loss - native_loss).abs();
+    assert!(
+        loss_difference <= NATIVE_PARITY_TOLERANCE * (1.0 + oxide_loss.abs()),
+        "LayerStack loss differs: oxide={oxide_loss}, native={native_loss}, diff={loss_difference}"
+    );
+    let oxide_state = oxide.raw_checkpoint_state_to_host()?;
+    let native_state = native.raw_checkpoint_state_to_host()?;
+    assert_checkpoint_state_close("LayerStack", &oxide_state, &native_state);
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+fn checkpoint_resume_layerstack_native_matches_cuda_oxide_in_both_directions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let context = CudaContext::new(0)?;
+    let options = LayerStackTestOptions {
+        feature_set: FeatureSet::HalfKp.spec().with_ft_factorize(),
+        precision: PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            fp16_opt_state: true,
+            ..PrecisionFlags::default()
+        },
+        psqt: true,
+        ..LayerStackTestOptions::standard()
+    };
+    let mut batch = BatchData::smoke_dummy(SMOKE_BATCH, options.feature_set);
+    for (row, bucket) in batch.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % options.num_buckets) as i32;
+    }
+    batch.score.fill(200.0);
+    batch.wdl.fill(0.8);
+
+    for source_is_native in [false, true] {
+        let source_name = if source_is_native { "native" } else { "oxide" };
+        let path = std::env::temp_dir().join(format!(
+            "tatara-layerstack-native-resume-{source_name}-{}.ckpt",
+            std::process::id()
+        ));
+        let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+            let mut source =
+                create_layerstack_trainer_with_options(&context, source_is_native, options)?;
+            for _ in 0..5 {
+                let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            }
+            let checkpoint_state = source.raw_checkpoint_state_to_host()?;
+            assert_eq!(checkpoint_state.0, 5);
+            source.save_raw_checkpoint(&path, 17, source_name, Some(42))?;
+            let _ = source.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+            let oracle_state = source.raw_checkpoint_state_to_host()?;
+            assert_eq!(oracle_state.0, 6);
+            drop(source);
+
+            let mut oxide = create_layerstack_trainer_with_options(&context, false, options)?;
+            let mut native = create_layerstack_trainer_with_options(&context, true, options)?;
+            for (backend_name, trainer) in [("oxide", &mut oxide), ("native", &mut native)] {
+                let (superbatch, producer, horizon) = trainer.load_raw_checkpoint(&path)?;
+                assert_eq!(superbatch, 17);
+                assert_eq!(producer.as_deref(), Some(source_name));
+                assert_eq!(horizon, Some(42));
+                let loaded_state = trainer.raw_checkpoint_state_to_host()?;
+                assert_checkpoint_state_bit_identical(
+                    &format!("LayerStack {source_name} to {backend_name} load"),
+                    &checkpoint_state,
+                    &loaded_state,
+                );
+                trainer.sync_ft_forward_weights()?;
+                let _ = trainer.step(&batch.as_ref(), 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+                let resumed_state = trainer.raw_checkpoint_state_to_host()?;
+                assert_checkpoint_state_close(
+                    &format!("LayerStack {source_name} to {backend_name}"),
+                    &oracle_state,
+                    &resumed_state,
+                );
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&path);
+        result?;
+    }
+    Ok(())
 }
 
 fn create_trainer(
@@ -967,6 +1462,74 @@ fn benchmark_backends_alternating(
         }
     }
     Ok((oxide_total / runs as f64, native_total / runs as f64))
+}
+
+#[cfg(feature = "native-cuda")]
+fn benchmark_layerstack_backend(
+    context: &std::sync::Arc<CudaContext>,
+    options: LayerStackTestOptions,
+    batch: &BatchData,
+    native: bool,
+    steps: usize,
+) -> Result<f64, Box<dyn std::error::Error>> {
+    let mut trainer = create_layerstack_trainer_with_batch(context, native, options, batch.n_pos)?;
+    for _ in 0..3 {
+        let _ = trainer.step(batch, 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    }
+    let _ = TrainerBackend::flush_pending_loss(&mut trainer)?;
+    let start = std::time::Instant::now();
+    for _ in 0..steps {
+        let _ = trainer.step(batch, 1.0e-3, 0.0, SMOKE_LOSS_WRM)?;
+    }
+    let _ = TrainerBackend::flush_pending_loss(&mut trainer)?;
+    Ok(batch.n_pos as f64 * steps as f64 / start.elapsed().as_secs_f64())
+}
+
+#[test]
+#[cfg(feature = "native-cuda")]
+#[ignore = "manual WSL performance comparison"]
+fn benchmark_layerstack_native_against_cuda_oxide() -> Result<(), Box<dyn std::error::Error>> {
+    let parse = |name: &str, default: usize| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    let batch_size = parse("TATARA_NATIVE_BENCH_BATCH", 16_384);
+    let steps = parse("TATARA_NATIVE_BENCH_STEPS", 20);
+    let runs = parse("TATARA_NATIVE_BENCH_RUNS", 3).max(1);
+    let context = CudaContext::new(0)?;
+    let options = LayerStackTestOptions {
+        ft_out: 1536,
+        num_buckets: 9,
+        ..LayerStackTestOptions::standard()
+    };
+    let mut owned = BatchData::smoke_dummy(batch_size, options.feature_set);
+    for (row, bucket) in owned.bucket_idx.iter_mut().enumerate() {
+        *bucket = (row % options.num_buckets) as i32;
+    }
+    owned.score.fill(200.0);
+    owned.wdl.fill(0.8);
+    let batch = owned.as_ref();
+
+    let mut oxide_total = 0.0;
+    let mut native_total = 0.0;
+    for run in 0..runs {
+        if run.is_multiple_of(2) {
+            oxide_total += benchmark_layerstack_backend(&context, options, &batch, false, steps)?;
+            native_total += benchmark_layerstack_backend(&context, options, &batch, true, steps)?;
+        } else {
+            native_total += benchmark_layerstack_backend(&context, options, &batch, true, steps)?;
+            oxide_total += benchmark_layerstack_backend(&context, options, &batch, false, steps)?;
+        }
+    }
+    let oxide = oxide_total / runs as f64;
+    let native = native_total / runs as f64;
+    eprintln!(
+        "[native-bench-layerstack] batch={batch_size}, steps={steps}, runs={runs}, cuda-oxide={oxide:.0} pos/s, native={native:.0} pos/s, ratio={:.3}",
+        native / oxide
+    );
+    Ok(())
 }
 
 #[test]
