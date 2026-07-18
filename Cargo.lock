@@ -513,6 +513,7 @@ dependencies = [
  "nnue-format",
  "nnue-train",
  "proc-macro2",
+ "serde",
  "serde_json",
  "shogi-features",
  "shogi-format",
