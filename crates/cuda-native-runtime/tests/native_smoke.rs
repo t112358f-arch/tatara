@@ -35,7 +35,7 @@ fn every_source_export_resolves_from_embedded_fatbin() {
         resolved += 1;
     }
 
-    assert_eq!(resolved, 53, "CUDA source export inventory changed");
+    assert_eq!(resolved, 81, "CUDA source export inventory changed");
 }
 
 #[test]
@@ -71,6 +71,16 @@ fn vector_add_runs_from_embedded_fatbin() {
     let mut output = [0.0_f32; 5];
     output_device.copy_to(&mut output).unwrap();
     assert_eq!(output, [5.0, 3.0, 2.0, 8.5, 0.5]);
+}
+
+#[test]
+fn zero_length_device_buffer_is_a_noop_allocation() {
+    let context = Context::new(0).unwrap();
+    let buffer = DeviceBuffer::<f32>::zeroed(&context, 0).unwrap();
+    assert!(buffer.is_empty());
+    assert_eq!(buffer.device_ptr(), 0);
+    buffer.copy_from(&[]).unwrap();
+    buffer.copy_to(&mut []).unwrap();
 }
 
 #[test]
