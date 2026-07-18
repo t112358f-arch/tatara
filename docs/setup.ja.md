@@ -119,10 +119,11 @@ cargo test -p nnue-trainer --no-default-features --features native-cuda-host --r
 出力される`[native-bench-portable-fp16]`を同じ3環境変数で実行したWSLの値と比較する。
 これはdummy batch上のtrainer kernel測定で、PSV decodeとdisk I/Oは含まない。
 
-現在の対応範囲は Simple (HalfKaHmMerged を含む)、CReLU / SCReLU / Pairwise、
-任意のhidden dimension、FP32 / FP16 option/state (TF32 ON / OFF)、factorizer ON / OFF、
-Sigmoid / WRM (拡張設定を含む)、norm loss、Ranger / RAdam / AdamW。Simpleが起動し得る
-全kernelを収録する。LayerStackは未対応で、起動時に拒否する。
+現在の対応範囲は Simple (HalfKaHmMerged を含む) と LayerStack。Simpleは CReLU /
+SCReLU / Pairwise と任意のhidden dimensionに対応する。LayerStackは可変層次元とbucket
+mode、PSQT、feature factorizer、threat / effect featureに対応する。両architectureとも
+FP32 / FP16 option/state (TF32 ON / OFF)、Sigmoid / WRM (拡張設定を含む)、norm loss、
+Ranger / RAdam / AdamWを利用でき、各trainerが起動し得る全kernelを収録する。
 
 ## Windows (WSL2) の準備
 

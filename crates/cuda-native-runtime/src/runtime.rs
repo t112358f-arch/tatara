@@ -442,7 +442,14 @@ pub struct DeviceBuffer<T> {
 
 impl<T: Copy> DeviceBuffer<T> {
     pub fn uninitialized(context: &Context, len: usize) -> Result<Self> {
-        assert!(len > 0, "zero-length CUDA allocations are not supported");
+        if len == 0 {
+            return Ok(Self {
+                raw: 0,
+                len: 0,
+                context: Arc::clone(&context.inner),
+                marker: PhantomData,
+            });
+        }
         context.set_current()?;
         let bytes = len
             .checked_mul(size_of::<T>())
@@ -460,6 +467,9 @@ impl<T: Copy> DeviceBuffer<T> {
 
     pub fn zeroed(context: &Context, len: usize) -> Result<Self> {
         let buffer = Self::uninitialized(context, len)?;
+        if len == 0 {
+            return Ok(buffer);
+        }
         // SAFETY: allocation is live and its exact byte length was checked in uninitialized.
         unsafe { check(cuMemsetD8_v2(buffer.raw, 0, len * size_of::<T>()))? };
         Ok(buffer)
@@ -473,6 +483,9 @@ impl<T: Copy> DeviceBuffer<T> {
 
     pub fn copy_from(&self, values: &[T]) -> Result<()> {
         assert_eq!(values.len(), self.len, "host and device lengths differ");
+        if self.len == 0 {
+            return Ok(());
+        }
         set_current(&self.context)?;
         // SAFETY: both buffers are valid for len * size_of::<T>() bytes.
         unsafe {
@@ -496,6 +509,9 @@ impl<T: Copy> DeviceBuffer<T> {
         stream: &Stream,
     ) -> Result<()> {
         assert_eq!(values.len, self.len, "host and device lengths differ");
+        if self.len == 0 {
+            return Ok(());
+        }
         ensure_same_context(&self.context, &values.context);
         ensure_same_context(&self.context, &stream.context);
         set_current(&self.context)?;
@@ -512,6 +528,9 @@ impl<T: Copy> DeviceBuffer<T> {
 
     pub fn copy_to(&self, values: &mut [T]) -> Result<()> {
         assert_eq!(values.len(), self.len, "host and device lengths differ");
+        if self.len == 0 {
+            return Ok(());
+        }
         set_current(&self.context)?;
         // SAFETY: both buffers are valid for len * size_of::<T>() bytes.
         unsafe {
@@ -535,6 +554,9 @@ impl<T: Copy> DeviceBuffer<T> {
         stream: &Stream,
     ) -> Result<()> {
         assert_eq!(values.len, self.len, "host and device lengths differ");
+        if self.len == 0 {
+            return Ok(());
+        }
         ensure_same_context(&self.context, &values.context);
         ensure_same_context(&self.context, &stream.context);
         set_current(&self.context)?;
@@ -550,6 +572,9 @@ impl<T: Copy> DeviceBuffer<T> {
     }
 
     pub fn zero_async(&self, stream: &Stream) -> Result<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
         ensure_same_context(&self.context, &stream.context);
         set_current(&self.context)?;
         // SAFETY: the allocation is live and stream belongs to the selected context.
@@ -577,6 +602,9 @@ impl<T: Copy> DeviceBuffer<T> {
             values.len() <= self.len,
             "host slice exceeds device allocation"
         );
+        if values.is_empty() {
+            return Ok(());
+        }
         ensure_same_context(&self.context, &stream.context);
         set_current(&self.context)?;
         // SAFETY: the capacity assertion bounds the copy and caller owns the source lifetime.
@@ -600,6 +628,9 @@ impl<T: Copy> DeviceBuffer<T> {
             values.len() <= self.len,
             "host slice exceeds device allocation"
         );
+        if values.is_empty() {
+            return Ok(());
+        }
         ensure_same_context(&self.context, &stream.context);
         set_current(&self.context)?;
         // SAFETY: the capacity assertion bounds the copy and caller owns destination access.
@@ -614,6 +645,9 @@ impl<T: Copy> DeviceBuffer<T> {
     }
 
     pub fn fill_byte_async(&self, value: u8, stream: &Stream) -> Result<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
         ensure_same_context(&self.context, &stream.context);
         set_current(&self.context)?;
         // SAFETY: the allocation is live and the exact byte extent is used.
@@ -638,6 +672,9 @@ impl<T: Copy> DeviceBuffer<T> {
 
 impl<T> Drop for DeviceBuffer<T> {
     fn drop(&mut self) {
+        if self.raw == 0 {
+            return;
+        }
         // SAFETY: the retained context owns raw and stays alive through this call.
         unsafe {
             let _ = cuCtxSetCurrent(self.context.raw);
@@ -655,7 +692,14 @@ pub struct PinnedBuffer<T: Copy> {
 
 impl<T: Copy + Default> PinnedBuffer<T> {
     pub fn new(context: &Context, len: usize) -> Result<Self> {
-        assert!(len > 0, "zero-length pinned allocations are not supported");
+        if len == 0 {
+            return Ok(Self {
+                raw: ptr::NonNull::<T>::dangling().as_ptr().cast(),
+                len: 0,
+                context: Arc::clone(&context.inner),
+                marker: PhantomData,
+            });
+        }
         context.set_current()?;
         let bytes = len
             .checked_mul(size_of::<T>())
@@ -705,6 +749,9 @@ impl<T: Copy> PinnedBuffer<T> {
 
 impl<T: Copy> Drop for PinnedBuffer<T> {
     fn drop(&mut self) {
+        if self.len == 0 {
+            return;
+        }
         // SAFETY: the retained context stays alive and raw was allocated once by cuMemHostAlloc.
         unsafe {
             let _ = cuCtxSetCurrent(self.context.raw);

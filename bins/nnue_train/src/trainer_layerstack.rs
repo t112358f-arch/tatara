@@ -45,6 +45,10 @@ pub(crate) struct StepOptions<'a> {
     prof_t0: &'a mut std::time::Instant,
 }
 
+#[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
+pub(crate) type LayerStackRawCheckpointState =
+    (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
+
 impl<'a> StepContext<'a> {
     fn new(
         trainer: &GpuTrainer,
@@ -760,11 +764,6 @@ impl GpuTrainer {
         psqt_init: Option<&[f32]>,
         init_spec: &LayerStackInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
-        if native_backend_requested() {
-            return Err("native CUDA currently supports only the Simple architecture".into());
-        }
-
         assert!(
             (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
             "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
@@ -1324,6 +1323,20 @@ impl GpuTrainer {
             });
         }
         groups
+    }
+
+    /// checkpoint に保存される全 weight / optimizer state と step counter を host へ
+    /// download する。backend 間の無中断学習比較に使う。
+    #[cfg(all(test, any(feature = "native-cuda", feature = "native-cuda-host")))]
+    pub(crate) fn raw_checkpoint_state_to_host(
+        &self,
+    ) -> Result<LayerStackRawCheckpointState, Box<dyn std::error::Error>> {
+        let groups = self
+            .raw_ckpt_group_sources()
+            .iter()
+            .map(|source| Ok((source.name, source.to_host(&self.stream)?)))
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        Ok((self.step_count, groups))
     }
 
     /// `--resume` 用 **raw f32 checkpoint** を atomic に書き出す。

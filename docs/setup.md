@@ -124,11 +124,12 @@ Compare the reported `[native-bench-portable-fp16]` value with a WSL run using
 the same three environment variables. This measures the trainer kernels on a
 dummy batch; it does not include PSV decoding or disk I/O.
 
-The current scope is Simple (including HalfKaHmMerged), CReLU / SCReLU / Pairwise,
-arbitrary hidden dimensions, FP32 and FP16 options or state with TF32 on or off,
-factorizer on or off, Sigmoid or WRM (including extended settings), norm loss,
-and Ranger / RAdam / AdamW. It contains every kernel that Simple can launch.
-LayerStack is unsupported and rejected at startup.
+The current scope is Simple (including HalfKaHmMerged) and LayerStack. Simple supports
+CReLU / SCReLU / Pairwise and arbitrary hidden dimensions. LayerStack supports its
+configurable dimensions and bucket modes, PSQT, feature factorization, threat and effect
+features, FP32 and FP16 options or state with TF32 on or off, Sigmoid or WRM (including
+extended settings), norm loss, and Ranger / RAdam / AdamW. The embedded fat binary
+contains every kernel that either trainer can launch.
 
 ## Preparing Windows (WSL2)
 

@@ -1847,3 +1847,844 @@ extern "C" __global__ void ranger_lookahead_lerp(
         slow_weights[i] = value;
     }
 }
+
+extern "C" __global__ void count_buckets(
+    const int* bucket_idx,
+    unsigned long long,
+    unsigned int* counts,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int num_buckets
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch) {
+        return;
+    }
+    const int bucket = bucket_idx[i];
+    const unsigned int bin = bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets
+        ? static_cast<unsigned int>(bucket)
+        : num_buckets;
+    atomicAdd(counts + bin, 1U);
+}
+
+extern "C" __global__ void exclusive_scan_aligned(
+    const unsigned int* counts,
+    unsigned long long,
+    unsigned int* offsets,
+    unsigned long long,
+    unsigned int n,
+    unsigned int align
+) {
+    if (blockIdx.x != 0 || threadIdx.x != 0) {
+        return;
+    }
+    unsigned int accumulator = 0;
+    for (unsigned int i = 0; i < n; ++i) {
+        const unsigned int remainder = accumulator % align;
+        if (remainder != 0) {
+            accumulator += align - remainder;
+        }
+        offsets[i] = accumulator;
+        accumulator += counts[i];
+    }
+}
+
+extern "C" __global__ void scatter_bucket_perm(
+    const int* bucket_idx,
+    unsigned long long,
+    const unsigned int* offsets,
+    unsigned long long,
+    unsigned int* write_counters,
+    unsigned long long,
+    int* permutation,
+    unsigned long long,
+    int* sorted_bucket,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int num_buckets
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= batch) {
+        return;
+    }
+    const int bucket = bucket_idx[i];
+    const unsigned int bin = bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets
+        ? static_cast<unsigned int>(bucket)
+        : num_buckets;
+    const unsigned int rank = atomicAdd(write_counters + bin, 1U);
+    const unsigned int destination = offsets[bin] + rank;
+    permutation[destination] = static_cast<int>(i);
+    sorted_bucket[destination] = bucket;
+}
+
+extern "C" __global__ void permute_rows_f32(
+    const float* input,
+    unsigned long long,
+    const int* permutation,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int dimension
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / dimension);
+    const unsigned int column = static_cast<unsigned int>(i % dimension);
+    const int source_row = permutation[row];
+    output[i] = source_row >= 0 && static_cast<unsigned int>(source_row) < batch
+        ? input[static_cast<unsigned long long>(source_row) * dimension + column]
+        : 0.0F;
+}
+
+extern "C" __global__ void inverse_permute_rows_f32(
+    const float* input,
+    unsigned long long,
+    const int* permutation,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int dimension
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / dimension);
+    const unsigned int column = static_cast<unsigned int>(i % dimension);
+    const int destination_row = permutation[row];
+    if (destination_row >= 0 && static_cast<unsigned int>(destination_row) < batch) {
+        output[static_cast<unsigned long long>(destination_row) * dimension + column] = input[i];
+    }
+}
+
+extern "C" __global__ void abs_pow2_scale_fwd(
+    const float* input,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    float scale,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        output[i] = input[i] * input[i] * scale;
+    }
+}
+
+extern "C" __global__ void abs_pow2_scale_grad(
+    const float* input,
+    unsigned long long,
+    const float* output_gradient,
+    unsigned long long,
+    float* input_gradient,
+    unsigned long long,
+    float scale,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        input_gradient[i] = 2.0F * input[i] * scale * output_gradient[i];
+    }
+}
+
+extern "C" __global__ void concat_l1sqr_main_fwd(
+    const float* lhs,
+    unsigned long long,
+    const float* rhs,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int lhs_dimension,
+    unsigned int rhs_dimension
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned int output_dimension = lhs_dimension + rhs_dimension;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * output_dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / output_dimension);
+    const unsigned int column = static_cast<unsigned int>(i % output_dimension);
+    output[i] = column < lhs_dimension
+        ? lhs[static_cast<unsigned long long>(row) * lhs_dimension + column]
+        : rhs[static_cast<unsigned long long>(row) * rhs_dimension + column - lhs_dimension];
+}
+
+extern "C" __global__ void concat_l1sqr_main_grad(
+    const float* output_gradient,
+    unsigned long long,
+    float* lhs_gradient,
+    unsigned long long,
+    float* rhs_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int dimension
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / dimension);
+    const unsigned int column = static_cast<unsigned int>(i % dimension);
+    const unsigned long long base = static_cast<unsigned long long>(row) * 2U * dimension;
+    lhs_gradient[i] = output_gradient[base + column];
+    rhs_gradient[i] = output_gradient[base + dimension + column];
+}
+
+extern "C" __global__ void bias_add_per_bucket_row(
+    const float* bias,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * output_dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / output_dimension);
+    const unsigned int column = static_cast<unsigned int>(i % output_dimension);
+    const int bucket = bucket_idx[row];
+    if (bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets) {
+        output[i] += bias[static_cast<unsigned long long>(bucket) * output_dimension + column];
+    }
+}
+
+extern "C" __global__ void elementwise_add(
+    const float* lhs,
+    unsigned long long,
+    const float* rhs,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        output[i] = lhs[i] + rhs[i];
+    }
+}
+
+extern "C" __global__ void slice_extract_2d(
+    const float* source,
+    unsigned long long,
+    float* destination,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int source_stride,
+    unsigned int source_offset,
+    unsigned int output_dimension
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * output_dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / output_dimension);
+    const unsigned int column = static_cast<unsigned int>(i % output_dimension);
+    destination[i] = source[static_cast<unsigned long long>(row) * source_stride + source_offset + column];
+}
+
+extern "C" __global__ void slice_scatter_2d(
+    const float* source,
+    unsigned long long,
+    float* destination,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int input_dimension,
+    unsigned int destination_stride,
+    unsigned int destination_offset
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * input_dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / input_dimension);
+    const unsigned int column = static_cast<unsigned int>(i % input_dimension);
+    destination[static_cast<unsigned long long>(row) * destination_stride + destination_offset + column] =
+        source[i];
+}
+
+extern "C" __global__ void psqt_diff_sparse_fwd_inplace(
+    const float* weights,
+    unsigned long long,
+    const int* stm_indices,
+    unsigned long long,
+    const int* nstm_indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* network_output,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int max_active,
+    unsigned int num_buckets,
+    unsigned int feature_count
+) {
+    const unsigned int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= batch) {
+        return;
+    }
+    const int bucket = bucket_idx[row];
+    if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
+        return;
+    }
+    float stm_sum = 0.0F;
+    float nstm_sum = 0.0F;
+    const unsigned int base = row * max_active;
+    for (int active = 0; active < nonzero_counts[row]; ++active) {
+        const int stm = stm_indices[base + static_cast<unsigned int>(active)];
+        const int nstm = nstm_indices[base + static_cast<unsigned int>(active)];
+        if (stm >= 0 && static_cast<unsigned int>(stm) < feature_count) {
+            stm_sum += weights[static_cast<unsigned long long>(stm) * num_buckets + bucket];
+        }
+        if (nstm >= 0 && static_cast<unsigned int>(nstm) < feature_count) {
+            nstm_sum += weights[static_cast<unsigned long long>(nstm) * num_buckets + bucket];
+        }
+    }
+    network_output[row] += 0.5F * (stm_sum - nstm_sum);
+}
+
+extern "C" __global__ void psqt_diff_sparse_bwd(
+    const float* network_gradient,
+    unsigned long long,
+    const int* stm_indices,
+    unsigned long long,
+    const int* nstm_indices,
+    unsigned long long,
+    const int* nonzero_counts,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* weight_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int max_active,
+    unsigned int num_buckets,
+    unsigned int feature_count
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * max_active;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / max_active);
+    const unsigned int active = static_cast<unsigned int>(i % max_active);
+    if (active >= static_cast<unsigned int>(nonzero_counts[row])) {
+        return;
+    }
+    const int bucket = bucket_idx[row];
+    if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
+        return;
+    }
+    const float gradient = 0.5F * network_gradient[row];
+    const int stm = stm_indices[i];
+    const int nstm = nstm_indices[i];
+    if (stm >= 0 && static_cast<unsigned int>(stm) < feature_count) {
+        atomicAdd(weight_gradient + static_cast<unsigned long long>(stm) * num_buckets + bucket, gradient);
+    }
+    if (nstm >= 0 && static_cast<unsigned int>(nstm) < feature_count) {
+        atomicAdd(weight_gradient + static_cast<unsigned long long>(nstm) * num_buckets + bucket, -gradient);
+    }
+}
+
+extern "C" __global__ void ft_post_perspective_grad_fused(
+    const float* combined_gradient_a,
+    unsigned long long,
+    const float* combined_gradient_b,
+    unsigned long long,
+    const float* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    float* ft_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    unsigned int combined_offset,
+    unsigned int combined_stride,
+    float scale
+) {
+    const unsigned long long pair =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned int half = ft_dimension / 2;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * half;
+    if (pair >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(pair / half);
+    const unsigned int column = static_cast<unsigned int>(pair % half);
+    const unsigned long long combined_index =
+        static_cast<unsigned long long>(row) * combined_stride + combined_offset + column;
+    const float dy = combined_gradient_a[combined_index] + combined_gradient_b[combined_index];
+    const unsigned long long base = static_cast<unsigned long long>(row) * ft_dimension;
+    const float xa = ft_output[base + column] + bias[column];
+    const float xb = ft_output[base + half + column] + bias[half + column];
+    const float ya = native_clamp_unit(xa);
+    const float yb = native_clamp_unit(xb);
+    const float grad_a = xa > 0.0F && xa < 1.0F ? dy * yb * scale : 0.0F;
+    const float grad_b = xb > 0.0F && xb < 1.0F ? dy * ya * scale : 0.0F;
+    ft_gradient[base + column] = grad_a;
+    ft_gradient[base + half + column] = grad_b;
+    atomicAdd(bias_gradient + column, grad_a);
+    atomicAdd(bias_gradient + half + column, grad_b);
+}
+
+extern "C" __global__ void ft_post_perspective_grad_fused_fp16(
+    const float* combined_gradient_a,
+    unsigned long long,
+    const float* combined_gradient_b,
+    unsigned long long,
+    const __half* ft_output,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    __half* ft_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned long long* clamp_counter,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int ft_dimension,
+    unsigned int combined_offset,
+    unsigned int combined_stride,
+    float scale,
+    float gradient_scale
+) {
+    const unsigned long long pair =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned int half = ft_dimension / 2;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * half;
+    if (pair >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(pair / half);
+    const unsigned int column = static_cast<unsigned int>(pair % half);
+    const unsigned long long combined_index =
+        static_cast<unsigned long long>(row) * combined_stride + combined_offset + column;
+    const float dy = combined_gradient_a[combined_index] + combined_gradient_b[combined_index];
+    const unsigned long long base = static_cast<unsigned long long>(row) * ft_dimension;
+    const float xa = __half2float(ft_output[base + column]) + bias[column];
+    const float xb = __half2float(ft_output[base + half + column]) + bias[half + column];
+    const float ya = native_clamp_unit(xa);
+    const float yb = native_clamp_unit(xb);
+    const float grad_a = xa > 0.0F && xa < 1.0F ? dy * yb * scale : 0.0F;
+    const float grad_b = xb > 0.0F && xb < 1.0F ? dy * ya * scale : 0.0F;
+    const float scaled_a = grad_a * gradient_scale;
+    const float scaled_b = grad_b * gradient_scale;
+    const float clamped_a = native_clamp_half(scaled_a, clamp_counter);
+    const float clamped_b = native_clamp_half(scaled_b, clamp_counter);
+    ft_gradient[base + column] = __float2half_rn(clamped_a);
+    ft_gradient[base + half + column] = __float2half_rn(clamped_b);
+    atomicAdd(bias_gradient + column, grad_a);
+    atomicAdd(bias_gradient + half + column, grad_b);
+}
+
+extern "C" __global__ void dense_mm_fwd_bucket(
+    const float* input,
+    unsigned long long,
+    const float* weights,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int input_dimension,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * output_dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / output_dimension);
+    const unsigned int output_index = static_cast<unsigned int>(i % output_dimension);
+    const int bucket = bucket_idx[row];
+    if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
+        output[i] = 0.0F;
+        return;
+    }
+    const unsigned long long weight_base =
+        (static_cast<unsigned long long>(bucket) * output_dimension + output_index) * input_dimension;
+    const unsigned long long input_base = static_cast<unsigned long long>(row) * input_dimension;
+    float accumulator = bias[static_cast<unsigned long long>(bucket) * output_dimension + output_index];
+    for (unsigned int input_index = 0; input_index < input_dimension; ++input_index) {
+        accumulator += input[input_base + input_index] * weights[weight_base + input_index];
+    }
+    output[i] = accumulator;
+}
+
+extern "C" __global__ void dense_mm_fwd_bucket_tiled_l1_sorted(
+    const float* input,
+    unsigned long long,
+    const float* weights,
+    unsigned long long,
+    const float* bias,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int input_dimension,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned int local_row = threadIdx.x >> 4;
+    const unsigned int local_output = threadIdx.x & 15U;
+    const unsigned int row = blockIdx.x * 16U + local_row;
+    const unsigned int output_index = blockIdx.y * 16U + local_output;
+    if (row >= batch || output_index >= output_dimension) {
+        return;
+    }
+    const int bucket = bucket_idx[blockIdx.x * 16U];
+    const unsigned long long output_offset =
+        static_cast<unsigned long long>(row) * output_dimension + output_index;
+    if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
+        output[output_offset] = 0.0F;
+        return;
+    }
+    const unsigned long long input_base = static_cast<unsigned long long>(row) * input_dimension;
+    const unsigned long long weight_base =
+        (static_cast<unsigned long long>(bucket) * output_dimension + output_index) * input_dimension;
+    float accumulator = bias[static_cast<unsigned long long>(bucket) * output_dimension + output_index];
+    for (unsigned int input_index = 0; input_index < input_dimension; ++input_index) {
+        accumulator += input[input_base + input_index] * weights[weight_base + input_index];
+    }
+    output[output_offset] = accumulator;
+}
+
+extern "C" __global__ void dense_mm_bwd_input_bucket(
+    const float* output_gradient,
+    unsigned long long,
+    const float* weights,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* input_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int input_dimension,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * input_dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / input_dimension);
+    const unsigned int input_index = static_cast<unsigned int>(i % input_dimension);
+    const int bucket = bucket_idx[row];
+    if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
+        input_gradient[i] = 0.0F;
+        return;
+    }
+    float accumulator = 0.0F;
+    for (unsigned int output_index = 0; output_index < output_dimension; ++output_index) {
+        const unsigned long long weight_index =
+            (static_cast<unsigned long long>(bucket) * output_dimension + output_index) *
+                input_dimension +
+            input_index;
+        accumulator +=
+            output_gradient[static_cast<unsigned long long>(row) * output_dimension + output_index] *
+            weights[weight_index];
+    }
+    input_gradient[i] = accumulator;
+}
+
+extern "C" __global__ void dense_mm_bwd_input_tiled(
+    const float* output_gradient,
+    unsigned long long,
+    const float* weights,
+    unsigned long long,
+    float* input_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int input_dimension,
+    unsigned int output_dimension
+) {
+    const unsigned int input_tiles = input_dimension / 16U;
+    const unsigned int batch_tile = blockIdx.x / input_tiles;
+    const unsigned int input_tile = blockIdx.x % input_tiles;
+    const unsigned int row = batch_tile * 16U + (threadIdx.x >> 4);
+    const unsigned int input_index = input_tile * 16U + (threadIdx.x & 15U);
+    if (row >= batch || input_index >= input_dimension) {
+        return;
+    }
+    float accumulator = 0.0F;
+    for (unsigned int output_index = 0; output_index < output_dimension; ++output_index) {
+        accumulator +=
+            output_gradient[static_cast<unsigned long long>(row) * output_dimension + output_index] *
+            weights[static_cast<unsigned long long>(input_index) * output_dimension + output_index];
+    }
+    input_gradient[static_cast<unsigned long long>(row) * input_dimension + input_index] = accumulator;
+}
+
+extern "C" __global__ void dense_mm_bwd_input_bucket_tiled_sorted_scatter(
+    const float* output_gradient,
+    unsigned long long,
+    const float* weights,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    const int* permutation,
+    unsigned long long,
+    float* input_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int input_dimension,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned int sorted_row = blockIdx.y * 16U + (threadIdx.x >> 4);
+    const unsigned int input_index = blockIdx.x * 16U + (threadIdx.x & 15U);
+    if (sorted_row >= batch || input_index >= input_dimension) {
+        return;
+    }
+    const int destination_row = permutation[sorted_row];
+    if (destination_row < 0) {
+        return;
+    }
+    const int bucket = bucket_idx[blockIdx.y * 16U];
+    if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
+        input_gradient[static_cast<unsigned long long>(destination_row) * input_dimension + input_index] =
+            0.0F;
+        return;
+    }
+    float accumulator = 0.0F;
+    for (unsigned int output_index = 0; output_index < output_dimension; ++output_index) {
+        accumulator +=
+            output_gradient[static_cast<unsigned long long>(sorted_row) * output_dimension + output_index] *
+            weights[(static_cast<unsigned long long>(bucket) * output_dimension + output_index) *
+                        input_dimension +
+                    input_index];
+    }
+    input_gradient[static_cast<unsigned long long>(destination_row) * input_dimension + input_index] =
+        accumulator;
+}
+
+extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l1_sorted(
+    const float* input,
+    unsigned long long,
+    const float* output_gradient,
+    unsigned long long,
+    const unsigned int* bucket_offsets,
+    unsigned long long,
+    float* weight_gradient,
+    unsigned long long,
+    unsigned int padded_batch,
+    unsigned int input_dimension,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned int input_tiles = input_dimension / 16U;
+    const unsigned int input_tile = blockIdx.x % input_tiles;
+    const unsigned int output_tile = blockIdx.x / input_tiles;
+    const unsigned int input_index = input_tile * 16U + (threadIdx.x >> 4);
+    const unsigned int output_index = output_tile * 16U + (threadIdx.x & 15U);
+    const unsigned int bucket = blockIdx.z;
+    if (bucket >= num_buckets || input_index >= input_dimension || output_index >= output_dimension) {
+        return;
+    }
+    const unsigned int bucket_start = bucket_offsets[bucket];
+    const unsigned int bucket_end = min(bucket_offsets[bucket + 1U], padded_batch);
+    const unsigned int bucket_tiles = (bucket_end - bucket_start) / 16U;
+    const unsigned int tiles_per_split =
+        (bucket_tiles + gridDim.y - 1U) / gridDim.y;
+    const unsigned int first_tile = blockIdx.y * tiles_per_split;
+    const unsigned int last_tile = min(first_tile + tiles_per_split, bucket_tiles);
+    float accumulator = 0.0F;
+    for (unsigned int tile = first_tile; tile < last_tile; ++tile) {
+        const unsigned int first_row = bucket_start + tile * 16U;
+        for (unsigned int lane = 0; lane < 16U; ++lane) {
+            const unsigned int row = first_row + lane;
+            accumulator +=
+                input[static_cast<unsigned long long>(row) * input_dimension + input_index] *
+                output_gradient[static_cast<unsigned long long>(row) * output_dimension + output_index];
+        }
+    }
+    const unsigned long long index =
+        (static_cast<unsigned long long>(bucket) * output_dimension + output_index) * input_dimension +
+        input_index;
+    atomicAdd(weight_gradient + index, accumulator);
+}
+
+extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l2(
+    const float* input,
+    unsigned long long,
+    const float* output_gradient,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* weight_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int input_dimension,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned int cell = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int cells_per_bucket = input_dimension * output_dimension;
+    if (cell >= cells_per_bucket) {
+        return;
+    }
+    const unsigned int output_index = cell / input_dimension;
+    const unsigned int input_index = cell % input_dimension;
+    const unsigned int rows_per_split = (batch + gridDim.y - 1U) / gridDim.y;
+    const unsigned int first_row = blockIdx.y * rows_per_split;
+    const unsigned int last_row = min(first_row + rows_per_split, batch);
+    float accumulators[9] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    for (unsigned int row = first_row; row < last_row; ++row) {
+        const int bucket = bucket_idx[row];
+        if (bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets) {
+            accumulators[bucket] +=
+                input[static_cast<unsigned long long>(row) * input_dimension + input_index] *
+                output_gradient[static_cast<unsigned long long>(row) * output_dimension + output_index];
+        }
+    }
+    for (unsigned int bucket = 0; bucket < num_buckets; ++bucket) {
+        atomicAdd(weight_gradient + static_cast<unsigned long long>(bucket) * cells_per_bucket + cell,
+                  accumulators[bucket]);
+    }
+}
+
+extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l3(
+    const float* input,
+    unsigned long long,
+    const float* output_gradient,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* weight_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int input_dimension,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned int input_index = threadIdx.x % input_dimension;
+    const unsigned int lane = threadIdx.x / input_dimension;
+    const unsigned int lanes_per_column = blockDim.x / input_dimension;
+    const unsigned int stride = gridDim.x * lanes_per_column;
+    unsigned int row = blockIdx.x * lanes_per_column + lane;
+    float accumulators[9] = {0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F};
+    while (row < batch) {
+        const int bucket = bucket_idx[row];
+        if (bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets) {
+            accumulators[bucket] +=
+                input[static_cast<unsigned long long>(row) * input_dimension + input_index] *
+                output_gradient[static_cast<unsigned long long>(row) * output_dimension];
+        }
+        row += stride;
+    }
+    for (unsigned int bucket = 0; bucket < num_buckets; ++bucket) {
+        atomicAdd(weight_gradient + static_cast<unsigned long long>(bucket) * input_dimension + input_index,
+                  accumulators[bucket]);
+    }
+}
+
+extern "C" __global__ void bias_grad_shared_l1f(
+    const float* output_gradient,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int output_dimension
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * output_dimension;
+    if (i < total) {
+        atomicAdd(bias_gradient + i % output_dimension, output_gradient[i]);
+    }
+}
+
+extern "C" __global__ void bias_grad_bucket_shared_sorted(
+    const float* output_gradient,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned int padded_batch,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned int output_index = threadIdx.x;
+    const unsigned int first_row = blockIdx.x * 16U;
+    if (output_index >= output_dimension || first_row >= padded_batch) {
+        return;
+    }
+    const int bucket = bucket_idx[first_row];
+    if (bucket < 0 || static_cast<unsigned int>(bucket) >= num_buckets) {
+        return;
+    }
+    float accumulator = 0.0F;
+    const unsigned int last_row = min(first_row + 16U, padded_batch);
+    for (unsigned int row = first_row; row < last_row; ++row) {
+        accumulator +=
+            output_gradient[static_cast<unsigned long long>(row) * output_dimension + output_index];
+    }
+    atomicAdd(bias_gradient + static_cast<unsigned long long>(bucket) * output_dimension + output_index,
+              accumulator);
+}
+
+extern "C" __global__ void bias_grad_bucket(
+    const float* output_gradient,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* bias_gradient,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int output_dimension,
+    unsigned int num_buckets
+) {
+    const unsigned long long i =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(batch) * output_dimension;
+    if (i >= total) {
+        return;
+    }
+    const unsigned int row = static_cast<unsigned int>(i / output_dimension);
+    const unsigned int output_index = static_cast<unsigned int>(i % output_dimension);
+    const int bucket = bucket_idx[row];
+    if (bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets) {
+        atomicAdd(bias_gradient + static_cast<unsigned long long>(bucket) * output_dimension + output_index,
+                  output_gradient[i]);
+    }
+}
