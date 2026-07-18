@@ -1,0 +1,149 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/SH11235/tatara/blob/main/docs/schemas/native-cuda-benchmark-v1.schema.json",
+  "title": "tatara native CUDA benchmark report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "timestamp_unix_ms",
+    "profile",
+    "mode",
+    "parameters",
+    "environment",
+    "measurements",
+    "summaries",
+    "backend_comparisons",
+    "precision_speedups"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "timestamp_unix_ms": { "type": "integer", "minimum": 0 },
+    "profile": { "const": "v1" },
+    "mode": { "enum": ["native-only", "compare"] },
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["batch_size", "warmup_steps", "steps", "runs", "device", "customized"],
+      "properties": {
+        "batch_size": { "type": "integer", "minimum": 1 },
+        "warmup_steps": { "type": "integer", "minimum": 0 },
+        "steps": { "type": "integer", "minimum": 1 },
+        "runs": { "type": "integer", "minimum": 1 },
+        "device": { "type": "integer", "minimum": 0 },
+        "customized": { "type": "boolean" }
+      }
+    },
+    "environment": { "$ref": "#/$defs/environment" },
+    "measurements": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/measurement" }
+    },
+    "summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/summary" }
+    },
+    "backend_comparisons": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/backendComparison" }
+    },
+    "precision_speedups": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/precisionSpeedup" }
+    }
+  },
+  "$defs": {
+    "backend": { "enum": ["cuda-oxide", "native-cuda"] },
+    "architecture": { "enum": ["layerstack", "simple"] },
+    "precision": { "enum": ["fp32", "all-optim"] },
+    "nullableString": { "type": ["string", "null"] },
+    "precisionFlags": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tf32", "ft_fp16", "ft_fp16_out", "fp16_opt_state"],
+      "properties": {
+        "tf32": { "type": "boolean" },
+        "ft_fp16": { "type": "boolean" },
+        "ft_fp16_out": { "type": "boolean" },
+        "fp16_opt_state": { "type": "boolean" }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "os", "architecture", "gpu", "driver", "cuda_toolkit", "rustc", "git_commit", "dirty", "cargo_features", "command_line"],
+      "properties": {
+        "platform": { "type": "string" },
+        "os": { "type": "string" },
+        "architecture": { "type": "string" },
+        "gpu": { "$ref": "#/$defs/nullableString" },
+        "driver": { "$ref": "#/$defs/nullableString" },
+        "cuda_toolkit": { "$ref": "#/$defs/nullableString" },
+        "rustc": { "$ref": "#/$defs/nullableString" },
+        "git_commit": { "$ref": "#/$defs/nullableString" },
+        "dirty": { "type": ["boolean", "null"] },
+        "cargo_features": { "type": "array", "items": { "type": "string" } },
+        "command_line": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "measurement": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architecture", "fixture_id", "precision", "precision_flags", "backend", "run", "order_in_run", "positions", "elapsed_ns", "pos_per_sec"],
+      "properties": {
+        "architecture": { "$ref": "#/$defs/architecture" },
+        "fixture_id": { "enum": ["layerstack-halfka-hm-merged-factorized-v1", "simple-halfkp-factorized-v1"] },
+        "precision": { "$ref": "#/$defs/precision" },
+        "precision_flags": { "$ref": "#/$defs/precisionFlags" },
+        "backend": { "$ref": "#/$defs/backend" },
+        "run": { "type": "integer", "minimum": 1 },
+        "order_in_run": { "type": "integer", "minimum": 1 },
+        "positions": { "type": "integer", "minimum": 1 },
+        "elapsed_ns": { "type": "integer", "minimum": 1 },
+        "pos_per_sec": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architecture", "fixture_id", "precision", "backend", "runs", "mean_pos_per_sec", "median_pos_per_sec", "sample_sd_pos_per_sec", "min_pos_per_sec", "max_pos_per_sec"],
+      "properties": {
+        "architecture": { "$ref": "#/$defs/architecture" },
+        "fixture_id": { "enum": ["layerstack-halfka-hm-merged-factorized-v1", "simple-halfkp-factorized-v1"] },
+        "precision": { "$ref": "#/$defs/precision" },
+        "backend": { "$ref": "#/$defs/backend" },
+        "runs": { "type": "array", "minItems": 1, "items": { "type": "number", "exclusiveMinimum": 0 } },
+        "mean_pos_per_sec": { "type": "number", "exclusiveMinimum": 0 },
+        "median_pos_per_sec": { "type": "number", "exclusiveMinimum": 0 },
+        "sample_sd_pos_per_sec": { "type": "number", "minimum": 0 },
+        "min_pos_per_sec": { "type": "number", "exclusiveMinimum": 0 },
+        "max_pos_per_sec": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "backendComparison": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architecture", "precision", "paired_deltas_percent", "mean_paired_delta_percent", "sample_sd_paired_delta_percent", "native_over_oxide_ratio"],
+      "properties": {
+        "architecture": { "$ref": "#/$defs/architecture" },
+        "precision": { "$ref": "#/$defs/precision" },
+        "paired_deltas_percent": { "type": "array", "minItems": 1, "items": { "type": "number" } },
+        "mean_paired_delta_percent": { "type": "number" },
+        "sample_sd_paired_delta_percent": { "type": "number", "minimum": 0 },
+        "native_over_oxide_ratio": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
+    "precisionSpeedup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["architecture", "backend", "all_optim_over_fp32_ratio"],
+      "properties": {
+        "architecture": { "$ref": "#/$defs/architecture" },
+        "backend": { "$ref": "#/$defs/backend" },
+        "all_optim_over_fp32_ratio": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    }
+  }
+}

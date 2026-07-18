@@ -166,6 +166,26 @@ fn layerstack_subcommand_parses() {
 }
 
 #[test]
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+fn native_bench_subcommand_has_fixed_v1_defaults() {
+    let cli = Cli::try_parse_from(["nnue-train", "native-bench"])
+        .expect("native-bench subcommand should parse");
+    let ArchCommand::NativeBench(args) = cli.arch else {
+        panic!("expected native-bench subcommand");
+    };
+    assert_eq!(args.profile, NativeBenchProfileArg::V1);
+    assert_eq!(args.architecture, NativeBenchArchitectureArg::All);
+    assert_eq!(args.precision, NativeBenchPrecisionArg::All);
+    assert_eq!(args.mode, NativeBenchModeArg::NativeOnly);
+    assert_eq!(cli.batch_size, 16_384);
+    assert_eq!(args.warmup_steps, 3);
+    assert_eq!(args.steps, 100);
+    assert_eq!(args.runs, 3);
+    assert_eq!(args.device, 0);
+    assert!(!args.allow_dirty);
+}
+
+#[test]
 fn yaneuraou_output_format_parses_and_simple_rejects_it() {
     let cli = Cli::try_parse_from(["nnue-train", "--output-format", "yaneuraou", "layerstack"])
         .expect("YaneuraOu LayerStack output should parse");
@@ -197,6 +217,8 @@ fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
     {
         ArchCommand::LayerStack(args) => args,
         ArchCommand::Simple(_) => unreachable!("layerstack subcommand was requested"),
+        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+        ArchCommand::NativeBench(_) => unreachable!("layerstack subcommand was requested"),
     }
 }
 
@@ -345,6 +367,8 @@ fn simple_accepts_tf32_flag() {
     match cli.arch {
         ArchCommand::Simple(args) => assert!(args.tf32),
         ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
+        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+        ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
     }
 }
 
@@ -611,6 +635,8 @@ fn simple_activation_arg_parses_and_maps() {
         let act = match cli.arch {
             ArchCommand::Simple(args) => args.activation,
             ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
+            #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+            ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
         };
         assert_eq!(SimpleActivation::from_canonical_name(&act), Some(want));
     }

@@ -2,23 +2,28 @@ use gpu_runtime::{CudaContext, CudaModule};
 
 pub(crate) use gpu_runtime::{BLOCK_DIM, grid_dim_1d};
 
-#[cfg(all(test, feature = "native-cuda"))]
+#[cfg(feature = "native-cuda")]
 thread_local! {
-    static TEST_NATIVE_BACKEND: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    static NATIVE_BACKEND_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(feature = "native-cuda")]
+pub(crate) fn with_native_backend<T>(native: bool, operation: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            NATIVE_BACKEND_OVERRIDE.set(self.0);
+        }
+    }
+
+    let previous = NATIVE_BACKEND_OVERRIDE.replace(Some(native));
+    let _restore = Restore(previous);
+    operation()
 }
 
 #[cfg(all(test, feature = "native-cuda"))]
 pub(crate) fn with_test_native_backend<T>(native: bool, operation: impl FnOnce() -> T) -> T {
-    struct Restore(Option<bool>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            TEST_NATIVE_BACKEND.set(self.0);
-        }
-    }
-
-    let previous = TEST_NATIVE_BACKEND.replace(Some(native));
-    let _restore = Restore(previous);
-    operation()
+    with_native_backend(native, operation)
 }
 
 #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
@@ -28,8 +33,7 @@ pub(crate) fn native_backend_requested() -> bool {
 
     #[cfg(feature = "native-cuda")]
     {
-        #[cfg(test)]
-        if let Some(native) = TEST_NATIVE_BACKEND.get() {
+        if let Some(native) = NATIVE_BACKEND_OVERRIDE.get() {
             return native;
         }
         std::env::var_os("TATARA_CUDA_BACKEND").as_deref() == Some(std::ffi::OsStr::new("native"))

@@ -625,6 +625,10 @@ pub(crate) enum ArchCommand {
     LayerStack(LayerstackArgs),
     /// Simple 4-layer dense architecture (no buckets / PSQT / skip).
     Simple(SimpleArgs),
+    /// Run the fixed native CUDA throughput benchmark and write a JSON report.
+    #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+    #[command(name = "native-bench")]
+    NativeBench(NativeBenchArgs),
 }
 
 impl ArchCommand {
@@ -634,8 +638,91 @@ impl ArchCommand {
         match self {
             ArchCommand::LayerStack(_) => ArchKind::LayerStack,
             ArchCommand::Simple(_) => ArchKind::Simple,
+            #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+            ArchCommand::NativeBench(_) => {
+                unreachable!("native-bench does not select a training architecture")
+            }
         }
     }
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Args, Debug)]
+pub(crate) struct NativeBenchArgs {
+    /// Fixed fixture profile. Changing fixture defaults requires a new profile version.
+    #[arg(long, value_enum, default_value_t = NativeBenchProfileArg::V1)]
+    pub(crate) profile: NativeBenchProfileArg,
+
+    /// Architecture fixture(s) to measure.
+    #[arg(long, value_enum, default_value_t = NativeBenchArchitectureArg::All)]
+    pub(crate) architecture: NativeBenchArchitectureArg,
+
+    /// Precision configuration(s) to measure.
+    #[arg(long, value_enum, default_value_t = NativeBenchPrecisionArg::All)]
+    pub(crate) precision: NativeBenchPrecisionArg,
+
+    /// `native-only` runs CUDA C++ alone; `compare` alternates cuda-oxide and CUDA C++.
+    #[arg(long, value_enum, default_value_t = NativeBenchModeArg::NativeOnly)]
+    pub(crate) mode: NativeBenchModeArg,
+
+    /// Warm-up steps excluded from timing.
+    #[arg(long, default_value_t = 3)]
+    pub(crate) warmup_steps: usize,
+
+    /// Timed training steps per run.
+    #[arg(long, default_value_t = 100)]
+    pub(crate) steps: usize,
+
+    /// Independent runs per backend and precision.
+    #[arg(long, default_value_t = 3)]
+    pub(crate) runs: usize,
+
+    /// CUDA device ordinal.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) device: usize,
+
+    /// Directory receiving a timestamped JSON report.
+    #[arg(long, default_value = "target/benchmark-results/native-cuda")]
+    pub(crate) output_dir: PathBuf,
+
+    /// Permit benchmarking an uncommitted working tree (recorded as dirty in JSON).
+    #[arg(long)]
+    pub(crate) allow_dirty: bool,
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum NativeBenchProfileArg {
+    #[default]
+    V1,
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum NativeBenchArchitectureArg {
+    Layerstack,
+    Simple,
+    #[default]
+    All,
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum NativeBenchPrecisionArg {
+    Fp32,
+    #[value(name = "all-optim")]
+    AllOptim,
+    #[default]
+    All,
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum NativeBenchModeArg {
+    #[default]
+    #[value(name = "native-only")]
+    NativeOnly,
+    Compare,
 }
 
 /// LayerStack アーキ固有の引数。

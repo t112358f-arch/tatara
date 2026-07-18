@@ -106,18 +106,16 @@ Get-Item "$smokeOut/native-simple-cli-1.bin", "$smokeOut/native-simple-cli-1.ckp
 
 正常終了し、両 file が空でないことを確認する。
 
-同一のmemory上fixtureでOS間throughputを比較する場合は次を実行する:
+同一の固定memory上fixtureでOS間throughputを比較する場合は次を実行する:
 
 ```powershell
-$env:TATARA_NATIVE_BENCH_BATCH = '16384'
-$env:TATARA_NATIVE_BENCH_STEPS = '100'
-$env:TATARA_NATIVE_BENCH_RUNS = '3'
-cargo test -p nnue-trainer --no-default-features --features native-cuda-host --release `
-  benchmark_factorized_fp16_simple_native_portable -- --ignored --nocapture --test-threads=1
+cargo run -p nnue-trainer --release --no-default-features --features native-cuda-host -- `
+  native-bench --architecture all --precision all
 ```
 
-出力される`[native-bench-portable-fp16]`を同じ3環境変数で実行したWSLの値と比較する。
-これはdummy batch上のtrainer kernel測定で、PSV decodeとdisk I/Oは含まない。
+LayerStackとSimpleのFP32/all-optimを測り、各runと環境情報をJSONに保存する。固定profile、
+WSL backend比較mode、統計、結果の扱いは[Native CUDA benchmark](native-cuda-benchmark.ja.md)
+を参照。
 
 現在の対応範囲は Simple (HalfKaHmMerged を含む) と LayerStack。Simpleは CReLU /
 SCReLU / Pairwise と任意のhidden dimensionに対応する。LayerStackは可変層次元とbucket
