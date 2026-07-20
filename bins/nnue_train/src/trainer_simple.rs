@@ -3,9 +3,10 @@ use std::path::Path;
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, LaunchConfig, cuda_launch};
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::init::{self, SimpleInit, WeightShape};
-use nnue_train::optimizer::radam_compute_step_size_denom;
+use nnue_train::optimizer::OptimizerKind;
 use nnue_train::trainer::LossKind;
 
+use crate::ft_factorize_host::{self, FoldComb};
 use crate::*;
 use crate::{arch::*, ckpt::*, kernel_module::*, trainer_common::*};
 
@@ -110,6 +111,8 @@ pub(crate) struct SimpleGpuWorkspace {
     stm_idx_dev: DeviceBuffer<i32>,
     /// 同 nstm。
     nstm_idx_dev: DeviceBuffer<i32>,
+    /// position ごとの実 active feature 数。
+    nnz_dev: DeviceBuffer<i32>,
     /// target score (`b`、centipawn)。
     score_dev: DeviceBuffer<f32>,
     /// target wdl (`b`、0.0/0.5/1.0)。
@@ -119,6 +122,7 @@ pub(crate) struct SimpleGpuWorkspace {
     /// 直前 step の compute と並走しても buffer 競合が起きない。
     stm_idx_dev_back: DeviceBuffer<i32>,
     nstm_idx_dev_back: DeviceBuffer<i32>,
+    nnz_dev_back: DeviceBuffer<i32>,
     score_dev_back: DeviceBuffer<f32>,
     wdl_dev_back: DeviceBuffer<f32>,
 }
@@ -177,10 +181,12 @@ impl SimpleGpuWorkspace {
             feat_positions: DeviceBuffer::<u32>::zeroed(stream, batch * max_active)?,
             stm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nnz_dev: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             stm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
             nstm_idx_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch * max_active)?,
+            nnz_dev_back: DeviceBuffer::<i32>::zeroed(stream, batch)?,
             score_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
             wdl_dev_back: DeviceBuffer::<f32>::zeroed(stream, batch)?,
         })
@@ -206,7 +212,7 @@ impl SimpleGpuWorkspace {
 }
 
 /// Simple 4 層アーキ用 GPU トレーナ。LayerStack 用 `GpuTrainer` と並ぶもう一方の
-/// アーキの host driver。1 batch の forward → loss → backward → Ranger optimizer step
+/// アーキの host driver。1 batch の forward → loss → backward → optimizer step
 /// を 8 weight group ({ft, l1, l2, l3} × {w, b}) について実行する。
 ///
 /// `--ft-fp16` / `--ft-fp16-out` / `--fp16-opt-state` / `--tf32` の risky 精度系 flag は
@@ -231,10 +237,22 @@ pub(crate) struct SimpleGpuTrainer {
     /// `ranger_lookahead_lerp_fp16_mirror` で `ft_w` 更新と同時に `ft_w_h` を書く。
     /// FP32 master `ft_w` / 量子化 checkpoint byte layout は不変。
     ft_fp16: bool,
-    /// `ft_w` の FP16 mirror。`ft_fp16` が `true` のときだけ `Some`。`sparse_ft_forward_fp16`
-    /// の weight 入力で、`radam_step_fp16_mirror` が optimizer step ごとに同期する。
-    /// 学習開始時の初期同期は [`sync_ft_w_h_mirror`](Self::sync_ft_w_h_mirror) で。
+    /// `ft_fp16` が `true` のときだけ `Some`。factorizer 無効時は `ft_w` (train 形状
+    /// = base) の FP16 mirror で、`sparse_ft_forward_fp16` の weight 入力・
+    /// `radam_step_fp16_mirror` が optimizer step ごとに同期する。factorizer 有効時は
+    /// 仮想行を実行へ畳み込んだ base 形状の f16 comb で、毎 step 末の
+    /// [`ft_factorize_host::launch_ft_fold`] が master (`ft_w`、train 形状) から再生成
+    /// する (optimizer は master のみ更新)。初期同期は
+    /// [`sync_ft_forward_weights`](Self::sync_ft_forward_weights)。
     ft_w_h: Option<DeviceBuffer<f16>>,
+    /// factorizer 有効かつ `ft_fp16` 無効のときの forward 用畳み込み weight (comb、
+    /// base 形状 `ft_in * ft_out` の f32)。`ft_w_h` の f16 comb と同役で、FP32 forward が
+    /// `ft_w` (train 形状 master) の代わりにこれを読む。毎 step 末の fold が再生成する。
+    ft_w_fold32: Option<DeviceBuffer<f32>>,
+    /// fold/reduce kernel に渡す threat within-pair prefix table (Simple の base feature
+    /// set は threat 行を持たないので実質 sentinel `[0]`、factorizer の virtual 対応を
+    /// piece-input 行に限定する)。factorizer 無効でも 1 要素確保する。
+    threat_pair_starts: DeviceBuffer<u32>,
     /// `--ft-fp16-out` opt-in flag。`true` の間 forward は `sparse_ft_forward_fp16_out`
     /// (FP16 weight + FP16 出力) で `ft_*_out` を f16 化し、FT post は活性化別の f16
     /// 入力 kernel (CReLU/SCReLU は `simple_bias_act_fwd_fp16_in_*`、Pairwise は
@@ -280,8 +298,8 @@ pub(crate) struct SimpleGpuTrainer {
     l3_w_grad: DeviceBuffer<f32>,
     l3_b_grad: DeviceBuffer<f32>,
 
-    // -- Ranger optimizer state (RAdam 1st/2nd moment + Lookahead slow weight、各 weight と同 shape) --
-    /// FT Ranger 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
+    // -- optimizer state (Adam 系 1st/2nd moment + lookahead slow weight、各 weight と同 shape) --
+    /// FT の 1st/2nd moment。既定 `f32`、`--fp16-opt-state` で `f16` ([`MomentBuf`])。
     /// 他 7 group の moment buffer は小さく `f16` 化の意味が無いので `f32` のまま。
     ft_w_m: MomentBuf,
     ft_w_v: MomentBuf,
@@ -337,14 +355,26 @@ pub(crate) struct SimpleGpuTrainer {
     input_ring: InputUploadRing,
     /// このトレーナのアーキ identity (feature set / 活性化 / 層次元)。
     id: SimpleId,
-    /// Ranger lookahead step counter。`RANGER_K` の倍数で lerp する。
+    /// optimizer step counter。ranger では `RANGER_K` の倍数で lookahead lerp する。
     step_count: u64,
-    /// Ranger optimizer の weight decay 係数 (`radam_step` 引数)。
+    /// optimizer 種別 (per-step scalar / beta1 / lookahead 有無を決める)。
+    optimizer: OptimizerKind,
+    /// weight decay 係数 (`radam_step` 引数)。
     weight_decay: f32,
+    /// oblique manifold norm-loss 正則化の係数 (`--norm-loss` opt-in、無効時 `None`)。
+    /// `Some(f)` の間 radam step の直前に各 weight group を
+    /// `w *= 1 - lr * 2 * f * (1 - 1 / (||w_group||_2 + eps))` で 1 へ緩める。
+    norm_loss_factor: Option<f32>,
+    /// norm-loss の per-group L2 norm 作業領域。長さは対象テンソル中の最大 group 数
+    /// (`norm_loss_factor` が `None` のときは 1 の dummy)。
+    norm_scratch: DeviceBuffer<f32>,
     /// 推論時の評価値スケール (`round(QA * QB / 学習 scale)`)。量子化 checkpoint
     /// 出力の arch 文字列に書く (`SimpleWeights::fv_scale`)。
     fv_scale: i32,
 }
+
+#[cfg(all(test, feature = "native-cuda"))]
+pub(crate) type SimpleRawCheckpointState = (u64, Vec<(&'static str, crate::ckpt::RawCkptGroup)>);
 
 impl Drop for SimpleGpuTrainer {
     fn drop(&mut self) {
@@ -358,22 +388,24 @@ impl Drop for SimpleGpuTrainer {
 
 impl SimpleGpuTrainer {
     /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         ctx: &std::sync::Arc<CudaContext>,
         batch_size: usize,
         id: SimpleId,
+        optimizer: OptimizerKind,
         weight_decay: f32,
+        norm_loss_factor: Option<f32>,
         fv_scale: i32,
         precision: PrecisionFlags,
         init_spec: &SimpleInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
         // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
-        debug_assert!(
-            !precision.ft_fp16_out || precision.ft_fp16,
-            "ft_fp16_out requires ft_fp16"
-        );
-        let stream = ctx.default_stream();
+        if precision.ft_fp16_out && !precision.ft_fp16 {
+            return Err("--ft-fp16-out requires --ft-fp16".into());
+        }
+        let stream = gpu_runtime::create_compute_stream(ctx)?;
         let module = load_kernel_module_with_fallback(ctx, "nnue_train")?;
         let dense_bias_grad_occ = DeviceOccupancy::query(ctx)?;
         let cublas = CublasHandle::new(&stream, precision.tf32)?;
@@ -406,10 +438,21 @@ impl SimpleGpuTrainer {
             "pairwise requires even ft_out for the half-split"
         );
 
+        // FT weight の行数。factorizer 有効時は base 実行 (`ft_in`) の後ろに piece-input
+        // 仮想行が連結される (`train_ft_in`)。sparse index の範囲と active 数は factorizer
+        // 非依存で base のまま — 仮想行は fold/reduce dense kernel でのみ読み書きされる。
+        let ft_factorize = id.feature_set.ft_factorize();
+        let train_ft_in = id.feature_set.train_ft_in();
+
         // weight / bias の初期値を `init_spec` から生成する。Simple は bucket / 共有
         // 因子層を持たないので全 group `flat`。fan_in は各層の入力次元 (FT=ft_in、
         // L1=combined_dim()、L2=l1_out、L3=l2_out)、bias は対応 weight と同じ fan_in。
-        let ft_w_h = init::sample(WeightShape::flat(ft_in * ft_out, ft_in), &init_spec.ft_w);
+        // FT weight は実 block を base 形状・base fan_in で sample し、factorizer の仮想
+        // block は zero を append する (train 形状で一括 sample すると仮想行に noise が
+        // 入り step-0 forward が OFF 構成とずれ、fan_in と RNG 消費数も変わって実 row の
+        // 乱数列が OFF と不一致になる)。
+        let mut ft_w_init = init::sample(WeightShape::flat(ft_in * ft_out, ft_in), &init_spec.ft_w);
+        ft_w_init.resize(train_ft_in * ft_out, 0.0);
         let ft_b_h = init::sample(WeightShape::flat(ft_out, ft_in), &init_spec.ft_b);
         let l1_in = id.combined_dim();
         let l1_w_h = init::sample(WeightShape::flat(l1_in * l1_out, l1_in), &init_spec.l1_w);
@@ -423,7 +466,7 @@ impl SimpleGpuTrainer {
         let z = |n: usize| -> Result<DeviceBuffer<f32>, Box<dyn std::error::Error>> {
             DeviceBuffer::<f32>::zeroed(&stream, n).map_err(Into::into)
         };
-        let ft_w_n = ft_in * ft_out;
+        let ft_w_n = train_ft_in * ft_out;
         let ft_b_n = ft_out;
         let l1_w_n = id.combined_dim() * l1_out;
         let l1_b_n = l1_out;
@@ -433,7 +476,7 @@ impl SimpleGpuTrainer {
         let l3_b_n = 1;
         // Lookahead slow weight は学習開始時 weights と同値で初期化する
         // (Ranger の初期 `slow_param ← param` 規約)。
-        let ft_w = DeviceBuffer::from_host(&stream, &ft_w_h)?;
+        let ft_w = DeviceBuffer::from_host(&stream, &ft_w_init)?;
         let ft_b = DeviceBuffer::from_host(&stream, &ft_b_h)?;
         let l1_w = DeviceBuffer::from_host(&stream, &l1_w_h)?;
         let l1_b = DeviceBuffer::from_host(&stream, &l1_b_h)?;
@@ -441,7 +484,7 @@ impl SimpleGpuTrainer {
         let l2_b = DeviceBuffer::from_host(&stream, &l2_b_h)?;
         let l3_w = DeviceBuffer::from_host(&stream, &l3_w_h)?;
         let l3_b = DeviceBuffer::from_host(&stream, &l3_b_h)?;
-        let ft_w_slow = DeviceBuffer::from_host(&stream, &ft_w_h)?;
+        let ft_w_slow = DeviceBuffer::from_host(&stream, &ft_w_init)?;
         let ft_b_slow = DeviceBuffer::from_host(&stream, &ft_b_h)?;
         let l1_w_slow = DeviceBuffer::from_host(&stream, &l1_w_h)?;
         let l1_b_slow = DeviceBuffer::from_host(&stream, &l1_b_h)?;
@@ -449,6 +492,24 @@ impl SimpleGpuTrainer {
         let l2_b_slow = DeviceBuffer::from_host(&stream, &l2_b_h)?;
         let l3_w_slow = DeviceBuffer::from_host(&stream, &l3_w_h)?;
         let l3_b_slow = DeviceBuffer::from_host(&stream, &l3_b_h)?;
+        let mut threat_pair_starts_host: Vec<u32> = id
+            .feature_set
+            .threat_factorize_pair_starts()
+            .into_iter()
+            .map(|x| x as u32)
+            .collect();
+        if threat_pair_starts_host.is_empty() {
+            threat_pair_starts_host.push(0);
+        }
+        // norm-loss reduce の per-group norm scratch。長さは対象テンソル中の最大 group 数
+        // (dense weight は per-output-neuron: FT=ft_out / L1=l1_out / L2=l2_out / L3=1、
+        // bias は per-tensor=1)。無効時は 1 の dummy。
+        let norm_scratch_len = if norm_loss_factor.is_some() {
+            ft_out.max(l1_out).max(l2_out).max(1)
+        } else {
+            1
+        };
+        let norm_scratch = DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?;
         Ok(Self {
             ft_w,
             ft_b,
@@ -497,17 +558,30 @@ impl SimpleGpuTrainer {
             fp16_clamp_elems_written: 0,
             loss_ring: AsyncLossRing::new(ctx)?,
             input_ring: InputUploadRing::new_simple(ctx, batch, id.feature_set.max_active())?,
+            // factorizer 有効時の `ft_w_h` / `ft_w_fold32` は forward 用 comb (base 形状)、
+            // 無効時の `ft_w_h` は master の cast mirror (train 形状 = base と同値)。いずれも
+            // `sync_ft_forward_weights` が初期同期する。
             ft_w_h: if precision.ft_fp16 {
-                Some(DeviceBuffer::<f16>::zeroed(&stream, ft_w_n)?)
+                let n = if ft_factorize { ft_in * ft_out } else { ft_w_n };
+                Some(DeviceBuffer::<f16>::zeroed(&stream, n)?)
             } else {
                 None
             },
+            ft_w_fold32: if ft_factorize && !precision.ft_fp16 {
+                Some(DeviceBuffer::<f32>::zeroed(&stream, ft_in * ft_out)?)
+            } else {
+                None
+            },
+            threat_pair_starts: DeviceBuffer::from_host(&stream, &threat_pair_starts_host)?,
             stream,
             module,
             dense_bias_grad_occ,
             id,
             step_count: 0,
+            optimizer,
             weight_decay,
+            norm_loss_factor,
+            norm_scratch,
             fv_scale,
             cublas,
             ft_fp16: precision.ft_fp16,
@@ -516,23 +590,106 @@ impl SimpleGpuTrainer {
         })
     }
 
-    /// 学習開始時の `ft_w_h` 初期同期。`ft_w_h` は `new` で zeroed 確保、optimizer
-    /// (`radam_step_fp16_mirror` / `ranger_lookahead_lerp_fp16_mirror`) が以後 step ごと
-    /// に維持するが、最初の forward の前に一度 `ft_w` (FP32 master) から cast しないと
-    /// mirror が全 0 で forward が trivial になる。`--init-from` / `--resume` で `ft_w`
-    /// を読み込んだ後にも呼ぶ。`ft_fp16` が無効 (`ft_w_h` が `None`) なら no-op。
-    pub(crate) fn sync_ft_w_h_mirror(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    /// forward が読む FT weight buffer (`ft_w_h` mirror / factorizer の comb) を現在の
+    /// `ft_w` (FP32 master) から再生成する。
+    ///
+    /// 構築直後の初期同期と、master を後から上書きする経路 (`--init-from` / `--resume`
+    /// の load 後) の再同期が役目。学習中は factorizer 無効 + `--ft-fp16` の mirror を
+    /// optimizer (`radam_step_fp16_mirror`) が step ごとに書き、factorizer 有効時の comb は
+    /// 毎 step 末の [`launch_ft_fold`](Self::launch_ft_fold) が維持する。どちらにも該当
+    /// しない構成 (FP32 + factorizer 無効) は forward が master を直接読むため no-op。
+    pub(crate) fn sync_ft_forward_weights(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.id.feature_set.ft_factorize() {
+            return self.launch_ft_fold();
+        }
         if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
             let ft_w_n = self.ws.ft_in * self.id.ft_out;
-            cuda_launch! {
-                kernel: cast_f32_to_f16,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(ft_w_n),
-                args: [slice(self.ft_w), slice_mut(ft_w_h), ft_w_n as u32]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: cast_f32_to_f16,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(ft_w_n),
+                    args: [slice(self.ft_w), slice_mut(ft_w_h), ft_w_n as u32]
+                }
             }?;
         }
         Ok(())
+    }
+
+    /// factorizer の forward 用畳み込み weight (comb = 実行 + 仮想行 broadcast、base 形状)
+    /// を `ft_w` (train 形状の FP32 master) から再生成する。`--ft-fp16` 系列では f16 comb
+    /// (`ft_w_h`)、FP32 では f32 comb (`ft_w_fold32`)。optimizer が master を書き換えた後、
+    /// 次の forward が読む前に毎 step 1 回呼ぶ。caller が factorizer 有効を保証する
+    /// (constructor が「factorize ⇒ comb buffer がちょうど 1 つ」を確立済み)。
+    fn launch_ft_fold(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // 非 factorize で誤呼び出しされると ft_fp16 構成では train 形状 mirror へ base 想定
+        // の fold が走り OOB read になるため、release でも入口で止める。
+        assert!(self.id.feature_set.ft_factorize());
+        let comb = if self.ft_fp16 {
+            FoldComb::F16(
+                self.ft_w_h
+                    .as_mut()
+                    .expect("ft_w_h (f16 comb) is Some when ft_factorize and ft_fp16 are enabled"),
+            )
+        } else {
+            FoldComb::F32(
+                self.ft_w_fold32
+                    .as_mut()
+                    .expect("ft_w_fold32 is Some when ft_factorize is enabled without ft_fp16"),
+            )
+        };
+        ft_factorize_host::launch_ft_fold(
+            &self.stream,
+            &self.module,
+            &self.id.feature_set,
+            self.id.ft_out,
+            &self.ft_w,
+            comb,
+            &self.threat_pair_starts,
+        )
+    }
+
+    /// FT weight master (`ft_w`、factorizer 有効時は train 形状) を host に download する。
+    /// factorizer の仮想行が更新されているかを test で観測するための accessor。
+    #[cfg(test)]
+    pub(crate) fn ft_w_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.ft_w.to_host_vec(&self.stream).map_err(Into::into)
+    }
+
+    /// `l1_w` を host へ download する (optimizer 配線検証テスト用)。
+    #[cfg(test)]
+    pub(crate) fn l1_w_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.l1_w.to_host_vec(&self.stream).map_err(Into::into)
+    }
+
+    /// `l1_w` の 1st moment を host へ download する (optimizer 配線検証テスト用)。
+    #[cfg(test)]
+    pub(crate) fn l1_w_m_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.l1_w_m.to_host_vec(&self.stream).map_err(Into::into)
+    }
+
+    /// `ft_w` の 1st moment を真値 `f32` で host へ download する (optimizer 配線
+    /// 検証テスト用)。`--fp16-opt-state` の `f16` 格納は scale を割り戻す。
+    #[cfg(test)]
+    pub(crate) fn ft_w_m_to_host(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        self.ft_w_m.to_host_f32(&self.stream, FT_OPT_M_SCALE)
+    }
+
+    /// checkpoint に保存される全 weight / optimizer state と step counter を host へ
+    /// download する。resume の無中断学習 oracle との比較に使う。
+    #[cfg(all(test, feature = "native-cuda"))]
+    pub(crate) fn raw_checkpoint_state_to_host(
+        &self,
+    ) -> Result<SimpleRawCheckpointState, Box<dyn std::error::Error>> {
+        let groups = self
+            .raw_ckpt_group_sources()
+            .iter()
+            .map(|source| Ok((source.name, source.to_host(&self.stream)?)))
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        Ok((self.step_count, groups))
     }
 
     /// 全 weight buffer を host に download し NaN/Inf が無いことを assert する。
@@ -576,7 +733,7 @@ impl SimpleGpuTrainer {
         Ok(loss_host[0])
     }
 
-    /// 1 batch の forward → backward → Ranger optimizer step を走らせ、loss kernel が
+    /// 1 batch の forward → backward → optimizer step を走らせ、loss kernel が
     /// 累積した Σerr² を返す。`bucket_idx` は受け取らない (Simple アーキは bucket 無し)。
     ///
     /// 環境変数 `NNUE_TRAIN_STEP_PROFILE` がセットされていれば各 phase の境界で
@@ -610,6 +767,7 @@ impl SimpleGpuTrainer {
         // h2d_reset を直前 step の compute と並走させる)。
         std::mem::swap(&mut self.ws.stm_idx_dev, &mut self.ws.stm_idx_dev_back);
         std::mem::swap(&mut self.ws.nstm_idx_dev, &mut self.ws.nstm_idx_dev_back);
+        std::mem::swap(&mut self.ws.nnz_dev, &mut self.ws.nnz_dev_back);
         std::mem::swap(&mut self.ws.score_dev, &mut self.ws.score_dev_back);
         std::mem::swap(&mut self.ws.wdl_dev, &mut self.ws.wdl_dev_back);
         self.input_ring.upload_simple(
@@ -618,6 +776,8 @@ impl SimpleGpuTrainer {
             &batch.stm_indices[..b * self.ws.max_active],
             &self.ws.nstm_idx_dev,
             &batch.nstm_indices[..b * self.ws.max_active],
+            &self.ws.nnz_dev,
+            &batch.nnz[..b],
             &self.ws.score_dev,
             &batch.score[..b],
             &self.ws.wdl_dev,
@@ -748,6 +908,7 @@ impl SimpleGpuTrainer {
                 &self.ws.nstm_idx_dev,
                 &batch.nstm_indices[..b * self.ws.max_active],
             )?;
+            copy_host_to_device_async_i32(&self.stream, &self.ws.nnz_dev, &batch.nnz[..b])?;
             copy_host_to_device_async_f32(&self.stream, &self.ws.score_dev, &batch.score[..b])?;
             copy_host_to_device_async_f32(&self.stream, &self.ws.wdl_dev, &batch.wdl[..b])?;
         }
@@ -773,88 +934,121 @@ impl SimpleGpuTrainer {
                 .ft_stm_out_h
                 .as_mut()
                 .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
-            cuda_launch! {
-                kernel: sparse_ft_forward_fp16_out,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * self.id.ft_out / 4),
-                args: [
-                    slice(ft_w_h),
-                    slice(self.ws.stm_idx_dev),
-                    slice_mut(ft_stm_out_h),
-                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: sparse_ft_forward_fp16_out,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * self.id.ft_out / 4),
+                    args: [
+                        slice(ft_w_h),
+                        slice(self.ws.stm_idx_dev),
+                        slice(self.ws.nnz_dev),
+                        slice_mut(ft_stm_out_h),
+                        b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                    ]
+                }
             }?;
             let mut ft_nstm_out_h = self
                 .ws
                 .ft_nstm_out_h
                 .as_mut()
                 .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
-            cuda_launch! {
-                kernel: sparse_ft_forward_fp16_out,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * self.id.ft_out / 4),
-                args: [
-                    slice(ft_w_h),
-                    slice(self.ws.nstm_idx_dev),
-                    slice_mut(ft_nstm_out_h),
-                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: sparse_ft_forward_fp16_out,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * self.id.ft_out / 4),
+                    args: [
+                        slice(ft_w_h),
+                        slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
+                        slice_mut(ft_nstm_out_h),
+                        b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                    ]
+                }
             }?;
         } else if self.ft_fp16 {
             let ft_w_h = self
                 .ft_w_h
                 .as_ref()
                 .expect("ft_w_h is Some when ft_fp16 is enabled");
-            cuda_launch! {
-                kernel: sparse_ft_forward_fp16,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * self.id.ft_out / 4),
-                args: [
-                    slice(ft_w_h),
-                    slice(self.ws.stm_idx_dev),
-                    slice_mut(self.ws.ft_stm_out),
-                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: sparse_ft_forward_fp16,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * self.id.ft_out / 4),
+                    args: [
+                        slice(ft_w_h),
+                        slice(self.ws.stm_idx_dev),
+                        slice(self.ws.nnz_dev),
+                        slice_mut(self.ws.ft_stm_out),
+                        b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                    ]
+                }
             }?;
-            cuda_launch! {
-                kernel: sparse_ft_forward_fp16,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * self.id.ft_out / 4),
-                args: [
-                    slice(ft_w_h),
-                    slice(self.ws.nstm_idx_dev),
-                    slice_mut(self.ws.ft_nstm_out),
-                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: sparse_ft_forward_fp16,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * self.id.ft_out / 4),
+                    args: [
+                        slice(ft_w_h),
+                        slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
+                        slice_mut(self.ws.ft_nstm_out),
+                        b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                    ]
+                }
             }?;
         } else {
-            cuda_launch! {
-                kernel: sparse_ft_forward,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * self.id.ft_out / 4),
-                args: [
-                    slice(self.ft_w),
-                    slice(self.ws.stm_idx_dev),
-                    slice_mut(self.ws.ft_stm_out),
-                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
-                ]
+            // factorizer 有効時は畳み込み済み comb (`ft_w_fold32`、base 形状) を読む
+            // (sparse path を base 次元に保つ)。無効時は master を直接読む。
+            let ft_w_fwd = self.ft_w_fold32.as_ref().unwrap_or(&self.ft_w);
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: sparse_ft_forward,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * self.id.ft_out / 4),
+                    args: [
+                        slice(ft_w_fwd),
+                        slice(self.ws.stm_idx_dev),
+                        slice(self.ws.nnz_dev),
+                        slice_mut(self.ws.ft_stm_out),
+                        b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                    ]
+                }
             }?;
-            cuda_launch! {
-                kernel: sparse_ft_forward,
-                stream: self.stream,
-                module: self.module,
-                config: cfg_1d(b * self.id.ft_out / 4),
-                args: [
-                    slice(self.ft_w),
-                    slice(self.ws.nstm_idx_dev),
-                    slice_mut(self.ws.ft_nstm_out),
-                    b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: sparse_ft_forward,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * self.id.ft_out / 4),
+                    args: [
+                        slice(ft_w_fwd),
+                        slice(self.ws.nstm_idx_dev),
+                        slice(self.ws.nnz_dev),
+                        slice_mut(self.ws.ft_nstm_out),
+                        b_u32, ft_out_u32, self.ws.ft_in as u32, self.ws.max_active as u32
+                    ]
+                }
             }?;
         }
         tick("fwd_ft", &self.stream, &mut prof_t0)?;
@@ -883,26 +1077,34 @@ impl SimpleGpuTrainer {
                         .ft_stm_out_h
                         .as_ref()
                         .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: simple_bias_act_fwd_fp16_in_crelu,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(ft_stm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.combined), l1_in_u32, 0_u32, b_u32, ft_out_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bias_act_fwd_fp16_in_crelu,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(ft_stm_out_h), slice(self.ft_b),
+                                slice_mut(self.ws.combined), l1_in_u32, 0_u32, b_u32, ft_out_u32
+                            ]
+                        }
                     }?;
                     let ft_nstm_out_h = self
                         .ws
                         .ft_nstm_out_h
                         .as_ref()
                         .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: simple_bias_act_fwd_fp16_in_crelu,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.combined), l1_in_u32, ft_out_u32, b_u32, ft_out_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bias_act_fwd_fp16_in_crelu,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(ft_nstm_out_h), slice(self.ft_b),
+                                slice_mut(self.ws.combined), l1_in_u32, ft_out_u32, b_u32, ft_out_u32
+                            ]
+                        }
                     }?;
                 }
                 SimpleActivation::SCReLU => {
@@ -911,26 +1113,34 @@ impl SimpleGpuTrainer {
                         .ft_stm_out_h
                         .as_ref()
                         .expect("ft_stm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: simple_bias_act_fwd_fp16_in_screlu,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(ft_stm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.combined), l1_in_u32, 0_u32, b_u32, ft_out_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bias_act_fwd_fp16_in_screlu,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(ft_stm_out_h), slice(self.ft_b),
+                                slice_mut(self.ws.combined), l1_in_u32, 0_u32, b_u32, ft_out_u32
+                            ]
+                        }
                     }?;
                     let ft_nstm_out_h = self
                         .ws
                         .ft_nstm_out_h
                         .as_ref()
                         .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: simple_bias_act_fwd_fp16_in_screlu,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.combined), l1_in_u32, ft_out_u32, b_u32, ft_out_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bias_act_fwd_fp16_in_screlu,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(ft_nstm_out_h), slice(self.ft_b),
+                                slice_mut(self.ws.combined), l1_in_u32, ft_out_u32, b_u32, ft_out_u32
+                            ]
+                        }
                     }?;
                 }
                 SimpleActivation::Pairwise => {
@@ -946,13 +1156,17 @@ impl SimpleGpuTrainer {
                         .ft_nstm_out_h
                         .as_ref()
                         .expect("ft_nstm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: ft_post_perspective_fwd_fp16,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(ft_stm_out_h), slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice_mut(self.ws.combined), b_u32, ft_out_u32, FT_POST_SCALE
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: ft_post_perspective_fwd_fp16,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(ft_stm_out_h), slice(ft_nstm_out_h), slice(self.ft_b),
+                                slice_mut(self.ws.combined), b_u32, ft_out_u32, FT_POST_SCALE
+                            ]
+                        }
                     }?;
                 }
             }
@@ -965,47 +1179,63 @@ impl SimpleGpuTrainer {
             // ~1.07 GB)。`ft_fp16_out` 経路は scale / clamp / f16 cast 含むため融合外。
             match self.id.activation {
                 SimpleActivation::CReLU => {
-                    cuda_launch! {
-                        kernel: simple_ft_post_fused_crelu,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice_mut(self.ws.ft_stm_out),
-                            slice(self.ft_b),
-                            slice_mut(self.ws.combined),
-                            b_u32, ft_out_u32, 0_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_ft_post_fused_crelu,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice_mut(self.ws.ft_stm_out),
+                                slice(self.ft_b),
+                                slice_mut(self.ws.combined),
+                                b_u32, ft_out_u32, 0_u32
+                            ]
+                        }
                     }?;
-                    cuda_launch! {
-                        kernel: simple_ft_post_fused_crelu,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice_mut(self.ws.ft_nstm_out),
-                            slice(self.ft_b),
-                            slice_mut(self.ws.combined),
-                            b_u32, ft_out_u32, ft_out_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_ft_post_fused_crelu,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice_mut(self.ws.ft_nstm_out),
+                                slice(self.ft_b),
+                                slice_mut(self.ws.combined),
+                                b_u32, ft_out_u32, ft_out_u32
+                            ]
+                        }
                     }?;
                 }
                 SimpleActivation::SCReLU => {
-                    cuda_launch! {
-                        kernel: simple_ft_post_fused_screlu,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice_mut(self.ws.ft_stm_out),
-                            slice(self.ft_b),
-                            slice_mut(self.ws.combined),
-                            b_u32, ft_out_u32, 0_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_ft_post_fused_screlu,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice_mut(self.ws.ft_stm_out),
+                                slice(self.ft_b),
+                                slice_mut(self.ws.combined),
+                                b_u32, ft_out_u32, 0_u32
+                            ]
+                        }
                     }?;
-                    cuda_launch! {
-                        kernel: simple_ft_post_fused_screlu,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice_mut(self.ws.ft_nstm_out),
-                            slice(self.ft_b),
-                            slice_mut(self.ws.combined),
-                            b_u32, ft_out_u32, ft_out_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_ft_post_fused_screlu,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice_mut(self.ws.ft_nstm_out),
+                                slice(self.ft_b),
+                                slice_mut(self.ws.combined),
+                                b_u32, ft_out_u32, ft_out_u32
+                            ]
+                        }
                     }?;
                 }
                 SimpleActivation::Pairwise => {
@@ -1014,16 +1244,20 @@ impl SimpleGpuTrainer {
                     // (`ft_post_perspective_fwd` は stm を前半 `[0, ft_out/2)`、nstm を
                     // 後半 `[ft_out/2, ft_out)` に置く)。`ft_*_out` は bias 未加算のまま
                     // 保持し、backward の `ft_post_perspective_grad` が bias を再加算する。
-                    cuda_launch! {
-                        kernel: ft_post_perspective_fwd,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(self.ws.ft_stm_out),
-                            slice(self.ws.ft_nstm_out),
-                            slice(self.ft_b),
-                            slice_mut(self.ws.combined),
-                            b_u32, ft_out_u32, FT_POST_SCALE
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: ft_post_perspective_fwd,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(self.ws.ft_stm_out),
+                                slice(self.ws.ft_nstm_out),
+                                slice(self.ft_b),
+                                slice_mut(self.ws.combined),
+                                b_u32, ft_out_u32, FT_POST_SCALE
+                            ]
+                        }
                     }?;
                 }
             }
@@ -1053,27 +1287,39 @@ impl SimpleGpuTrainer {
                 self.ws.l1_pre.cu_deviceptr() as *mut f32,
             )?;
         }
-        cuda_launch! {
-            kernel: bias_add_per_row,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * self.id.l1_out),
-            args: [slice(self.l1_b), slice_mut(self.ws.l1_pre), b_u32, l1_out_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: bias_add_per_row,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * self.id.l1_out),
+                args: [slice(self.l1_b), slice_mut(self.ws.l1_pre), b_u32, l1_out_u32]
+            }
         }?;
         let l1_n = b * self.id.l1_out;
         let l1_n_u32 = l1_n as u32;
         // L1 / L2 の dense 出力は単一ベクトルで pairwise 乗算が適用できないため、
         // Pairwise でも CReLU で活性化する (pairwise 乗算は FT post 固有)。
         match self.id.activation {
-            SimpleActivation::CReLU | SimpleActivation::Pairwise => cuda_launch! {
-                kernel: crelu_fwd, stream: self.stream, module: self.module,
-                config: cfg_1d(l1_n),
-                args: [slice(self.ws.l1_pre), slice_mut(self.ws.l1_acted), l1_n_u32]
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_fwd, stream: self.stream, module: self.module,
+                    config: cfg_1d(l1_n),
+                    args: [slice(self.ws.l1_pre), slice_mut(self.ws.l1_acted), l1_n_u32]
+                }
             }?,
-            SimpleActivation::SCReLU => cuda_launch! {
-                kernel: screlu_fwd, stream: self.stream, module: self.module,
-                config: cfg_1d(l1_n),
-                args: [slice(self.ws.l1_pre), slice_mut(self.ws.l1_acted), l1_n_u32]
+            SimpleActivation::SCReLU => unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: screlu_fwd, stream: self.stream, module: self.module,
+                    config: cfg_1d(l1_n),
+                    args: [slice(self.ws.l1_pre), slice_mut(self.ws.l1_acted), l1_n_u32]
+                }
             }?,
         }
 
@@ -1100,25 +1346,37 @@ impl SimpleGpuTrainer {
                 self.ws.l2_pre.cu_deviceptr() as *mut f32,
             )?;
         }
-        cuda_launch! {
-            kernel: bias_add_per_row,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b * self.id.l2_out),
-            args: [slice(self.l2_b), slice_mut(self.ws.l2_pre), b_u32, l2_out_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: bias_add_per_row,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b * self.id.l2_out),
+                args: [slice(self.l2_b), slice_mut(self.ws.l2_pre), b_u32, l2_out_u32]
+            }
         }?;
         let l2_n = b * self.id.l2_out;
         let l2_n_u32 = l2_n as u32;
         match self.id.activation {
-            SimpleActivation::CReLU | SimpleActivation::Pairwise => cuda_launch! {
-                kernel: crelu_fwd, stream: self.stream, module: self.module,
-                config: cfg_1d(l2_n),
-                args: [slice(self.ws.l2_pre), slice_mut(self.ws.l2_acted), l2_n_u32]
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_fwd, stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_n),
+                    args: [slice(self.ws.l2_pre), slice_mut(self.ws.l2_acted), l2_n_u32]
+                }
             }?,
-            SimpleActivation::SCReLU => cuda_launch! {
-                kernel: screlu_fwd, stream: self.stream, module: self.module,
-                config: cfg_1d(l2_n),
-                args: [slice(self.ws.l2_pre), slice_mut(self.ws.l2_acted), l2_n_u32]
+            SimpleActivation::SCReLU => unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: screlu_fwd, stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_n),
+                    args: [slice(self.ws.l2_pre), slice_mut(self.ws.l2_acted), l2_n_u32]
+                }
             }?,
         }
 
@@ -1141,12 +1399,16 @@ impl SimpleGpuTrainer {
                 self.ws.net_output.cu_deviceptr() as *mut f32,
             )?;
         }
-        cuda_launch! {
-            kernel: bias_add_per_row,
-            stream: self.stream,
-            module: self.module,
-            config: cfg_1d(b),
-            args: [slice(self.l3_b), slice_mut(self.ws.net_output), b_u32, 1_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: bias_add_per_row,
+                stream: self.stream,
+                module: self.module,
+                config: cfg_1d(b),
+                args: [slice(self.l3_b), slice_mut(self.ws.net_output), b_u32, 1_u32]
+            }
         }?;
         tick("fwd_dense", &self.stream, &mut prof_t0)?;
 
@@ -1154,22 +1416,26 @@ impl SimpleGpuTrainer {
         // L3 出力への grad を書く。`wdl_lambda` で score/wdl ターゲットを blend する。
         match loss {
             LossKind::Sigmoid { scale } => {
-                cuda_launch! {
-                    kernel: loss_wdl,
-                    stream: self.stream,
-                    module: self.module,
-                    config: cfg_1d(b),
-                    args: [
-                        slice(self.ws.net_output),
-                        slice(self.ws.score_dev),
-                        slice(self.ws.wdl_dev),
-                        batch.per_pos_norm,
-                        slice_mut(self.ws.dy_net_output),
-                        slice(self.loss_acc),
-                        wdl_lambda,
-                        scale,
-                        b_u32
-                    ]
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: loss_wdl,
+                        stream: self.stream,
+                        module: self.module,
+                        config: cfg_1d(b),
+                        args: [
+                            slice(self.ws.net_output),
+                            slice(self.ws.score_dev),
+                            slice(self.ws.wdl_dev),
+                            batch.per_pos_norm,
+                            slice_mut(self.ws.dy_net_output),
+                            slice(self.loss_acc),
+                            wdl_lambda,
+                            scale,
+                            b_u32
+                        ]
+                    }
                 }?;
             }
             LossKind::Wrm {
@@ -1188,39 +1454,47 @@ impl SimpleGpuTrainer {
                 // 帰着し weight_sum を launch せず bit-identical 経路を通す。
                 let extended = loss.wrm_extended();
                 if extended {
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: wrm_weight_sum,
+                            stream: self.stream,
+                            module: self.module,
+                            config: cfg_1d(b),
+                            args: [
+                                slice(self.ws.score_dev),
+                                slice(self.weight_sum_acc),
+                                weight_boost_w1, weight_boost_w2,
+                                target_offset, target_scaling, b_u32
+                            ]
+                        }
+                    }?;
+                }
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
                     cuda_launch! {
-                        kernel: wrm_weight_sum,
+                        kernel: loss_wrm,
                         stream: self.stream,
                         module: self.module,
                         config: cfg_1d(b),
                         args: [
+                            slice(self.ws.net_output),
                             slice(self.ws.score_dev),
+                            slice(self.ws.wdl_dev),
+                            batch.per_pos_norm,
+                            slice_mut(self.ws.dy_net_output),
+                            slice(self.loss_acc),
+                            wdl_lambda,
+                            nnue2score, in_scaling, in_offset,
+                            target_offset, target_scaling,
+                            pow_exp, qp_asymmetry, weight_boost_w1, weight_boost_w2,
                             slice(self.weight_sum_acc),
-                            weight_boost_w1, weight_boost_w2,
-                            target_offset, target_scaling, b_u32
+                            if extended { 1_u32 } else { 0_u32 },
+                            b_u32
                         ]
-                    }?;
-                }
-                cuda_launch! {
-                    kernel: loss_wrm,
-                    stream: self.stream,
-                    module: self.module,
-                    config: cfg_1d(b),
-                    args: [
-                        slice(self.ws.net_output),
-                        slice(self.ws.score_dev),
-                        slice(self.ws.wdl_dev),
-                        batch.per_pos_norm,
-                        slice_mut(self.ws.dy_net_output),
-                        slice(self.loss_acc),
-                        wdl_lambda,
-                        nnue2score, in_scaling, in_offset,
-                        target_offset, target_scaling,
-                        pow_exp, qp_asymmetry, weight_boost_w1, weight_boost_w2,
-                        slice(self.weight_sum_acc),
-                        if extended { 1_u32 } else { 0_u32 },
-                        b_u32
-                    ]
+                    }
                 }?;
             }
         }
@@ -1315,27 +1589,39 @@ impl SimpleGpuTrainer {
                 self.l3_w_grad.cu_deviceptr() as *mut f32,
             )?;
         }
-        cuda_launch! {
-            kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
-            config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, 1),
-            args: [slice(self.ws.dy_net_output), slice(self.l3_b_grad), b_u32, 1_u32]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
+                config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, 1),
+                args: [slice(self.ws.dy_net_output), slice(self.l3_b_grad), b_u32, 1_u32]
+            }
         }?;
         tick("L3_dense", &self.stream, &mut prof_t0)?;
 
         // ---- L2 activation grad: dl2_acted -> dl2_pre (kernel reads l2_pre) ----
         // L1 / L2 dense は Pairwise でも CReLU 活性化 (forward と対)。
         match self.id.activation {
-            SimpleActivation::CReLU | SimpleActivation::Pairwise => cuda_launch! {
-                kernel: crelu_grad, stream: self.stream, module: self.module,
-                config: cfg_1d(l2_n),
-                args: [slice(self.ws.l2_pre), slice(self.ws.dl2_acted),
-                       slice_mut(self.ws.dl2_pre), l2_n_u32]
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_n),
+                    args: [slice(self.ws.l2_pre), slice(self.ws.dl2_acted),
+                           slice_mut(self.ws.dl2_pre), l2_n_u32]
+                }
             }?,
-            SimpleActivation::SCReLU => cuda_launch! {
-                kernel: screlu_grad, stream: self.stream, module: self.module,
-                config: cfg_1d(l2_n),
-                args: [slice(self.ws.l2_pre), slice(self.ws.dl2_acted),
-                       slice_mut(self.ws.dl2_pre), l2_n_u32]
+            SimpleActivation::SCReLU => unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: screlu_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_n),
+                    args: [slice(self.ws.l2_pre), slice(self.ws.dl2_acted),
+                           slice_mut(self.ws.dl2_pre), l2_n_u32]
+                }
             }?,
         }
 
@@ -1378,33 +1664,49 @@ impl SimpleGpuTrainer {
         // (`--arch`/`--l3` で l2_out > 256 を指定した層) では任意幅で動く generic `bias_grad`
         // に fall back する。常用 arch は l2_out <= 256 で tiled path を通る。
         if l2_out_u32 <= DENSE_BIAS_GRAD_MAX_OUT {
-            cuda_launch! {
-                kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
-                config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, l2_out_u32),
-                args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
+                    config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, l2_out_u32),
+                    args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
+                }
             }?;
         } else {
-            cuda_launch! {
-                kernel: bias_grad, stream: self.stream, module: self.module,
-                config: cfg_1d(l2_n),
-                args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: bias_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_n),
+                    args: [slice(self.ws.dl2_pre), slice(self.l2_b_grad), b_u32, l2_out_u32]
+                }
             }?;
         }
         tick("L2_dense", &self.stream, &mut prof_t0)?;
 
         // ---- L1 activation grad: dl1_acted -> dl1_pre (kernel reads l1_pre) ----
         match self.id.activation {
-            SimpleActivation::CReLU | SimpleActivation::Pairwise => cuda_launch! {
-                kernel: crelu_grad, stream: self.stream, module: self.module,
-                config: cfg_1d(l1_n),
-                args: [slice(self.ws.l1_pre), slice(self.ws.dl1_acted),
-                       slice_mut(self.ws.dl1_pre), l1_n_u32]
+            SimpleActivation::CReLU | SimpleActivation::Pairwise => unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(l1_n),
+                    args: [slice(self.ws.l1_pre), slice(self.ws.dl1_acted),
+                           slice_mut(self.ws.dl1_pre), l1_n_u32]
+                }
             }?,
-            SimpleActivation::SCReLU => cuda_launch! {
-                kernel: screlu_grad, stream: self.stream, module: self.module,
-                config: cfg_1d(l1_n),
-                args: [slice(self.ws.l1_pre), slice(self.ws.dl1_acted),
-                       slice_mut(self.ws.dl1_pre), l1_n_u32]
+            SimpleActivation::SCReLU => unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: screlu_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(l1_n),
+                    args: [slice(self.ws.l1_pre), slice(self.ws.dl1_acted),
+                           slice_mut(self.ws.dl1_pre), l1_n_u32]
+                }
             }?,
         }
 
@@ -1446,16 +1748,24 @@ impl SimpleGpuTrainer {
         }
         // l2_out と同じく out_dim > 256 では generic `bias_grad` に fall back する。
         if l1_out_u32 <= DENSE_BIAS_GRAD_MAX_OUT {
-            cuda_launch! {
-                kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
-                config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, l1_out_u32),
-                args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_bias_grad_tiled, stream: self.stream, module: self.module,
+                    config: cfg_dense_bias_grad(self.dense_bias_grad_occ, b_u32, l1_out_u32),
+                    args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
+                }
             }?;
         } else {
-            cuda_launch! {
-                kernel: bias_grad, stream: self.stream, module: self.module,
-                config: cfg_1d(l1_n),
-                args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: bias_grad, stream: self.stream, module: self.module,
+                    config: cfg_1d(l1_n),
+                    args: [slice(self.ws.dl1_pre), slice(self.l1_b_grad), b_u32, l1_out_u32]
+                }
             }?;
         }
         tick("L1_dense", &self.stream, &mut prof_t0)?;
@@ -1493,15 +1803,19 @@ impl SimpleGpuTrainer {
                         .dft_stm_out_h
                         .as_mut()
                         .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: simple_act_grad_to_fp16_crelu_with_scale,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(ft_stm_out_h), slice(self.ft_b),
-                            slice(self.ws.dcombined), l1_in_u32, 0_u32, slice_mut(dft_stm_out_h),
-                            slice(self.fp16_clamp_counter),
-                            b_u32, ft_out_u32, dft_scale
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_act_grad_to_fp16_crelu_with_scale,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(ft_stm_out_h), slice(self.ft_b),
+                                slice(self.ws.dcombined), l1_in_u32, 0_u32, slice_mut(dft_stm_out_h),
+                                slice(self.fp16_clamp_counter),
+                                b_u32, ft_out_u32, dft_scale
+                            ]
+                        }
                     }?;
                     let ft_nstm_out_h = self
                         .ws
@@ -1513,15 +1827,19 @@ impl SimpleGpuTrainer {
                         .dft_nstm_out_h
                         .as_mut()
                         .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: simple_act_grad_to_fp16_crelu_with_scale,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice(self.ws.dcombined), l1_in_u32, ft_out_u32, slice_mut(dft_nstm_out_h),
-                            slice(self.fp16_clamp_counter),
-                            b_u32, ft_out_u32, dft_scale
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_act_grad_to_fp16_crelu_with_scale,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(ft_nstm_out_h), slice(self.ft_b),
+                                slice(self.ws.dcombined), l1_in_u32, ft_out_u32, slice_mut(dft_nstm_out_h),
+                                slice(self.fp16_clamp_counter),
+                                b_u32, ft_out_u32, dft_scale
+                            ]
+                        }
                     }?;
                     // stm + nstm の 2 launch × ft_n thread × 1 elem/thread = 2 * ft_n。
                     // `ft_n = b * ft_out_u32` (= b * ft_dim) なので 2 * b * ft_dim 要素/step。
@@ -1540,15 +1858,19 @@ impl SimpleGpuTrainer {
                         .dft_stm_out_h
                         .as_mut()
                         .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: simple_act_grad_to_fp16_screlu_with_scale,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(ft_stm_out_h), slice(self.ft_b),
-                            slice(self.ws.dcombined), l1_in_u32, 0_u32, slice_mut(dft_stm_out_h),
-                            slice(self.fp16_clamp_counter),
-                            b_u32, ft_out_u32, dft_scale
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_act_grad_to_fp16_screlu_with_scale,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(ft_stm_out_h), slice(self.ft_b),
+                                slice(self.ws.dcombined), l1_in_u32, 0_u32, slice_mut(dft_stm_out_h),
+                                slice(self.fp16_clamp_counter),
+                                b_u32, ft_out_u32, dft_scale
+                            ]
+                        }
                     }?;
                     let ft_nstm_out_h = self
                         .ws
@@ -1560,15 +1882,19 @@ impl SimpleGpuTrainer {
                         .dft_nstm_out_h
                         .as_mut()
                         .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: simple_act_grad_to_fp16_screlu_with_scale,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [
-                            slice(ft_nstm_out_h), slice(self.ft_b),
-                            slice(self.ws.dcombined), l1_in_u32, ft_out_u32, slice_mut(dft_nstm_out_h),
-                            slice(self.fp16_clamp_counter),
-                            b_u32, ft_out_u32, dft_scale
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_act_grad_to_fp16_screlu_with_scale,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [
+                                slice(ft_nstm_out_h), slice(self.ft_b),
+                                slice(self.ws.dcombined), l1_in_u32, ft_out_u32, slice_mut(dft_nstm_out_h),
+                                slice(self.fp16_clamp_counter),
+                                b_u32, ft_out_u32, dft_scale
+                            ]
+                        }
                     }?;
                     // see CReLU branch: stm+nstm 2 launch × ft_n elems = 2 * ft_n。
                     self.fp16_clamp_elems_written = self
@@ -1591,14 +1917,18 @@ impl SimpleGpuTrainer {
                         .dft_stm_out_h
                         .as_mut()
                         .expect("dft_stm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: ft_post_perspective_grad_fp16,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
-                        args: [slice(self.ws.dcombined), slice(ft_stm_out_h),
-                               slice(self.ft_b), slice_mut(dft_stm_out_h),
-                               slice(self.ft_b_grad), slice(self.fp16_clamp_counter),
-                               b_u32, ft_out_u32,
-                               0_u32, l1_in_u32, FT_POST_SCALE, dft_scale]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: ft_post_perspective_grad_fp16,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
+                            args: [slice(self.ws.dcombined), slice(ft_stm_out_h),
+                                   slice(self.ft_b), slice_mut(dft_stm_out_h),
+                                   slice(self.ft_b_grad), slice(self.fp16_clamp_counter),
+                                   b_u32, ft_out_u32,
+                                   0_u32, l1_in_u32, FT_POST_SCALE, dft_scale]
+                        }
                     }?;
                     let ft_nstm_out_h = self
                         .ws
@@ -1610,14 +1940,18 @@ impl SimpleGpuTrainer {
                         .dft_nstm_out_h
                         .as_mut()
                         .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: ft_post_perspective_grad_fp16,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
-                        args: [slice(self.ws.dcombined), slice(ft_nstm_out_h),
-                               slice(self.ft_b), slice_mut(dft_nstm_out_h),
-                               slice(self.ft_b_grad), slice(self.fp16_clamp_counter),
-                               b_u32, ft_out_u32,
-                               ft_out_u32 / 2, l1_in_u32, FT_POST_SCALE, dft_scale]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: ft_post_perspective_grad_fp16,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
+                            args: [slice(self.ws.dcombined), slice(ft_nstm_out_h),
+                                   slice(self.ft_b), slice_mut(dft_nstm_out_h),
+                                   slice(self.ft_b_grad), slice(self.fp16_clamp_counter),
+                                   b_u32, ft_out_u32,
+                                   ft_out_u32 / 2, l1_in_u32, FT_POST_SCALE, dft_scale]
+                        }
                     }?;
                     // Pairwise: stm+nstm 2 launch × (ft_n/2) thread × 2 elem/thread = 2 * ft_n。
                     self.fp16_clamp_elems_written = self
@@ -1628,31 +1962,47 @@ impl SimpleGpuTrainer {
         } else {
             match self.id.activation {
                 SimpleActivation::CReLU => {
-                    cuda_launch! {
-                        kernel: simple_bwd_ft_act_crelu_fused,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
-                               slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bwd_ft_act_crelu_fused,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
+                                   slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
+                        }
                     }?;
-                    cuda_launch! {
-                        kernel: simple_bwd_ft_act_crelu_fused,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
-                               slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bwd_ft_act_crelu_fused,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
+                                   slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
+                        }
                     }?;
                 }
                 SimpleActivation::SCReLU => {
-                    cuda_launch! {
-                        kernel: simple_bwd_ft_act_screlu_fused,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
-                               slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bwd_ft_act_screlu_fused,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
+                                   slice(self.ws.dft_stm_out), b_u32, ft_out_u32, 0_u32]
+                        }
                     }?;
-                    cuda_launch! {
-                        kernel: simple_bwd_ft_act_screlu_fused,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n),
-                        args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
-                               slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bwd_ft_act_screlu_fused,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n),
+                            args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
+                                   slice(self.ws.dft_nstm_out), b_u32, ft_out_u32, ft_out_u32]
+                        }
                     }?;
                 }
                 SimpleActivation::Pairwise => {
@@ -1663,21 +2013,29 @@ impl SimpleGpuTrainer {
                     // 指示関数 + pairwise 乗算の勾配を作る。この kernel は `dft_*_out`
                     // を書くと同時に `ft_b_grad` へ bias 勾配を atomic accumulate する
                     // ため、後段の `simple_bias_grad_dual` は Pairwise では呼ばない。
-                    cuda_launch! {
-                        kernel: ft_post_perspective_grad,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
-                        args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
-                               slice(self.ft_b), slice_mut(self.ws.dft_stm_out),
-                               slice(self.ft_b_grad), b_u32, ft_out_u32,
-                               0_u32, l1_in_u32, FT_POST_SCALE]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: ft_post_perspective_grad,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
+                            args: [slice(self.ws.dcombined), slice(self.ws.ft_stm_out),
+                                   slice(self.ft_b), slice_mut(self.ws.dft_stm_out),
+                                   slice(self.ft_b_grad), b_u32, ft_out_u32,
+                                   0_u32, l1_in_u32, FT_POST_SCALE]
+                        }
                     }?;
-                    cuda_launch! {
-                        kernel: ft_post_perspective_grad,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
-                        args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
-                               slice(self.ft_b), slice_mut(self.ws.dft_nstm_out),
-                               slice(self.ft_b_grad), b_u32, ft_out_u32,
-                               ft_out_u32 / 2, l1_in_u32, FT_POST_SCALE]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: ft_post_perspective_grad,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_n / 2),
+                            args: [slice(self.ws.dcombined), slice(self.ws.ft_nstm_out),
+                                   slice(self.ft_b), slice_mut(self.ws.dft_nstm_out),
+                                   slice(self.ft_b_grad), b_u32, ft_out_u32,
+                                   ft_out_u32 / 2, l1_in_u32, FT_POST_SCALE]
+                        }
                     }?;
                 }
             }
@@ -1722,34 +2080,42 @@ impl SimpleGpuTrainer {
                         .dft_nstm_out_h
                         .as_ref()
                         .expect("dft_nstm_out_h is Some when ft_fp16_out is enabled");
-                    cuda_launch! {
-                        kernel: simple_bias_grad_dual_fp16, stream: self.stream, module: self.module,
-                        config: LaunchConfig {
-                            grid_dim: (bias_grad_blocks, bias_grad_out_tiles, 1),
-                            block_dim: (bias_grad_block_dim, 1, 1),
-                            shared_mem_bytes: 0,
-                        },
-                        args: [
-                            slice(dft_stm_out_h),
-                            slice(dft_nstm_out_h),
-                            slice(self.ft_b_grad),
-                            b_u32, ft_out_u32, dft_inv_scale_fp16, bias_grad_items
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bias_grad_dual_fp16, stream: self.stream, module: self.module,
+                            config: LaunchConfig {
+                                grid_dim: (bias_grad_blocks, bias_grad_out_tiles, 1),
+                                block_dim: (bias_grad_block_dim, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            args: [
+                                slice(dft_stm_out_h),
+                                slice(dft_nstm_out_h),
+                                slice(self.ft_b_grad),
+                                b_u32, ft_out_u32, dft_inv_scale_fp16, bias_grad_items
+                            ]
+                        }
                     }?;
                 } else {
-                    cuda_launch! {
-                        kernel: simple_bias_grad_dual, stream: self.stream, module: self.module,
-                        config: LaunchConfig {
-                            grid_dim: (bias_grad_blocks, bias_grad_out_tiles, 1),
-                            block_dim: (bias_grad_block_dim, 1, 1),
-                            shared_mem_bytes: 0,
-                        },
-                        args: [
-                            slice(self.ws.dft_stm_out),
-                            slice(self.ws.dft_nstm_out),
-                            slice(self.ft_b_grad),
-                            b_u32, ft_out_u32, bias_grad_items
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: simple_bias_grad_dual, stream: self.stream, module: self.module,
+                            config: LaunchConfig {
+                                grid_dim: (bias_grad_blocks, bias_grad_out_tiles, 1),
+                                block_dim: (bias_grad_block_dim, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            args: [
+                                slice(self.ws.dft_stm_out),
+                                slice(self.ws.dft_nstm_out),
+                                slice(self.ft_b_grad),
+                                b_u32, ft_out_u32, bias_grad_items
+                            ]
+                        }
                     }?;
                 }
             }
@@ -1776,79 +2142,101 @@ impl SimpleGpuTrainer {
             memset_zero(&self.stream, &self.ws.feat_counts)?;
             memset_zero(&self.stream, &self.ws.feat_write_ctr)?;
             // A2: 各 (b, ni) sparse index について feat_counts[feature] を atomic increment。
-            cuda_launch! {
-                kernel: build_feature_counts,
-                stream: self.stream, module: self.module,
-                config: cfg_1d(b * self.ws.max_active),
-                args: [
-                    slice(idx_dev),
-                    slice(self.ws.feat_counts),
-                    b_u32, max_active_u32, ft_in_u32
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: build_feature_counts,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(b * self.ws.max_active),
+                    args: [
+                        slice(idx_dev),
+                        slice(self.ws.nnz_dev),
+                        slice(self.ws.feat_counts),
+                        b_u32, max_active_u32, ft_in_u32
+                    ]
+                }
             }?;
             // B: feat_counts の exclusive prefix sum (multi-block scan で全 SM を使う)。
             // 単一 block scan は 1 SM 律速 (`ft_in` ~73K-138K で大半 idle) のため 3 段に分割。
             let prefix_blocks = ft_in_u32.div_ceil(1024);
             // level 1: 各 block が連続 1024 要素を block-local scan、block 総和を emit。
-            cuda_launch! {
-                kernel: prefix_sum_block_local,
-                stream: self.stream, module: self.module,
-                config: LaunchConfig {
-                    grid_dim: (prefix_blocks, 1, 1),
-                    block_dim: (1024, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                args: [
-                    slice(self.ws.feat_counts),
-                    slice(self.ws.feat_offsets),
-                    slice(self.ws.feat_block_sums),
-                    ft_in_u32
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: prefix_sum_block_local,
+                    stream: self.stream, module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (prefix_blocks, 1, 1),
+                        block_dim: (1024, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.feat_counts),
+                        slice(self.ws.feat_offsets),
+                        slice(self.ws.feat_block_sums),
+                        ft_in_u32
+                    ]
+                }
             }?;
             // level 2: block 総和列 (prefix_blocks ≲ 135 要素) を単一 block で scan。
-            cuda_launch! {
-                kernel: exclusive_prefix_sum_small,
-                stream: self.stream, module: self.module,
-                config: LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (1024, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                args: [
-                    slice(self.ws.feat_block_sums),
-                    slice(self.ws.feat_block_offsets),
-                    prefix_blocks
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: exclusive_prefix_sum_small,
+                    stream: self.stream, module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (1024, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.feat_block_sums),
+                        slice(self.ws.feat_block_offsets),
+                        prefix_blocks
+                    ]
+                }
             }?;
             // level 3: block-local offsets へ block offset を加算 + offsets[n]=total。
-            cuda_launch! {
-                kernel: prefix_sum_add_block_offset,
-                stream: self.stream, module: self.module,
-                config: LaunchConfig {
-                    grid_dim: (prefix_blocks, 1, 1),
-                    block_dim: (1024, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                args: [
-                    slice(self.ws.feat_offsets),
-                    slice(self.ws.feat_block_offsets),
-                    ft_in_u32,
-                    prefix_blocks
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: prefix_sum_add_block_offset,
+                    stream: self.stream, module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (prefix_blocks, 1, 1),
+                        block_dim: (1024, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.feat_offsets),
+                        slice(self.ws.feat_block_offsets),
+                        ft_in_u32,
+                        prefix_blocks
+                    ]
+                }
             }?;
             // C: 各 (b, ni) sparse index について feat_positions の per-feature slot に
             // batch position `b` を書き込む (`feat_write_ctr[feature]++` で位置決定)。
-            cuda_launch! {
-                kernel: scatter_positions,
-                stream: self.stream, module: self.module,
-                config: cfg_1d(b * self.ws.max_active),
-                args: [
-                    slice(idx_dev),
-                    slice(self.ws.feat_offsets),
-                    slice(self.ws.feat_write_ctr),
-                    slice(self.ws.feat_positions),
-                    b_u32, max_active_u32, ft_in_u32
-                ]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: scatter_positions,
+                    stream: self.stream, module: self.module,
+                    config: cfg_1d(b * self.ws.max_active),
+                    args: [
+                        slice(idx_dev),
+                        slice(self.ws.nnz_dev),
+                        slice(self.ws.feat_offsets),
+                        slice(self.ws.feat_write_ctr),
+                        slice(self.ws.feat_positions),
+                        b_u32, max_active_u32, ft_in_u32
+                    ]
+                }
             }?;
             // D: 各 (feature, ri) cell について feat_positions[feat_offsets[f]..feat_offsets[f+1]]
             // を順 read して accumulate。iter 0 = stm は overwrite (全 cell 書き切り)、iter 1 =
@@ -1871,28 +2259,36 @@ impl SimpleGpuTrainer {
                     dft_nstm_out_h
                 };
                 if iter_idx == 0 {
-                    cuda_launch! {
-                        kernel: gather_and_sum_per_feature_overwrite_fp16,
-                        stream: self.stream, module: self.module, config: gather_config,
-                        args: [
-                            slice(dft_h),
-                            slice(self.ws.feat_positions),
-                            slice(self.ws.feat_offsets),
-                            slice(self.ft_w_grad),
-                            ft_in_u32, ft_out_u32, dft_inv_scale_fp16
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: gather_and_sum_per_feature_overwrite_fp16,
+                            stream: self.stream, module: self.module, config: gather_config,
+                            args: [
+                                slice(dft_h),
+                                slice(self.ws.feat_positions),
+                                slice(self.ws.feat_offsets),
+                                slice(self.ft_w_grad),
+                                ft_in_u32, ft_out_u32, dft_inv_scale_fp16
+                            ]
+                        }
                     }?;
                 } else {
-                    cuda_launch! {
-                        kernel: gather_and_sum_per_feature_add_fp16,
-                        stream: self.stream, module: self.module, config: gather_config,
-                        args: [
-                            slice(dft_h),
-                            slice(self.ws.feat_positions),
-                            slice(self.ws.feat_offsets),
-                            slice(self.ft_w_grad),
-                            ft_in_u32, ft_out_u32, dft_inv_scale_fp16
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: gather_and_sum_per_feature_add_fp16,
+                            stream: self.stream, module: self.module, config: gather_config,
+                            args: [
+                                slice(dft_h),
+                                slice(self.ws.feat_positions),
+                                slice(self.ws.feat_offsets),
+                                slice(self.ft_w_grad),
+                                ft_in_u32, ft_out_u32, dft_inv_scale_fp16
+                            ]
+                        }
                     }?;
                 }
             } else {
@@ -1902,50 +2298,78 @@ impl SimpleGpuTrainer {
                     &self.ws.dft_nstm_out
                 };
                 if iter_idx == 0 {
-                    cuda_launch! {
-                        kernel: gather_and_sum_per_feature_overwrite,
-                        stream: self.stream, module: self.module, config: gather_config,
-                        args: [
-                            slice(dft),
-                            slice(self.ws.feat_positions),
-                            slice(self.ws.feat_offsets),
-                            slice(self.ft_w_grad),
-                            ft_in_u32, ft_out_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: gather_and_sum_per_feature_overwrite,
+                            stream: self.stream, module: self.module, config: gather_config,
+                            args: [
+                                slice(dft),
+                                slice(self.ws.feat_positions),
+                                slice(self.ws.feat_offsets),
+                                slice(self.ft_w_grad),
+                                ft_in_u32, ft_out_u32
+                            ]
+                        }
                     }?;
                 } else {
-                    cuda_launch! {
-                        kernel: gather_and_sum_per_feature_add,
-                        stream: self.stream, module: self.module, config: gather_config,
-                        args: [
-                            slice(dft),
-                            slice(self.ws.feat_positions),
-                            slice(self.ws.feat_offsets),
-                            slice(self.ft_w_grad),
-                            ft_in_u32, ft_out_u32
-                        ]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: gather_and_sum_per_feature_add,
+                            stream: self.stream, module: self.module, config: gather_config,
+                            args: [
+                                slice(dft),
+                                slice(self.ws.feat_positions),
+                                slice(self.ws.feat_offsets),
+                                slice(self.ft_w_grad),
+                                ft_in_u32, ft_out_u32
+                            ]
+                        }
                     }?;
                 }
             }
+        }
+        // factorizer: piece-input 仮想行の grad を対応 base 実行の grad 和で埋める。
+        // 上の gather は実 block (`[0, ft_in)`) のみ書くので、仮想 block は reduce が
+        // overwrite で書き切る。optimizer は train 形状 master の全行を更新する。
+        if self.id.feature_set.ft_factorize() {
+            ft_factorize_host::launch_ft_reduce(
+                &self.stream,
+                &self.module,
+                &self.id.feature_set,
+                self.id.ft_out,
+                &self.ft_w_grad,
+                &self.threat_pair_starts,
+            )?;
         }
         tick("bwd_ft_bw", &self.stream, &mut prof_t0)?;
 
         Ok(())
     }
 
-    /// Ranger optimizer step (RAdam + Lookahead) を 8 weight group に走らせる。
-    /// `RANGER_K` の倍数 step では lookahead lerp を続けて走らせ slow weight と
-    /// master weight を補間する。`run_backward_kernels` の直後に呼ぶ。
+    /// optimizer step を 8 weight group に走らせる。3 種 (ranger / radam / adamw)
+    /// とも element 更新は同じ radam_step kernel で、per-step scalar
+    /// (`step_size`, `denom`) と `beta1`、lookahead lerp の有無だけが異なる
+    /// ([`OptimizerKind`])。ranger では `RANGER_K` の倍数 step で lookahead lerp を
+    /// 続けて走らせ slow weight と master weight を補間する。
+    /// `run_backward_kernels` の直後に呼ぶ。
     pub(crate) fn run_optimizer_step(&mut self, lr: f32) -> Result<(), Box<dyn std::error::Error>> {
         self.step_count += 1;
         let (step_size, denom) =
-            radam_compute_step_size_denom(self.step_count, BETA1, BETA2, N_SMA_THRESHOLD);
+            self.optimizer
+                .step_size_denom(self.step_count, BETA2, N_SMA_THRESHOLD);
+        let beta1 = self.optimizer.beta1();
 
-        let ft_in = self.ws.ft_in;
         let ft_out = self.id.ft_out;
         let l1_out = self.id.l1_out;
         let l2_out = self.id.l2_out;
-        let ft_w_n = (ft_in * ft_out) as u32;
+        // factorizer 有効時は FT master が train 形状 (実行 + piece-input 仮想行)。仮想行も
+        // radam で更新し、forward comb は step 末の fold が master から再生成する。
+        let ft_factorize = self.id.feature_set.ft_factorize();
+        let ft_w_n = (self.id.feature_set.train_ft_in() * ft_out) as u32;
         let ft_b_n = ft_out as u32;
         let l1_w_n = (self.id.combined_dim() * l1_out) as u32;
         let l1_b_n = l1_out as u32;
@@ -1953,6 +2377,66 @@ impl SimpleGpuTrainer {
         let l2_b_n = l2_out as u32;
         let l3_w_n = l2_out as u32;
         let l3_b_n = 1_u32;
+
+        // ===== NORM LOSS (per-weight-group L2-norm 正則化、opt-in) =====
+        // radam step の **前** に適用する (optimizer update の直前、LayerStack と同じ順序)。
+        // forward 用 FT weight (`ft_w_h` mirror / factorizer の comb) は後続の radam
+        // (mirror 同時更新) または step 末の fold が master から再同期するので、ここで触る
+        // 必要はない。各テンソルで reduce (per-group L2 norm) → finalize (sqrt) →
+        // apply (`w *= 1 - lr*2*factor*(1 - 1/(norm+eps))`) の 3 launch。group の
+        // (n_groups, group_pitch, elem_stride, group_len) は weight レイアウトで決まる:
+        // dense weight は per-output-neuron ([in, out] strided column: pitch=1 / stride=out、
+        // L3 は out=1 で 1 group)、bias は per-tensor scalar (n_groups=1)。
+        if let Some(nl_factor) = self.norm_loss_factor {
+            // FT の norm group 行数は train 値 — factorizer の piece-input 仮想行も同じ
+            // 正則化 group に含める (LayerStack と同じ扱い)。
+            let ft_w_rows = self.id.feature_set.train_ft_in();
+            let combined_dim = self.id.combined_dim();
+            macro_rules! norm_loss_group {
+                ($w:expr, $ng:expr, $pitch:expr, $stride:expr, $len:expr) => {{
+                    memset_zero(&self.stream, &self.norm_scratch)?;
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: norm_loss_reduce,
+                            stream: self.stream, module: self.module,
+                            config: cfg_norm_loss_reduce($ng, $len),
+                            args: [slice($w), slice(self.norm_scratch),
+                                   ($ng) as u32, ($pitch) as u32, ($stride) as u32, ($len) as u32]
+                        }
+                    }?;
+                    unsafe {
+                        // SAFETY: 同上。
+                        cuda_launch! {
+                            kernel: norm_loss_finalize,
+                            stream: self.stream, module: self.module,
+                            config: cfg_1d($ng),
+                            args: [slice_mut(self.norm_scratch), ($ng) as u32]
+                        }
+                    }?;
+                    unsafe {
+                        // SAFETY: 同上。
+                        cuda_launch! {
+                            kernel: norm_loss_apply,
+                            stream: self.stream, module: self.module,
+                            config: cfg_1d(($ng) * ($len)),
+                            args: [slice_mut($w), slice(self.norm_scratch),
+                                   nl_factor, lr, EPS,
+                                   ($ng) as u32, ($pitch) as u32, ($stride) as u32, ($len) as u32]
+                        }
+                    }?;
+                }};
+            }
+            norm_loss_group!(self.ft_w, ft_out, 1, ft_out, ft_w_rows);
+            norm_loss_group!(self.l1_w, l1_out, 1, l1_out, combined_dim);
+            norm_loss_group!(self.l2_w, l2_out, 1, l2_out, l1_out);
+            norm_loss_group!(self.l3_w, 1, 1, 1, l2_out);
+            norm_loss_group!(self.ft_b, 1, 0, 1, ft_out);
+            norm_loss_group!(self.l1_b, 1, 0, 1, l1_out);
+            norm_loss_group!(self.l2_b, 1, 0, 1, l2_out);
+            norm_loss_group!(self.l3_b, 1, 0, 1, 1);
+        }
 
         // ft_w optimizer: 2 つの opt-in flag で 4 通りに分岐する (LayerStack と同じパターン)。
         //  - `--ft-fp16`: FP16 mirror (`ft_w_h`) 同時更新版 (`*_mirror`) を使い、forward 用
@@ -1963,43 +2447,59 @@ impl SimpleGpuTrainer {
         match (&mut self.ft_w_m, &mut self.ft_w_v) {
             (MomentBuf::F16(ft_w_m), MomentBuf::F16(ft_w_v)) => {
                 let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
-                    cuda_launch! {
-                        kernel: radam_step_f16state_mirror,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
-                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                               self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
-                               FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: radam_step_f16state_mirror,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
+                            args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                                   slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
+                                   self.weight_decay, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
+                        }
                     }?;
                 } else {
-                    cuda_launch! {
-                        kernel: radam_step_f16state,
-                        stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
-                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                               slice_mut(self.ft_w_grad), lr, step_size, denom,
-                               self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
-                               FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: radam_step_f16state,
+                            stream: self.stream, module: self.module, config: cfg_1d(ft_w_n as usize),
+                            args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                                   slice_mut(self.ft_w_grad), lr, step_size, denom,
+                                   self.weight_decay, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX,
+                                   FT_OPT_M_SCALE, FT_OPT_V_SCALE, ft_w_n]
+                        }
                     }?;
                 }
             }
             (MomentBuf::F32(ft_w_m), MomentBuf::F32(ft_w_v)) => {
                 let (mut ft_w_m, mut ft_w_v) = (ft_w_m, ft_w_v);
-                if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
-                    cuda_launch! {
-                        kernel: radam_step_fp16_mirror, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_w_n as usize),
-                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                               slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
-                               self.weight_decay, BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
+                if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: radam_step_fp16_mirror, stream: self.stream, module: self.module,
+                            config: cfg_1d(ft_w_n as usize),
+                            args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                                   slice_mut(self.ft_w_grad), slice_mut(ft_w_h), lr, step_size, denom,
+                                   self.weight_decay, beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
+                        }
                     }?;
                 } else {
-                    cuda_launch! {
-                        kernel: radam_step, stream: self.stream, module: self.module,
-                        config: cfg_1d(ft_w_n as usize),
-                        args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
-                               slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay,
-                               BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
+                    unsafe {
+                        // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                        // stream の完了を待つ同期点まで生存する device allocation。
+                        cuda_launch! {
+                            kernel: radam_step, stream: self.stream, module: self.module,
+                            config: cfg_1d(ft_w_n as usize),
+                            args: [slice_mut(self.ft_w), slice_mut(ft_w_m), slice_mut(ft_w_v),
+                                   slice_mut(self.ft_w_grad), lr, step_size, denom, self.weight_decay,
+                                   beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_w_n]
+                        }
                     }?;
                 }
             }
@@ -2008,101 +2508,172 @@ impl SimpleGpuTrainer {
 
         // 残り 7 group (ft_b, l1_w/b, l2_w/b, l3_w/b) は moment buffer 縮小余地が無いので
         // 常に FP32 master + `radam_step`。FT 以外の `f16` 化は本フラグの範囲外。
-        cuda_launch! {
-            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_b_n as usize),
-            args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
-                   slice_mut(self.ft_b_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_b_n]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(ft_b_n as usize),
+                args: [slice_mut(self.ft_b), slice_mut(self.ft_b_m), slice_mut(self.ft_b_v),
+                       slice_mut(self.ft_b_grad), lr, step_size, denom, self.weight_decay,
+                       beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, ft_b_n]
+            }
         }?;
-        cuda_launch! {
-            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_w_n as usize),
-            args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
-                   slice_mut(self.l1_w_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_w_n]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_w_n as usize),
+                args: [slice_mut(self.l1_w), slice_mut(self.l1_w_m), slice_mut(self.l1_w_v),
+                       slice_mut(self.l1_w_grad), lr, step_size, denom, self.weight_decay,
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_w_n]
+            }
         }?;
-        cuda_launch! {
-            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_b_n as usize),
-            args: [slice_mut(self.l1_b), slice_mut(self.l1_b_m), slice_mut(self.l1_b_v),
-                   slice_mut(self.l1_b_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_b_n]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l1_b_n as usize),
+                args: [slice_mut(self.l1_b), slice_mut(self.l1_b_m), slice_mut(self.l1_b_v),
+                       slice_mut(self.l1_b_grad), lr, step_size, denom, self.weight_decay,
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l1_b_n]
+            }
         }?;
-        cuda_launch! {
-            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_w_n as usize),
-            args: [slice_mut(self.l2_w), slice_mut(self.l2_w_m), slice_mut(self.l2_w_v),
-                   slice_mut(self.l2_w_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_w_n]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_w_n as usize),
+                args: [slice_mut(self.l2_w), slice_mut(self.l2_w_m), slice_mut(self.l2_w_v),
+                       slice_mut(self.l2_w_grad), lr, step_size, denom, self.weight_decay,
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_w_n]
+            }
         }?;
-        cuda_launch! {
-            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_b_n as usize),
-            args: [slice_mut(self.l2_b), slice_mut(self.l2_b_m), slice_mut(self.l2_b_v),
-                   slice_mut(self.l2_b_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_b_n]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l2_b_n as usize),
+                args: [slice_mut(self.l2_b), slice_mut(self.l2_b_m), slice_mut(self.l2_b_v),
+                       slice_mut(self.l2_b_grad), lr, step_size, denom, self.weight_decay,
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l2_b_n]
+            }
         }?;
-        cuda_launch! {
-            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_w_n as usize),
-            args: [slice_mut(self.l3_w), slice_mut(self.l3_w_m), slice_mut(self.l3_w_v),
-                   slice_mut(self.l3_w_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l3_w_n]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_w_n as usize),
+                args: [slice_mut(self.l3_w), slice_mut(self.l3_w_m), slice_mut(self.l3_w_v),
+                       slice_mut(self.l3_w_grad), lr, step_size, denom, self.weight_decay,
+                       beta1, BETA2, EPS, W_CLAMP_QUANT_MIN, W_CLAMP_QUANT_MAX, l3_w_n]
+            }
         }?;
-        cuda_launch! {
-            kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_b_n as usize),
-            args: [slice_mut(self.l3_b), slice_mut(self.l3_b_m), slice_mut(self.l3_b_v),
-                   slice_mut(self.l3_b_grad), lr, step_size, denom, self.weight_decay,
-                   BETA1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, l3_b_n]
+        unsafe {
+            // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+            // stream の完了を待つ同期点まで生存する device allocation。
+            cuda_launch! {
+                kernel: radam_step, stream: self.stream, module: self.module, config: cfg_1d(l3_b_n as usize),
+                args: [slice_mut(self.l3_b), slice_mut(self.l3_b_m), slice_mut(self.l3_b_v),
+                       slice_mut(self.l3_b_grad), lr, step_size, denom, self.weight_decay,
+                       beta1, BETA2, EPS, W_CLAMP_NONE_MIN, W_CLAMP_NONE_MAX, l3_b_n]
+            }
         }?;
 
-        if self.step_count.is_multiple_of(RANGER_K) {
+        if self.optimizer.uses_lookahead() && self.step_count.is_multiple_of(RANGER_K) {
             // ft_w lookahead lerp: lerp は radam の後に ft_w を再度書き換えるので、
             // `ft_fp16` 時は mirror 同時更新版で `ft_w_h` を lerp 後の最終値に同期する。
-            if let Some(mut ft_w_h) = self.ft_w_h.as_mut() {
-                cuda_launch! {
-                    kernel: ranger_lookahead_lerp_fp16_mirror, stream: self.stream, module: self.module,
-                    config: cfg_1d(ft_w_n as usize),
-                    args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), slice_mut(ft_w_h),
-                           RANGER_ALPHA, ft_w_n]
+            // factorizer 有効時は mirror variant を使わず (comb は base 形状で train 形状の
+            // lerp からは書けない)、master のみ lerp し step 末の fold が comb を再生成する。
+            if let Some(mut ft_w_h) = self.ft_w_h.as_mut().filter(|_| !ft_factorize) {
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: ranger_lookahead_lerp_fp16_mirror, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_w_n as usize),
+                        args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), slice_mut(ft_w_h),
+                               RANGER_ALPHA, ft_w_n]
+                    }
                 }?;
             } else {
-                cuda_launch! {
-                    kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
-                    config: cfg_1d(ft_w_n as usize),
-                    args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n]
+                unsafe {
+                    // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                    // stream の完了を待つ同期点まで生存する device allocation。
+                    cuda_launch! {
+                        kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                        config: cfg_1d(ft_w_n as usize),
+                        args: [slice_mut(self.ft_w), slice_mut(self.ft_w_slow), RANGER_ALPHA, ft_w_n]
+                    }
                 }?;
             }
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
-                config: cfg_1d(ft_b_n as usize),
-                args: [slice_mut(self.ft_b), slice_mut(self.ft_b_slow), RANGER_ALPHA, ft_b_n]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                    config: cfg_1d(ft_b_n as usize),
+                    args: [slice_mut(self.ft_b), slice_mut(self.ft_b_slow), RANGER_ALPHA, ft_b_n]
+                }
             }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
-                config: cfg_1d(l1_w_n as usize),
-                args: [slice_mut(self.l1_w), slice_mut(self.l1_w_slow), RANGER_ALPHA, l1_w_n]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                    config: cfg_1d(l1_w_n as usize),
+                    args: [slice_mut(self.l1_w), slice_mut(self.l1_w_slow), RANGER_ALPHA, l1_w_n]
+                }
             }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
-                config: cfg_1d(l1_b_n as usize),
-                args: [slice_mut(self.l1_b), slice_mut(self.l1_b_slow), RANGER_ALPHA, l1_b_n]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                    config: cfg_1d(l1_b_n as usize),
+                    args: [slice_mut(self.l1_b), slice_mut(self.l1_b_slow), RANGER_ALPHA, l1_b_n]
+                }
             }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
-                config: cfg_1d(l2_w_n as usize),
-                args: [slice_mut(self.l2_w), slice_mut(self.l2_w_slow), RANGER_ALPHA, l2_w_n]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_w_n as usize),
+                    args: [slice_mut(self.l2_w), slice_mut(self.l2_w_slow), RANGER_ALPHA, l2_w_n]
+                }
             }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
-                config: cfg_1d(l2_b_n as usize),
-                args: [slice_mut(self.l2_b), slice_mut(self.l2_b_slow), RANGER_ALPHA, l2_b_n]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                    config: cfg_1d(l2_b_n as usize),
+                    args: [slice_mut(self.l2_b), slice_mut(self.l2_b_slow), RANGER_ALPHA, l2_b_n]
+                }
             }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
-                config: cfg_1d(l3_w_n as usize),
-                args: [slice_mut(self.l3_w), slice_mut(self.l3_w_slow), RANGER_ALPHA, l3_w_n]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                    config: cfg_1d(l3_w_n as usize),
+                    args: [slice_mut(self.l3_w), slice_mut(self.l3_w_slow), RANGER_ALPHA, l3_w_n]
+                }
             }?;
-            cuda_launch! {
-                kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
-                config: cfg_1d(l3_b_n as usize),
-                args: [slice_mut(self.l3_b), slice_mut(self.l3_b_slow), RANGER_ALPHA, l3_b_n]
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: ranger_lookahead_lerp, stream: self.stream, module: self.module,
+                    config: cfg_1d(l3_b_n as usize),
+                    args: [slice_mut(self.l3_b), slice_mut(self.l3_b_slow), RANGER_ALPHA, l3_b_n]
+                }
             }?;
+        }
+        // factorizer: master (`ft_w`) の本 step の全更新 (radam / lookahead) が確定した後、
+        // 次 step の forward が読む comb を再生成する。
+        if ft_factorize {
+            self.launch_ft_fold()?;
         }
         Ok(())
     }
@@ -2124,6 +2695,23 @@ impl SimpleGpuTrainer {
         let l1_in = id.combined_dim();
 
         let ft_w = self.ft_w.to_host_vec(&self.stream)?;
+        // factorizer 有効時は piece-input 仮想行を実行へ畳み込み base 形状で返す
+        // (量子化・飽和検査は畳み込み後の値に掛かる)。export id は factorizer modifier を
+        // 外した base spec にする (量子化 .bin は仮想行を持たず shape は非 factorize と同形)。
+        let (export_id, ft_w) = if self.id.feature_set.ft_factorize() {
+            let folded = nnue_format::layerstack_weights::coalesce_ft_factorized(
+                &self.id.feature_set,
+                self.id.ft_out,
+                &ft_w,
+            );
+            let base_id = SimpleId {
+                feature_set: self.id.feature_set.feature_set().spec(),
+                ..self.id
+            };
+            (base_id, folded)
+        } else {
+            (id, ft_w)
+        };
         let ft_b = self.ft_b.to_host_vec(&self.stream)?;
         let l1_w_in_major = self.l1_w.to_host_vec(&self.stream)?;
         let l1_b = self.l1_b.to_host_vec(&self.stream)?;
@@ -2146,7 +2734,7 @@ impl SimpleGpuTrainer {
         }
 
         Ok(SimpleWeights {
-            id,
+            id: export_id,
             fv_scale: self.fv_scale,
             ft_w,
             ft_b,
@@ -2160,7 +2748,7 @@ impl SimpleGpuTrainer {
     }
 
     /// `SimpleWeights` を device 上に upload して現在の重み・lookahead slow を置き換える。
-    /// `m` / `v` / `grad` は 0 リセット、`step_count` を 0 に戻す (Ranger を最初から
+    /// `m` / `v` / `grad` は 0 リセット、`step_count` を 0 に戻す (optimizer を最初から
     /// やり直すのと等価)。`load_simple_weights` 後の slow weight は upload した weight
     /// と同値 (lookahead が `w == slow` 状態から始まる、`new` と同じ規約)。
     ///
@@ -2229,10 +2817,12 @@ impl SimpleGpuTrainer {
         self.l3_b = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
         self.l3_b_slow = DeviceBuffer::from_host(&self.stream, &w.l3_b)?;
 
-        // m / v / grad を 0 リセット、step_count を 0 に戻す (Ranger を最初から)。
+        // m / v / grad を 0 リセット、step_count を 0 に戻す (optimizer を最初から)。
         // ft_w の m / v は [`MomentBuf`] で `--fp16-opt-state` 精度を保つため `zeroed`
-        // で作り直す (`memset_zero` が `MomentBuf` を取らないため)。
-        let ft_w_n = self.id.ft_in() * self.id.ft_out;
+        // で作り直す (`memset_zero` が `MomentBuf` を取らないため)。長さは `ft_w` と同じ
+        // train 形状 (factorizer 有効時は仮想行込み。`--init-from` では factorizer が
+        // auto-suppress されるので通常 base と一致する)。
+        let ft_w_n = self.id.feature_set.train_ft_in() * self.id.ft_out;
         self.ft_w_m = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
         self.ft_w_v = MomentBuf::zeroed(&self.stream, ft_w_n, self.fp16_opt_state)?;
         for buf in [
@@ -2266,6 +2856,13 @@ impl SimpleGpuTrainer {
         Ok(())
     }
 
+    /// export される `.bin` の arch 文字列に書かれる実効 `fv_scale`。`--init-from` で
+    /// weights を読むと入力 `.bin` の値で上書きされるため、CLI の `--scale` から再計算
+    /// せずこの値を使う (experiment.json が `.bin` と食い違うのを防ぐ)。
+    pub(crate) fn fv_scale(&self) -> i32 {
+        self.fv_scale
+    }
+
     /// resume 用 raw f32 checkpoint を `path` に atomic に書き出す (LayerStack の
     /// [`GpuTrainer::save_raw_checkpoint`] と同 format / 同方針)。
     ///
@@ -2292,6 +2889,7 @@ impl SimpleGpuTrainer {
             &RawCkptArch {
                 feature_set: self.id.feature_set,
                 arch_kind: ArchKind::Simple,
+                bucket_mode: None,
                 ft_out: self.id.ft_out as u64,
                 topology: &topology,
             },
@@ -2332,6 +2930,7 @@ impl SimpleGpuTrainer {
             &RawCkptArch {
                 feature_set: self.id.feature_set,
                 arch_kind: ArchKind::Simple,
+                bucket_mode: None,
                 ft_out: self.id.ft_out as u64,
                 topology: &topology,
             },
@@ -2391,7 +2990,10 @@ impl SimpleGpuTrainer {
                 }
             };
         }
-        let ft_w_n = self.id.ft_in() * self.id.ft_out;
+        // ft_w は train 形状 (factorizer 有効時は piece-input 仮想行込み)。header にも
+        // train_ft_in と ft_factorize flag が書かれ、resume 時の on/off 不一致は
+        // [`load_raw_checkpoint_file`] が reject する。
+        let ft_w_n = self.id.feature_set.train_ft_in() * self.id.ft_out;
         let ft_b_n = self.id.ft_out;
         let l1_w_n = self.id.combined_dim() * self.id.l1_out;
         let l1_b_n = self.id.l1_out;

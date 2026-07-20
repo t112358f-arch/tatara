@@ -19,7 +19,7 @@
 //!     report(sb, loss / positions, pos/s, ETA)
 //!     if sb % save_rate == 0 || sb == end_superbatch:
 //!         backend.save_checkpoint("{output_dir}/{net_id}-{sb}.bin")          # 量子化 (推論用)
-//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, run_id, lr_horizon)  # raw f32 + Ranger state (resume 用)
+//!         backend.save_resume_checkpoint("{output_dir}/{net_id}-{sb}.ckpt", sb, run_id, lr_horizon)  # raw f32 + optimizer state (resume 用)
 //!         if keep_raw_checkpoints == Some(n): 直近 n 個より古い *.ckpt を削除
 //! ```
 //!
@@ -54,9 +54,10 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use shogi_features::FeatureSetSpec;
+#[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{Batch, BucketedPrefetchedLoader, PSV_RECORD_BYTES};
+use crate::dataloader::{Batch, BucketMode, BucketedPrefetchedLoader, PSV_RECORD_BYTES};
 use crate::experiment::ExperimentLogger;
 use crate::schedule::{LrScheduler, WdlScheduler};
 
@@ -263,7 +264,7 @@ pub struct ValidationStepOutput {
 /// `bins/nnue_train::GpuTrainer` が impl する。本 trait を介すことで loop driver
 /// を GPU 非依存に保ち (CPU-only crate に置ける)、mock backend で単体テストできる。
 pub trait TrainerBackend {
-    /// 1 batch 分 (forward → loss kernel → backward → Ranger step) を実行し、
+    /// 1 batch 分 (forward → loss kernel → backward → optimizer step) を実行し、
     /// batch 全体で累積した二乗誤差 (`Σ err²`、まだ position 数で割っていない値)
     /// を返す。caller が報告時に position 数で割って平均 loss にする。
     ///
@@ -316,12 +317,17 @@ pub trait TrainerBackend {
 
     /// 現在の weight を量子化 NNUE binary として `path` に書き出す (推論用
     /// artifact、`nnue-format` の `save_quantised` 相当を backend 内で実行する)。
-    fn save_checkpoint(&mut self, path: &Path) -> io::Result<()>;
+    fn save_checkpoint(
+        &mut self,
+        path: &Path,
+        fv_scale: Option<i32>,
+        output_format: OutputFormat,
+    ) -> io::Result<()>;
 
     /// resume 用 **raw f32 checkpoint** を `path` に書き出す。
     ///
     /// 量子化 `.bin` ([`TrainerBackend::save_checkpoint`]) と違い、全 weight
-    /// group の raw f32 値に加えて optimizer state (Ranger の `m` / `v` / `slow`)
+    /// group の raw f32 値に加えて optimizer state (`m` / `v` / `slow`)
     /// と step counter、および現在の `superbatch` 番号を保存する。これを
     /// `--resume` で読み戻すと optimizer state ごと学習を再開できる
     /// (`--init-from` の weight だけ注入する経路と違い、optimizer 状態も
@@ -364,6 +370,16 @@ pub trait TrainerBackend {
 // TrainingConfig
 // =============================================================================
 
+/// 推論用 checkpoint の出力形式。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OutputFormat {
+    /// tatara LayerStack / Simple quantised binary。
+    #[default]
+    Tatara,
+    /// YaneuraOu SFNNWithoutPsqt evaluation file。
+    Yaneuraou,
+}
+
 /// 1 回の [`run`] に渡す training hyper-parameter 一式。
 ///
 /// LayerStack (bucket-aware) / Simple (bucket-less) どちらの backend で学習する
@@ -389,6 +405,10 @@ pub struct TrainingConfig {
     pub batch_size: usize,
     /// `save_rate` superbatch ごと (および末尾) に checkpoint を書き出す。
     pub save_rate: usize,
+    /// LayerStack arch string に書く `fv_scale`。`None` は token を省略する。
+    pub fv_scale: Option<i32>,
+    /// 推論用 checkpoint の serialization format。
+    pub output_format: OutputFormat,
     /// `Some(n)` のとき、新しい raw checkpoint (`{net_id}-{sb}.ckpt`) を書いた
     /// 後、直近 `n` 個より古い raw checkpoint を削除する (`--keep-checkpoints`)。
     /// `None` は全 raw checkpoint を保持。raw state は ~1.8GB/個 なので
@@ -399,11 +419,16 @@ pub struct TrainingConfig {
     pub loss: LossKind,
     /// `Some(t)` のとき `|score| >= t` の position を skip する (`--score-drop-abs`)。
     pub score_drop_abs: Option<i32>,
+    /// `Some(c)` のとき drop を生き残った position の score を `[-c, c]` に飽和
+    /// させる (`--score-clamp-abs`)。教師の encode 変種 (clip 上限の違い等) を
+    /// 単一の上限へ正規化する用途。i16 なのは PSV score の表現域に合わせ、
+    /// 消費側の縮小 cast (wrap) を型で不可能にするため。
+    pub score_clamp_abs: Option<i16>,
     /// dataloader の prefetch worker 数 (`--threads`)。`0` は `1` 扱い。
     /// `1` で決定論的逐次 read 相当、`>= 2` で並列パース (1 epoch 内の
     /// position 順序は非決定的になる; [`BucketedPrefetchedLoader`] doc 参照)。
     pub threads: usize,
-    /// `Some` のとき held-out validation 用 PSV file。各 superbatch 末に
+    /// `Some` のとき held-out validation 用 PSV / HCPE file。各 superbatch 末に
     /// forward-only 検証を走らせ test_loss / test_accuracy を report する。
     pub test_data: Option<PathBuf>,
     /// held-out validation 1 回あたりの検証局面数 (`batch_size` 単位に切り上げて
@@ -416,7 +441,7 @@ pub struct TrainingConfig {
     /// `[file_size - n * PSV_RECORD_BYTES, file_size)` を読む。`test_data` と
     /// 同時指定は `validate()` で error。
     pub test_tail_positions: Option<u64>,
-    /// dataloader worker で `ShogiProgressKPAbs::bucket_board` を計算して per-position
+    /// dataloader worker で選択された bucket mode を計算して per-position
     /// bucket を `Batch` と共に返すか。LayerStack (bucket-aware) は `true`、Simple
     /// (bucket-less) は `false` で worker CPU 仕事を ~1 board 推論分削減できる。
     /// `false` のとき backend に渡る `bucket_idx` は空 slice になるので backend は
@@ -424,7 +449,7 @@ pub struct TrainingConfig {
     /// を使わない契約)。
     pub compute_bucket: bool,
     /// LayerStack の output bucket 数 (`--num-buckets`)。dataloader worker が
-    /// `progress.bucket_board(board, num_buckets)` で `0..num_buckets-1` を emit
+    /// bucket mode が `0..num_buckets-1` を emit
     /// するために必要。`compute_bucket = false` の Simple 経路では bucket 計算
     /// 自体が skip されるため値は参照されない (任意の `>= 1` で可)。
     pub num_buckets: usize,
@@ -434,6 +459,14 @@ pub struct TrainingConfig {
     /// 側 atomic 計数は常時有効だが host 報告のみ gate)。`--ft-fp16-out` 無しの
     /// run では FP16 clamp kernel 自体が launch されないため total は常に 0。
     pub monitor_fp16_clamps: bool,
+    /// `true` のとき dataloader worker が各 position の実 active feature 数
+    /// (`Batch::push_decoded_counting` の `written`) を histogram に集計し、各
+    /// superbatch 末に `[active-hist] sb=N positions=T mean=M p50=.. p90=.. p99=..
+    /// max=..` line を、run 終了時に non-zero bin の full dump (`[active-hist]
+    /// count[k]=n`) を stderr に出す (`--monitor-active-features`)。stats は累積
+    /// histogram に対して計算する。`false` では histogram を確保せず worker の
+    /// ホットパスに計装コードを通さない (feature-set 非依存、threat off でも動く)。
+    pub monitor_active_features: bool,
 }
 
 impl TrainingConfig {
@@ -471,6 +504,22 @@ impl TrainingConfig {
                 "score_drop_abs must be >= 1 (got {t}); a non-positive threshold would drop every position"
             )));
         }
+        if let Some(c) = self.score_clamp_abs
+            && c < 1
+        {
+            return Err(io::Error::other(format!(
+                "score_clamp_abs must be >= 1 (got {c}); a non-positive bound would saturate \
+                 every score to it"
+            )));
+        }
+        if let (Some(t), Some(c)) = (self.score_drop_abs, self.score_clamp_abs)
+            && i64::from(c) >= i64::from(t)
+        {
+            return Err(io::Error::other(format!(
+                "score_clamp_abs ({c}) must be < score_drop_abs ({t}); every position surviving \
+                 the drop filter already has |score| < {t}, so the clamp would never fire"
+            )));
+        }
         if self.test_data.is_some() && self.test_positions == 0 {
             return Err(io::Error::other(
                 "test_positions must be >= 1 when test_data is set",
@@ -479,7 +528,7 @@ impl TrainingConfig {
         if self.test_data.is_some() && self.test_tail_positions.is_some() {
             return Err(io::Error::other(
                 "test_data and test_tail_positions are mutually exclusive \
-                 (pick one held-out source: external PSV file or training-data tail)",
+                 (pick one held-out source: external PSV/HCPE file or training-data tail)",
             ));
         }
         if let Some(n) = self.test_tail_positions {
@@ -496,11 +545,71 @@ impl TrainingConfig {
         }
         if self.num_buckets == 0 {
             return Err(io::Error::other(
-                "num_buckets must be >= 1 (`progress.bucket_board` requires at \
-                 least one bucket; LayerStack uses `--num-buckets` in [2, 9])",
+                "num_buckets must be >= 1 (LayerStack uses `--num-buckets` in [2, 9])",
             ));
         }
         Ok(())
+    }
+}
+
+// =============================================================================
+// ActiveHistStats — 実 active feature 数 histogram の要約統計
+// =============================================================================
+
+/// 実 active feature 数 histogram (`bin[k]` = active 数 `k` の position 数) から
+/// 計算した分布要約 (`--monitor-active-features` の superbatch 末 line 用)。
+struct ActiveHistStats {
+    /// histogram に入っている総 position 数 (= bin の総和)。
+    positions: u64,
+    /// active 数の算術平均。
+    mean: f64,
+    /// 50 / 90 / 99 percentile (nearest-rank: 累積が `ceil(p * N)` に達する最小
+    /// bin index)。
+    p50: usize,
+    p90: usize,
+    p99: usize,
+    /// non-zero だった最大 bin index (= 観測された最大 active 数)。
+    max: usize,
+}
+
+impl ActiveHistStats {
+    /// `histogram` (index = active 数、値 = 出現 position 数) から統計を計算する。
+    /// 総和が 0 (= 1 position も入っていない) なら `None`。
+    fn from_histogram(histogram: &[u64]) -> Option<Self> {
+        let positions: u64 = histogram.iter().sum();
+        if positions == 0 {
+            return None;
+        }
+        let weighted: u128 = histogram
+            .iter()
+            .enumerate()
+            .map(|(active, &count)| active as u128 * count as u128)
+            .sum();
+        let mean = weighted as f64 / positions as f64;
+
+        // nearest-rank percentile: 累積 count が threshold 以上になる最小 bin。
+        let percentile = |p: f64| -> usize {
+            let threshold = (p * positions as f64).ceil() as u64;
+            let mut cumulative = 0u64;
+            for (active, &count) in histogram.iter().enumerate() {
+                cumulative += count;
+                if cumulative >= threshold {
+                    return active;
+                }
+            }
+            histogram.len().saturating_sub(1)
+        };
+
+        let max = histogram.iter().rposition(|&count| count > 0).unwrap_or(0);
+
+        Some(Self {
+            positions,
+            mean,
+            p50: percentile(0.50),
+            p90: percentile(0.90),
+            p99: percentile(0.99),
+            max,
+        })
     }
 }
 
@@ -512,8 +621,8 @@ impl TrainingConfig {
 ///
 /// - `backend`: GPU step を実行する backend (`bins/nnue_train::GpuTrainer`)
 /// - `data_path`: PSV file (`PackedSfenValue` × N、40 bytes 固定)
-/// - `progress`: progress8kpabs 重み (`--progress-coeff` 未指定なら zero-weight default → 全 bucket 4)。
-///   重みは process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること
+/// - `bucket_mode`: dataloader と held-out validation に共通の bucket 算出方式。
+///   progress8kpabs の重みは process-global なので呼び出し前に load 済であること
 /// - `lr_scheduler` / `wdl_scheduler`: superbatch / batch index から lr / wdl lambda を返す
 /// - `cfg`: hyper-parameter (superbatch 範囲、batch 構成、save 間隔、loss scale、score-drop-abs、`threads`)
 /// - `experiment`: `Some` のとき、run 開始時・superbatch ごと・正常終了時に
@@ -524,10 +633,10 @@ impl TrainingConfig {
 /// `decode()` 1 回 / position の bucket-aware 先読み + ring-buffer 再利用される。
 /// worker 数 ≥ 2 では 1 epoch 内の position 順序が非決定的になる点に注意
 /// (training では問題ない)。
-pub fn run<B, L, W>(
+pub fn run<B, L, W, M>(
     backend: &mut B,
     data_path: &Path,
-    progress: &ShogiProgressKPAbs,
+    bucket_mode: &M,
     lr_scheduler: &L,
     wdl_scheduler: &W,
     cfg: &TrainingConfig,
@@ -537,6 +646,7 @@ where
     B: TrainerBackend,
     L: LrScheduler,
     W: WdlScheduler,
+    M: Copy + Into<BucketMode>,
 {
     cfg.validate()?;
 
@@ -577,17 +687,19 @@ where
         data_path,
         cfg.batch_size,
         cfg.score_drop_abs,
+        cfg.score_clamp_abs,
         cfg.threads,
-        *progress,
+        (*bucket_mode).into(),
         cfg.feature_set,
         cfg.compute_bucket,
         cfg.num_buckets,
         train_end_offset,
+        cfg.monitor_active_features,
     )?;
 
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
-         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | dataloader threads {}",
+         | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | dataloader threads {}",
         data_path.display(),
         cfg.net_id,
         cfg.start_superbatch,
@@ -596,6 +708,7 @@ where
         cfg.batch_size,
         cfg.loss,
         cfg.score_drop_abs,
+        cfg.score_clamp_abs,
         cfg.threads.max(1),
     );
 
@@ -609,8 +722,9 @@ where
                 test_path,
                 cfg.batch_size,
                 cfg.score_drop_abs,
+                cfg.score_clamp_abs,
                 cfg.test_positions,
-                progress,
+                bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
             )?;
@@ -630,8 +744,9 @@ where
                 file_size,
                 cfg.batch_size,
                 cfg.score_drop_abs,
+                cfg.score_clamp_abs,
                 cfg.test_positions,
-                progress,
+                bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
             )?;
@@ -836,13 +951,26 @@ where
             );
         }
 
+        if cfg.monitor_active_features
+            && let Some(hist) = loader.active_histogram_snapshot()
+            && let Some(stats) = ActiveHistStats::from_histogram(&hist)
+        {
+            // 累積 histogram に対する分布統計 (実 active feature 数)。overflow は
+            // `push_decoded_counting` 側の hard-error で弾かれるため histogram には
+            // 現れない。
+            eprintln!(
+                "[active-hist] sb={} positions={} mean={:.1} p50={} p90={} p99={} max={}",
+                sb, stats.positions, stats.mean, stats.p50, stats.p90, stats.p99, stats.max,
+            );
+        }
+
         let saved = sb % cfg.save_rate == 0 || sb == cfg.end_superbatch;
         if saved {
             let path = cfg.output_dir.join(format!("{}-{}.bin", cfg.net_id, sb));
-            backend.save_checkpoint(&path)?;
+            backend.save_checkpoint(&path, cfg.fv_scale, cfg.output_format)?;
             println!("[train] checkpoint saved: {}", path.display());
 
-            // resume 用 raw checkpoint: weight raw f32 + Ranger state + step + sb。
+            // resume 用 raw checkpoint: weight raw f32 + optimizer state + step + sb。
             // 実験ログがあれば run id を渡し `*.ckpt` に埋め込む (resume 時に
             // その run が lineage の親として参照される)。
             let raw_path = cfg.output_dir.join(format!("{}-{}.ckpt", cfg.net_id, sb));
@@ -882,6 +1010,18 @@ where
     // 当該 batch の H2D は完了済、loader に返しても安全。
     if let Some(prev) = prev_pending.take() {
         loader.recycle(prev);
+    }
+
+    // 学習終了時に 1 回だけ full histogram を dump (non-zero bin のみ)。累積なので
+    // run 全体の実 active feature 数分布になる。
+    if cfg.monitor_active_features
+        && let Some(hist) = loader.active_histogram_snapshot()
+    {
+        for (active, count) in hist.iter().enumerate() {
+            if *count > 0 {
+                eprintln!("[active-hist] count[{active}]={count}");
+            }
+        }
     }
 
     println!(
@@ -1104,7 +1244,12 @@ mod tests {
             })
         }
 
-        fn save_checkpoint(&mut self, path: &Path) -> io::Result<()> {
+        fn save_checkpoint(
+            &mut self,
+            path: &Path,
+            _fv_scale: Option<i32>,
+            _output_format: OutputFormat,
+        ) -> io::Result<()> {
             self.saves.push(path.to_path_buf());
             Ok(())
         }
@@ -1137,9 +1282,12 @@ mod tests {
             batches_per_superbatch: 2,
             batch_size: 8,
             save_rate: 2,
+            fv_scale: Some(nnue_format::layerstack_weights::FV_SCALE),
+            output_format: OutputFormat::Tatara,
             keep_raw_checkpoints: None,
             loss: LossKind::Sigmoid { scale: 1.0 / 290.0 },
             score_drop_abs: None,
+            score_clamp_abs: None,
             threads: 2,
             test_data: None,
             test_positions: 0,
@@ -1147,6 +1295,7 @@ mod tests {
             compute_bucket: true,
             num_buckets: 9,
             monitor_fp16_clamps: false,
+            monitor_active_features: false,
         }
     }
 
@@ -1350,6 +1499,7 @@ mod tests {
             wrm_weight_boost_w1: None,
             wrm_weight_boost_w2: None,
             score_drop_abs: None,
+            score_clamp_abs: None,
             init_from: None,
             init_preset: None,
             test_data: None,
@@ -1396,6 +1546,7 @@ mod tests {
             None,
             params,
             data,
+            Some(nnue_format::layerstack_weights::FV_SCALE),
         );
         let mut logger = ExperimentLogger::new(json_path.clone(), doc);
 
@@ -1503,6 +1654,7 @@ mod tests {
                 total_positions: 0,
                 dataset_passes: 0.0,
             },
+            Some(nnue_format::layerstack_weights::FV_SCALE),
         );
         let mut logger = ExperimentLogger::new(json_path.clone(), doc);
 
@@ -2126,6 +2278,46 @@ mod tests {
         assert!(
             TrainingConfig {
                 score_drop_abs: Some(32000),
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
+        );
+        // score-clamp-abs は >= 1 (上限 i16::MAX は型で保証)。
+        for bad in [0, -1] {
+            assert!(
+                TrainingConfig {
+                    score_clamp_abs: Some(bad),
+                    ..base_cfg()
+                }
+                .validate()
+                .is_err(),
+                "score_clamp_abs {bad} must be rejected"
+            );
+        }
+        assert!(
+            TrainingConfig {
+                score_clamp_abs: Some(4144),
+                ..base_cfg()
+            }
+            .validate()
+            .is_ok()
+        );
+        // clamp >= drop は「drop 生存者に clamp が一度も発火しない」silent no-op
+        // 構成なので reject。clamp < drop は OK。
+        assert!(
+            TrainingConfig {
+                score_drop_abs: Some(3000),
+                score_clamp_abs: Some(4144),
+                ..base_cfg()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            TrainingConfig {
+                score_drop_abs: Some(32000),
+                score_clamp_abs: Some(4144),
                 ..base_cfg()
             }
             .validate()

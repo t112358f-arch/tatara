@@ -20,6 +20,34 @@ if ! command -v cargo-oxide >/dev/null 2>&1; then
   exit 1
 fi
 
+# cargo-oxide の codegen backend cache (~/.cargo/cuda-oxide/) は
+# scripts/setup-cuda-oxide.sh だけが pin rev に揃える/揃っているか検証する
+# (詳細は同スクリプトのコメント参照)。ここでは同スクリプトが書いた stamp と
+# Cargo.lock の pin を比べるだけの軽い確認に留め、build 自体では cache を
+# 書き換えない (build のたびに fetch/rebuild すると遅くなるため)。stamp が
+# 無い/ずれているときに実際に device codegen エラーになるとは限らないが、
+# 原因切り分けの入口として fail-fast する。
+# CUDA_OXIDE_BACKEND は実在ファイルを指すときだけ override として有効。cargo-oxide は
+# 不在パスを無視して cache に fallback するため、不在パスを override 扱いすると
+# この stamp 確認を skip したまま unpinned cache でビルドしてしまう (setup-cuda-oxide.sh
+# の同名ガードと揃える)。不在なら通常どおり stamp を確認する。
+oxide_backend_override=""
+if [[ -n "${CUDA_OXIDE_BACKEND:-}" && -e "$CUDA_OXIDE_BACKEND" ]]; then
+  oxide_backend_override="$CUDA_OXIDE_BACKEND"
+fi
+if [[ -z "$oxide_backend_override" ]]; then
+  full_rev="$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+#[0-9a-f]+' Cargo.lock | sed -E 's/.*#//' || true)"
+  stamp_file="${CARGO_HOME:-$HOME/.cargo}/cuda-oxide/.pin-stamp"
+  expected_stamp="$full_rev|$(rustc --version)"
+  actual_stamp=""
+  [[ -n "$full_rev" && -f "$stamp_file" ]] && actual_stamp="$(cat "$stamp_file")"
+  if [[ -z "$full_rev" || "$actual_stamp" != "$expected_stamp" ]]; then
+    echo "error: cuda-oxide の codegen backend cache が pin rev / toolchain と一致しません。" >&2
+    echo "       bash scripts/setup-cuda-oxide.sh を再実行してから再試行してください。" >&2
+    exit 1
+  fi
+fi
+
 # CUDA_OXIDE_TARGET が既に設定済みならそれを尊重する (local-ci.sh 等の呼び出し
 # 元が export してくる)。未設定のときだけ GPU の compute capability (例: "8.6")
 # を取得し、sub-Ampere (sm < 80) の場合に限り自動設定する。
@@ -45,10 +73,78 @@ else
   fi
 fi
 
+# libdevice call と LLVM atomic operation が同じ module にある場合、pre-Blackwell
+# 向け legacy NVVM IR は atomic operation を表現できない。modern NVVM IR を一度
+# 生成し、libdevice を link してから LLVM NVPTX backend で実行対象の PTX に落とす。
+# modern IR の target は利用可能な命令を制限するだけで、最終 PTX target は下の
+# llc --mcpu が決める。
+ptx_target="${CUDA_OXIDE_TARGET:-sm_80}"
+target_number="${ptx_target#sm_}"
+target_number="${target_number%%[a-z]*}"
+if [[ "$target_number" =~ ^[0-9]+$ && "$target_number" -ge 100 ]]; then
+  nvvm_target="$ptx_target"
+else
+  nvvm_target="sm_100"
+fi
+
+find_llvm_tool() {
+  local env_name="$1"
+  local tool="$2"
+  local configured="${!env_name:-}"
+  if [[ -n "$configured" ]]; then
+    echo "$configured"
+    return
+  fi
+  command -v "$tool-22" || command -v "$tool-21" || command -v "$tool"
+}
+
+find_libdevice() {
+  local root
+  for root in "${CUDA_TOOLKIT_PATH:-}" "${CUDA_HOME:-}" "${CUDA_PATH:-}" /usr/local/cuda; do
+    if [[ -n "$root" && -f "$root/nvvm/libdevice/libdevice.10.bc" ]]; then
+      echo "$root/nvvm/libdevice/libdevice.10.bc"
+      return
+    fi
+  done
+  local candidate
+  candidate="$(compgen -G '/usr/local/cuda-*/nvvm/libdevice/libdevice.10.bc' | head -1 || true)"
+  [[ -n "$candidate" ]] && echo "$candidate"
+}
+
+llvm_link="$(find_llvm_tool LLVM_LINK_BIN llvm-link)"
+opt_bin="$(find_llvm_tool OPT_BIN opt)"
+llc_bin="$(find_llvm_tool LLC_BIN llc)"
+libdevice="$(find_libdevice)"
+if [[ -z "$llvm_link" || -z "$opt_bin" || -z "$llc_bin" || -z "$libdevice" ]]; then
+  echo "error: PTX 生成に必要な llvm-link / opt / llc / libdevice.10.bc が見つかりません。" >&2
+  exit 1
+fi
+
 # kernel を持つ bin をすべてビルドする。
 for bin in nnue_train progress_kpabs_train; do
-  echo "[build-kernels] cargo-oxide build: bins/$bin"
-  ( cd "bins/$bin" && cargo-oxide build )
+  echo "[build-kernels] cargo-oxide build: bins/$bin (modern NVVM IR: $nvvm_target)"
+  ( cd "bins/$bin" && cargo-oxide build --emit-nvvm-ir --arch "$nvvm_target" )
+
+  ll="$repo_root/$bin.ll"
+  if [[ ! -f "$ll" ]]; then
+    ll="$repo_root/bins/$bin/$bin.ll"
+  fi
+  if [[ ! -f "$ll" ]]; then
+    echo "error: cargo-oxide が $bin.ll を生成しませんでした。" >&2
+    exit 1
+  fi
+
+  artifact_dir="$(dirname "$ll")"
+  linked_bc="$artifact_dir/$bin.linked.bc"
+  opt_bc="$artifact_dir/$bin.opt.bc"
+  ptx="$artifact_dir/$bin.ptx"
+  "$llvm_link" "$ll" "$libdevice" -o "$linked_bc"
+  # internalize が kernel entry を internal 化しても消えないのは、cargo-oxide の
+  # emit する .ll が全 kernel を @llvm.used に載せているため (globaldce の生存根拠)。
+  "$opt_bin" --passes=nvvm-reflect,internalize,globaldce "$linked_bc" -o "$opt_bc"
+  "$llc_bin" --mtriple=nvptx64-nvidia-cuda --mcpu="$ptx_target" -O2 "$opt_bc" -o "$ptx"
+  rm -f "$artifact_dir/$bin.options" "$artifact_dir/$bin.target"
+  echo "[build-kernels] PTX: $ptx ($(sha256sum "$ptx" | awk '{print $1}'))"
 done
 
 echo "[build-kernels] 完了。"

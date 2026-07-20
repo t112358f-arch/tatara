@@ -7,32 +7,65 @@ use gpu_runtime::CudaContext;
 use nnue_format::LayerStackWeights;
 #[cfg(feature = "gpu")]
 use nnue_format::{SimpleActivation, SimpleId, SimpleWeights};
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::dataloader::BucketMode;
 #[cfg(feature = "gpu")]
 use nnue_train::experiment::{DataInfo, ExperimentDoc, ExperimentLogger, Lineage, Params};
 #[cfg(feature = "gpu")]
 use nnue_train::init::{LayerStackInit, SimpleInit, WeightLayer};
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::optimizer::OptimizerKind;
 #[cfg(feature = "gpu")]
 use nnue_train::schedule::WdlScheduler;
 #[cfg(any(feature = "gpu", test))]
 use nnue_train::schedule::{LrSchedulerEnum, WdlSchedulerEnum};
+#[cfg(any(feature = "gpu", test))]
+use nnue_train::trainer::LossKind;
 #[cfg(feature = "gpu")]
-use nnue_train::trainer::{LossKind, TrainingConfig};
-#[cfg(feature = "gpu")]
-use shogi_features::ThreatProfile;
+use nnue_train::trainer::TrainingConfig;
 #[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+#[cfg(feature = "gpu")]
+use shogi_features::{EffectBucketConfig, FtFactorizeMode, ThreatProfile};
 #[cfg(any(feature = "gpu", test))]
-use shogi_features::{FeatureSet, FeatureSetSpec};
+use shogi_features::{FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS};
 
 #[cfg(any(feature = "gpu", test))]
 use crate::cli::*;
 #[cfg(feature = "gpu")]
-use crate::{arch::*, trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
+use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
+
+#[cfg(any(feature = "gpu", test))]
+// kernel の per-bucket backward 容量 (arch.rs) が正典。値の乖離を防ぐため再輸出する。
+const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
+
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn layerstack_export_fv_scale(
+    override_value: Option<i32>,
+    loss: LossKind,
+    score_scale: f32,
+) -> Option<i32> {
+    override_value.or_else(|| match loss {
+        LossKind::Sigmoid { .. } => Some(
+            ((nnue_format::layerstack_weights::QA * nnue_format::layerstack_weights::QB) as f32
+                / score_scale)
+                .round() as i32,
+        ),
+        LossKind::Wrm { .. } => None,
+    })
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Clone, Copy, Default)]
+struct OomFeatureConfig<'a> {
+    threat_profile: Option<&'a str>,
+    effect_bucket_config: Option<&'a str>,
+}
 
 /// GPU buffer 確保が OOM した時の actionable error。tunable な current config と
 /// メモリ削減手段を列挙する。`gpu_runtime::is_out_of_memory` で OOM と判定した
 /// ときだけ呼ぶ。`accumulator_flag` は FT 出力次元を下げる flag (LayerStack
-/// `--ft-out` / Simple `--l1`)、`threat_profile` は LayerStack のみ Some。
+/// `--ft-out` / Simple `--l1`)、feature 拡張 config は LayerStack のみ Some。
 /// `--ft-fp16` / `--ft-fp16-out` は棋力 trade-off のため remedy には挙げず
 /// (診断用に current 値だけ表示)、メモリ専用の `--fp16-opt-state` を推奨する。
 #[cfg(feature = "gpu")]
@@ -43,7 +76,7 @@ fn gpu_oom_error(
     fp16_opt_state: bool,
     accumulator_flag: &str,
     accumulator_dim: usize,
-    threat_profile: Option<&str>,
+    feature_config: OomFeatureConfig<'_>,
 ) -> Box<dyn std::error::Error> {
     use std::fmt::Write as _;
     let mut msg = String::from("GPU out of memory while allocating training buffers (");
@@ -53,8 +86,11 @@ fn gpu_oom_error(
         msg,
         ", ft-fp16={ft_fp16}, ft-fp16-out={ft_fp16_out}, fp16-opt-state={fp16_opt_state}"
     );
-    if let Some(p) = threat_profile {
+    if let Some(p) = feature_config.threat_profile {
         let _ = write!(msg, ", threat-profile={p}");
+    }
+    if let Some(c) = feature_config.effect_bucket_config {
+        let _ = write!(msg, ", effect-bucket={c}");
     }
     msg.push_str(").\nReduce GPU memory by one or more of:\n");
     if !fp16_opt_state {
@@ -64,10 +100,13 @@ fn gpu_oom_error(
         msg,
         "  - lower `{accumulator_flag}` (FT 出力次元。buffer はこれに概ね線形)"
     );
-    if matches!(threat_profile, Some(p) if p != "off") {
+    if matches!(feature_config.threat_profile, Some(p) if p != "off") {
         msg.push_str(
             "  - smaller `--threat-profile` (dims 降順: full > same-class > same-class-major-pawn > cross-side > step-attacker、または off)\n",
         );
+    }
+    if matches!(feature_config.effect_bucket_config, Some(c) if c != "off") {
+        msg.push_str("  - smaller `--effect-bucket` (2x2 uses fewer FT rows than 3x3, or off)\n");
     }
     msg.push_str("  - smaller `--batch-size`");
     msg.into()
@@ -86,6 +125,80 @@ struct SharedPrecisionFlags {
 struct SharedCliValidation {
     feature_set: FeatureSetSpec,
     precision: SharedPrecisionFlags,
+    optimizer: OptimizerKind,
+}
+
+#[cfg(feature = "gpu")]
+fn parse_effect_bucket_config(
+    name: &str,
+) -> Result<Option<EffectBucketConfig>, Box<dyn std::error::Error>> {
+    let config = match name {
+        "off" => None,
+        "2x2-kingfixed" => Some(EffectBucketConfig::KINGFIXED_2X2),
+        "2x2-kingbucketed" => Some(EffectBucketConfig::KINGBUCKETED_2X2),
+        "3x3-kingfixed" => Some(EffectBucketConfig::KINGFIXED_3X3),
+        "3x3-kingbucketed" => Some(EffectBucketConfig::KINGBUCKETED_3X3),
+        _ => {
+            return Err(format!(
+                "--effect-bucket '{name}' is not a known config (expected one of: off, \
+                 2x2-kingfixed, 2x2-kingbucketed, 3x3-kingfixed, 3x3-kingbucketed)"
+            )
+            .into());
+        }
+    };
+    Ok(config)
+}
+
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn validate_bucket_mode(
+    args: &LayerstackArgs,
+) -> Result<BucketMode, Box<dyn std::error::Error>> {
+    match args.bucket_mode.as_str() {
+        "progress8kpabs" => {
+            if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
+                return Err(format!(
+                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for progress8kpabs (got {}); larger N requires the per-bucket weight backward kernels to be generalised",
+                    args.num_buckets
+                )
+                .into());
+            }
+            Ok(BucketMode::Progress8KpAbs)
+        }
+        "kingrank9" => {
+            if args.num_buckets != KINGRANK9_NUM_BUCKETS {
+                return Err(format!(
+                    "--num-buckets must be {KINGRANK9_NUM_BUCKETS} when --bucket-mode kingrank9 is used (got {}); KingRank9 has a fixed 3x3 bucket layout",
+                    args.num_buckets,
+                )
+                .into());
+            }
+            if args.progress_coeff.is_some() {
+                return Err(
+                    "--progress-coeff is not used with --bucket-mode kingrank9; remove it".into(),
+                );
+            }
+            Ok(BucketMode::KingRank9)
+        }
+        other => Err(format!(
+            "--bucket-mode '{other}' is unknown (expected 'progress8kpabs' or 'kingrank9')"
+        )
+        .into()),
+    }
+}
+
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn validate_output_format(
+    output_format: OutputFormatArg,
+    bucket_mode: BucketMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if output_format == OutputFormatArg::Yaneuraou && !matches!(bucket_mode, BucketMode::KingRank9)
+    {
+        return Err(
+            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9; progress8kpabs routing is not representable in YaneuraOu SFNN"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(feature = "gpu", test))]
@@ -126,13 +239,12 @@ fn validate_shared_cli(
         })?
         .spec();
 
-    if !cli.optimizer.eq_ignore_ascii_case("ranger") {
-        return Err(format!(
-            "--optimizer '{}' is not implemented (only 'ranger')",
+    let optimizer = OptimizerKind::parse(&cli.optimizer).ok_or_else(|| {
+        format!(
+            "--optimizer '{}' is not a known optimizer (expected one of: ranger, radam, adamw)",
             cli.optimizer
         )
-        .into());
-    }
+    })?;
     // `--ft-fp16-out` は weight FP16 path の上に積む拡張なので `--ft-fp16` を要求する。
     if ft_fp16_out_missing_ft_fp16(ft_fp16_out_raw, cli.ft_fp16, cli.all_optim) {
         return Err(
@@ -167,7 +279,7 @@ fn validate_shared_cli(
         return Err("--threads must be >= 1".into());
     }
     if cli.init_from.is_some() && cli.resume.is_some() {
-        return Err("--init-from and --resume are mutually exclusive (--init-from injects weights but resets the Ranger optimizer state; --resume preserves it)".into());
+        return Err("--init-from and --resume are mutually exclusive (--init-from injects weights but resets the optimizer state; --resume preserves it)".into());
     }
     if cli.superbatches == 0 {
         return Err("--superbatches must be >= 1".into());
@@ -180,6 +292,7 @@ fn validate_shared_cli(
 
     Ok(SharedCliValidation {
         feature_set,
+        optimizer,
         precision: SharedPrecisionFlags {
             ft_fp16: cli.ft_fp16 || cli.all_optim,
             ft_fp16_out: ft_fp16_out_raw || cli.all_optim,
@@ -191,24 +304,18 @@ fn validate_shared_cli(
 
 #[cfg(feature = "gpu")]
 pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
-    // eval-only / threat ablation は LayerStack 専用。Simple arch は別 driver
-    // ([`run_simple_training`]) でこれらを解釈しないため、黙って通常学習に落ちる
-    // 取り違えを避けて明示的に弾く (dispatch より前)。
-    if matches!(cli.arch, ArchCommand::Simple(_))
-        && (cli.eval_only || cli.threat_ablate.is_some() || cli.threat_norm_dump)
-    {
-        return Err(
-            "--eval-only / --threat-ablate / --threat-norm-dump are only supported with the \
-             layerstack subcommand"
-                .into(),
-        );
-    }
-
     // アーキ種別で host pipeline を分岐する。Simple は別 driver
     // ([`run_simple_training`]) で受け、LayerStack 側はそのまま既存の flow を継続する。
     let layerstack = match &cli.arch {
         ArchCommand::LayerStack(args) => args,
         ArchCommand::Simple(args) => return run_simple_training(cli, args),
+        ArchCommand::BenchPos(_) => {
+            return Err("bench-pos must be dispatched before run_training".into());
+        }
+        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+        ArchCommand::NativeBench(_) => {
+            return Err("native-bench must be dispatched before training".into());
+        }
     };
 
     // --data は通常学習と --eval-only --test-tail-positions では必須だが、
@@ -243,9 +350,21 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             },
         )?),
     };
-    // PSQT は threat と排他のまま据え置く。PSQT shortcut は全 FT row に material
-    // prior を載せる設計で、threat row には material 概念が無いため base row 限定の
-    // 境界処理が要る (未配線)。factorizer との併用は本 path で解禁する。
+    let effect_bucket_config = parse_effect_bucket_config(&layerstack.effect_bucket_config)?;
+    if cli.output_format == OutputFormatArg::Yaneuraou
+        && (layerstack.psqt || threat_profile.is_some() || effect_bucket_config.is_some())
+    {
+        return Err(
+            "--output-format yaneuraou supports plain LayerStack only; PSQT, threat-profile, and effect-bucket models are not representable in YaneuraOu SFNN"
+                .into(),
+        );
+    }
+    if threat_profile.is_some() && effect_bucket_config.is_some() {
+        return Err("--effect-bucket is mutually exclusive with --threat-profile".into());
+    }
+    // PSQT shortcut は全 FT row に material prior を載せる設計で、base row 限定の
+    // 境界処理が要る feature 拡張とは同時に使わない。factorizer と threat の併用は
+    // threat path で解禁する。
     if threat_profile.is_some() && layerstack.psqt {
         return Err(
             "--threat-profile is mutually exclusive with --psqt for now (the PSQT shortcut \
@@ -254,21 +373,38 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 .into(),
         );
     }
-
+    if effect_bucket_config.is_some() && layerstack.psqt {
+        return Err(
+            "--effect-bucket is mutually exclusive with --psqt for now (the PSQT shortcut \
+             must be restricted to effect bucket FT rows explicitly)"
+                .into(),
+        );
+    }
     // spec の modifier 適用 (確定はこの 1 箇所)。threat と factorizer は独立に
-    // 連結でき、両 ON の FT layout は `[base real | threat real | virtual P]`。
-    // factorizer は default ON で `--no-ft-factorize` が opt-out。`--init-from` は
+    // 連結でき、両 ON の FT layout は `[base real | threat real | virtual piece-input rows]`。
+    // effect bucket は base row 全体を bucket 数倍に展開し、factorizer は共有 mode に応じた
+    // piece-input 仮想行 を後ろへ連結する。factorizer は default ON で `--no-ft-factorize` が opt-out。`--init-from` は
     // factorizer と排他で auto-suppress する (量子化 .bin は仮想行を持たないため
     // 初期化元にできない)。threat profile は init-from でも保持する (threat row は
     // .bin に書かれており初期化できる)。
-    let feature_set = match threat_profile {
-        Some(profile) => {
+    let feature_set = match (threat_profile, effect_bucket_config) {
+        (Some(profile), None) => {
             println!("[train] --threat-profile {profile} → FT input extended by threat dims");
             feature_set.with_threat_profile(profile)
         }
-        None => feature_set,
+        (None, Some(config)) => {
+            println!(
+                "[train] --effect-bucket {} → FT input extended by effect buckets",
+                layerstack.effect_bucket_config
+            );
+            feature_set.with_effect_bucket_config(config)
+        }
+        (None, None) => feature_set,
+        (Some(_), Some(_)) => {
+            unreachable!("effect bucket and threat are rejected before spec construction")
+        }
     };
-    let feature_set = if layerstack.ft_factorize_enabled() {
+    let feature_set = if cli.ft_factorize_enabled() {
         if cli.init_from.is_some() {
             println!(
                 "[train] --init-from set → ft-factorizer disabled (a quantised .bin has no \
@@ -276,20 +412,22 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             );
             feature_set
         } else {
-            feature_set.with_ft_factorize()
+            let mode = if feature_set.effect_bucket_config().is_some() {
+                match layerstack.ft_factorize_effect_bucket_share {
+                    EffectBucketFactorizeShare::PoolBuckets => FtFactorizeMode::PoolEffectBuckets,
+                    EffectBucketFactorizeShare::PerBucket => FtFactorizeMode::PerEffectBucket,
+                }
+            } else {
+                FtFactorizeMode::Base
+            };
+            feature_set.with_ft_factorize_mode(mode)
         }
     } else {
         feature_set
     };
 
-    // --- 未実装オプション値の reject ---
-    if layerstack.bucket_mode != "progress8kpabs" {
-        return Err(format!(
-            "--bucket-mode '{}' is not implemented (only 'progress8kpabs')",
-            layerstack.bucket_mode
-        )
-        .into());
-    }
+    let bucket_mode = validate_bucket_mode(layerstack)?;
+    validate_output_format(cli.output_format, bucket_mode)?;
     // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
     // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
     // 非依存に掛かる)、bias wd=0 と同様に許容する。
@@ -318,6 +456,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             scale: 1.0 / cli.scale,
         }
     };
+    let fv_scale = layerstack_export_fv_scale(layerstack.fv_scale, loss, cli.scale);
     // FT 出力次元は backward の gather kernel が grid を `ft_out / 128` で launch する
     // ため 128 の倍数でなければ末尾行の勾配が計算されない。
     if layerstack.ft_out == 0 || !layerstack.ft_out.is_multiple_of(128) {
@@ -349,36 +488,25 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         )
         .into());
     }
-    // bucket 数の下限 2 は progress binning が意味を持つ最小値。上限 9 は L2 / L3
-    // per-bucket weight backward kernel の固定 9-register accumulator 容量
-    // (`MAX_SUPPORTED_NUM_BUCKETS`)。larger N would need the per-bucket weight
-    // backward kernels' register fan-out to be generalised.
-    if !(2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&layerstack.num_buckets) {
-        return Err(format!(
-            "--num-buckets must be in [2, {MAX_SUPPORTED_NUM_BUCKETS}] (got {}); larger N \
-             requires the per-bucket weight backward kernels to be generalised",
-            layerstack.num_buckets
-        )
-        .into());
-    }
-
     std::fs::create_dir_all(&cli.output)?;
 
-    // progress8kpabs weights (process-global; 未指定なら zero → 全 bucket 4)
-    let progress = match &layerstack.progress_coeff {
-        Some(p) => {
-            println!("[train] loading progress8kpabs coeff: {}", p.display());
-            ShogiProgressKPAbs::load_from_bin(p).map_err(|e| -> Box<dyn std::error::Error> {
-                format!("failed to load --progress-coeff {}: {e}", p.display()).into()
-            })?
-        }
-        None => {
-            eprintln!(
+    // progress8kpabs のみ process-global coefficient を使う。KingRank9 は玉位置から
+    // 直接求めるため file I/O も progress model 初期化も行わない。
+    if matches!(bucket_mode, BucketMode::Progress8KpAbs) {
+        match &layerstack.progress_coeff {
+            Some(p) => {
+                println!("[train] loading progress8kpabs coeff: {}", p.display());
+                ShogiProgressKPAbs::load_from_bin(p).map_err(
+                    |e| -> Box<dyn std::error::Error> {
+                        format!("failed to load --progress-coeff {}: {e}", p.display()).into()
+                    },
+                )?;
+            }
+            None => eprintln!(
                 "[train] note: --progress-coeff not given; all positions map to bucket 4 (sigmoid(0) = 0.5)"
-            );
-            ShogiProgressKPAbs
+            ),
         }
-    };
+    }
 
     // norm-dump は load した threat FT 重みの host 側 L2 分解だけで GPU を要さない。
     // CUDA context / GpuTrainer の構築前に load → dump → return し、GPU 非搭載の
@@ -404,6 +532,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building GpuTrainer (LayerStack)...");
+    println!("[train] optimizer: {}", shared.optimizer.name());
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
     // 実効値は起動時 log に展開出力し reproducibility 確保。
     let SharedPrecisionFlags {
@@ -511,6 +640,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         layerstack.l1,
         layerstack.l2,
         layerstack.num_buckets,
+        bucket_mode,
         PrecisionFlags {
             tf32,
             ft_fp16,
@@ -518,6 +648,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             fp16_opt_state,
         },
         feature_set,
+        shared.optimizer,
         optim_groups,
         norm_loss_factor,
         psqt_init_vec.as_deref(),
@@ -532,7 +663,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 fp16_opt_state,
                 "--ft-out",
                 layerstack.ft_out,
-                Some(layerstack.threat_profile.as_str()),
+                OomFeatureConfig {
+                    threat_profile: Some(layerstack.threat_profile.as_str()),
+                    effect_bucket_config: Some(layerstack.effect_bucket_config.as_str()),
+                },
             )
         } else {
             e
@@ -618,9 +752,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         batches_per_superbatch: cli.batches_per_superbatch,
         batch_size: cli.batch_size,
         save_rate: cli.save_rate,
+        fv_scale,
+        output_format: cli.output_format.into(),
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         score_drop_abs: cli.score_drop_abs,
+        score_clamp_abs: cli.score_clamp_abs,
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
@@ -628,6 +765,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         compute_bucket: true,
         num_buckets: layerstack.num_buckets,
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
+        monitor_active_features: cli.monitor_active_features,
     };
 
     // forward 用 FT weight (`--ft-fp16` の mirror / factorizer の comb) を学習
@@ -639,6 +777,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         // 通常学習は trainer::run 内の cfg.validate() が held-out 数を検証するが、
         // eval-only はそこへ到達せず HeldoutSet::load を直接呼ぶため、ここで等価の
         // 下限を弾く (test_positions==0 は 1 batch に切上げられ無言で縮退する)。
+        // cfg.validate() 丸ごとは呼べない: eval-only では resume 由来の
+        // start_superbatch が --superbatches を超えていても正当なため。
+        // score_clamp_abs は CLI parser (i16 + range 1..) が値域を保証する。
         if cfg.test_positions == 0 {
             return Err("--eval-only requires --test-positions >= 1 (held-out batch count)".into());
         }
@@ -648,8 +789,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 test_path,
                 cfg.batch_size,
                 cfg.score_drop_abs,
+                cfg.score_clamp_abs,
                 cfg.test_positions,
-                &progress,
+                &bucket_mode,
                 cfg.feature_set,
                 cfg.num_buckets,
             )?,
@@ -673,8 +815,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     file_size,
                     cfg.batch_size,
                     cfg.score_drop_abs,
+                    cfg.score_clamp_abs,
                     cfg.test_positions,
-                    &progress,
+                    &bucket_mode,
                     cfg.feature_set,
                     cfg.num_buckets,
                 )?
@@ -707,13 +850,14 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         resume_parent_id,
         data,
         lr_scheduler.to_string(),
+        fv_scale,
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
     let result = nnue_train::trainer::run(
         &mut trainer,
         data,
-        &progress,
+        &bucket_mode,
         &lr_scheduler,
         &wdl_scheduler,
         &cfg,
@@ -933,7 +1077,7 @@ pub(crate) fn finite_or_zero(x: f32) -> f32 {
 
 /// per-group optimizer override flag の `(CLI 名, 指定値)` 一覧。layerstack 経路の
 /// 値 validation と simple 経路の reject が同じ表を参照する (flag 追加時の漏れ防止)。
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 6] {
     [
         ("--ft-weight-decay", cli.ft_weight_decay),
@@ -951,6 +1095,82 @@ pub(crate) fn per_group_optim_flags(cli: &Cli) -> [(&'static str, Option<f32>); 
 #[cfg(feature = "gpu")]
 pub(crate) fn per_group_optim_overridden(cli: &Cli) -> bool {
     per_group_optim_flags(cli).iter().any(|(_, v)| v.is_some())
+}
+
+/// simple サブコマンドが解釈しない global フラグを明示エラーで弾く (silent no-op 回避)。
+///
+/// simple driver ([`run_simple_training`]) と `SimpleGpuTrainer` は、global フラグの
+/// 大半 (data / feature-set / LR・WDL schedule / loss・WRM パラメータ / precision
+/// (`--ft-fp16` / `--fp16-opt-state` / `--all-optim`) / init (`--init-ft` / `--init-l1..3`) /
+/// checkpoint / monitor / `--ft-factorize` / `--norm-loss`) を消費する。layerstack 専用で
+/// simple が解釈しないのは本関数が弾く 2 群だけ:
+///   - `--eval-only` / `--threat-ablate` / `--threat-norm-dump`: layerstack の eval / threat
+///     経路専用。
+///   - per-group optimizer override (`--ft/dense/bias-weight-decay` / `--ft/dense/bias-lr-mult`):
+///     simple は単一 `weight_decay` 経路のみ。
+///
+/// 他の layerstack 専用 flag の enforce は別所が担う: `--optimizer` は
+/// [`validate_shared_cli`] が未知の optimizer 名を reject、`--init-l1f` は
+/// [`build_simple_init_spec`] が reject (simple に L1f 層は無い)。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn reject_simple_unsupported_flags(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.output_format == OutputFormatArg::Yaneuraou {
+        return Err(
+            "--output-format yaneuraou is supported only with the layerstack subcommand".into(),
+        );
+    }
+    if cli.eval_only || cli.threat_ablate.is_some() || cli.threat_norm_dump {
+        return Err(
+            "--eval-only / --threat-ablate / --threat-norm-dump are only supported with the \
+             layerstack subcommand"
+                .into(),
+        );
+    }
+    if let Some((name, _)) = per_group_optim_flags(cli).iter().find(|(_, v)| v.is_some()) {
+        return Err(format!(
+            "{name} is only supported with the layerstack subcommand, not the simple trainer \
+             (simple uses a single --weight-decay path)"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// simple トレーナは `--win-rate-model` (WRM) を必須とし、学習出力と量子化 export の
+/// score scale が一致することを検証する。非 WRM の loss_wdl は
+/// net_output ≈ cp (±数千) に収束するが、simple の quantised export は dense weight を
+/// int8 clamp (±127/QB ≈ ±1.98) で書くため、出力層がその大きな出力スケールを構成
+/// できず clamp 端へ飽和し、量子化ネットの評価値が破綻する。WRM 経路は
+/// net_output = logit(WRM(cp)) = O(1) で dense clamp と整合するため安全。この不整合は
+/// 学習中の符号ベース test accuracy には現れないので CLI で早期に弾く。
+///
+/// WRM の学習出力は `--wrm-nnue2score` 単位だが、simple の `fv_scale` は `--scale` から
+/// 算出される。両者が異なると量子化 net の評価値が同じ比率でずれるため、一致を必須とする。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn require_simple_win_rate_model(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if !cli.win_rate_model {
+        return Err(
+            "the simple trainer requires --win-rate-model: the plain sigmoid loss \
+             path converges to net_output ≈ cp, which the int8 dense weight clamp (±127/QB) \
+             cannot represent, so the exported output layer saturates and the evaluation breaks \
+             (the sign-based test accuracy will not surface this). To recover a plain sigmoid, \
+             degenerate the WRM to identity with --scale <scale> --wrm-in-offset 0 \
+             --wrm-target-offset 0 --wrm-in-scaling <scale> --wrm-target-scaling <scale> \
+             --wrm-nnue2score <scale> (use the same <scale> everywhere; the simple trainer \
+             derives fv_scale from --scale even under the WRM, so omitting it silently shifts \
+             the evaluation scale)."
+                .into(),
+        );
+    }
+    if cli.scale != cli.wrm_nnue2score {
+        return Err(format!(
+            "the simple trainer requires matching training and export score scales: \
+             --scale ({}) must equal --wrm-nnue2score ({})",
+            cli.scale, cli.wrm_nnue2score
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// `--win-rate-model` 指定時の WRM loss パラメータを検証して [`LossKind::Wrm`] を作る。
@@ -1185,6 +1405,7 @@ pub(crate) fn build_experiment_logger(
     resume_parent_id: Option<String>,
     data: &Path,
     lr_schedule: String,
+    fv_scale: Option<i32>,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
     // id 末尾に process id を付ける。同一 net_id / output で複数プロセスが同一
@@ -1240,7 +1461,7 @@ pub(crate) fn build_experiment_logger(
         l1: layerstack.l1,
         l2: layerstack.l2,
         num_buckets: Some(layerstack.num_buckets),
-        optimizer: cli.optimizer.clone(),
+        optimizer: cli.optimizer.to_ascii_lowercase(),
         bucket_mode: Some(layerstack.bucket_mode.clone()),
         activation: None,
         progress_coeff: layerstack.progress_coeff.as_deref().map(file_basename),
@@ -1282,6 +1503,7 @@ pub(crate) fn build_experiment_logger(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
+        score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         // test_data / test_positions / test_tail_positions は対応する CLI フラグ
@@ -1313,6 +1535,7 @@ pub(crate) fn build_experiment_logger(
         lineage,
         params,
         data_info,
+        fv_scale,
     );
     ExperimentLogger::new(json_path, doc)
 }
@@ -1360,6 +1583,9 @@ pub(crate) fn build_experiment_logger_simple(
     fp16_opt_state: bool,
     tf32: bool,
     lr_schedule: String,
+    // export される `.bin` の実効値。`--init-from` で入力 `.bin` の値に上書きされるため、
+    // CLI の `--scale` から再計算せず trainer の値を渡す。
+    fv_scale: i32,
 ) -> ExperimentLogger {
     let start_secs = nnue_train::experiment::now_epoch_secs();
     let net_id_compact = format!(
@@ -1396,12 +1622,12 @@ pub(crate) fn build_experiment_logger_simple(
         architecture,
         feature_set: id.feature_set.canonical_name().to_string(),
         ft_in: id.ft_in(),
-        ft_factorize: None,
+        ft_factorize: id.feature_set.ft_factorize().then_some(true),
         l0: id.ft_out,
         l1: id.l1_out,
         l2: id.l2_out,
         num_buckets: None,
-        optimizer: cli.optimizer.clone(),
+        optimizer: cli.optimizer.to_ascii_lowercase(),
         bucket_mode: None,
         activation: Some(id.activation.canonical_name().to_string()),
         progress_coeff: None,
@@ -1418,15 +1644,15 @@ pub(crate) fn build_experiment_logger_simple(
         end_wdl: cli.end_wdl.map(finite_or_zero),
         scale: finite_or_zero(cli.scale),
         weight_decay: finite_or_zero(cli.weight_decay),
-        // simple subcommand は per-group optimizer 非対応 (`run_simple_training` で reject 済)。
+        // simple は per-group optimizer 非対応 ([`reject_simple_unsupported_flags`] が弾く)。
         ft_weight_decay: None,
         dense_weight_decay: None,
         bias_weight_decay: None,
         ft_lr_mult: None,
         dense_lr_mult: None,
         bias_lr_mult: None,
-        // simple subcommand は norm loss 非対応 (`run_simple_training` で reject 済)。
-        norm_loss_factor: None,
+        // `--norm-loss` 有効時のみ factor を記録する (無効時 None)。
+        norm_loss_factor: cli.norm_loss.then_some(cli.norm_loss_factor),
         qa: id.activation.qa(),
         qb: nnue_format::simple_weights::QB,
         loss_kind: if is_wrm { "wrm" } else { "sigmoid" }.to_string(),
@@ -1440,6 +1666,7 @@ pub(crate) fn build_experiment_logger_simple(
         wrm_weight_boost_w1: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w1)),
         wrm_weight_boost_w2: is_wrm.then(|| finite_or_zero(cli.loss_weight_boost_w2)),
         score_drop_abs: cli.score_drop_abs,
+        score_clamp_abs: cli.score_clamp_abs.map(i32::from),
         init_from: cli.init_from.as_deref().map(file_basename),
         init_preset: init_summary_for_log(cli),
         test_data: cli.test_data.as_deref().map(file_basename),
@@ -1470,6 +1697,7 @@ pub(crate) fn build_experiment_logger_simple(
         lineage,
         params,
         data_info,
+        Some(fv_scale),
     );
     ExperimentLogger::new(json_path, doc)
 }
@@ -1532,6 +1760,12 @@ pub(crate) fn run_simple_training(
     cli: &Cli,
     simple_args: &SimpleArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // simple が解釈しない layerstack 専用 global フラグ (eval/threat 系・per-group optim) を
+    // silent no-op せず明示 reject する。`--data` 展開より前に弾く: main は `--eval-only`
+    // 等では `--data` 不在でも本 driver に dispatch するため、後段の `data.expect` より前で
+    // reject しないと clean error が panic に化ける。監査内容は関数 doc を参照。
+    reject_simple_unsupported_flags(cli)?;
+    require_simple_win_rate_model(cli)?;
     let data = cli
         .data
         .as_ref()
@@ -1539,18 +1773,10 @@ pub(crate) fn run_simple_training(
 
     let shared = validate_shared_cli(cli, simple_args.ft_fp16_out, simple_args.tf32)?;
     let feature_set = shared.feature_set;
-    if cli.norm_loss {
-        return Err(
-            "--norm-loss is only supported by the layer-stack trainer, not the simple subcommand"
-                .into(),
-        );
-    }
-    // per-group flag は global 定義なので parse は通るが、simple trainer は単一
-    // weight_decay 経路のみ。silent no-op (指定 hyperparameter が効かないまま走る)
-    // を防ぐため明示 reject する。
-    if let Some((name, _)) = per_group_optim_flags(cli).iter().find(|(_, v)| v.is_some()) {
+    if cli.norm_loss && (!cli.norm_loss_factor.is_finite() || cli.norm_loss_factor < 0.0) {
         return Err(format!(
-            "{name} is only supported by the layer-stack trainer, not the simple subcommand"
+            "--norm-loss-factor must be finite and >= 0 (got {})",
+            cli.norm_loss_factor
         )
         .into());
     }
@@ -1585,6 +1811,26 @@ pub(crate) fn run_simple_training(
             .into()
         },
     )?;
+    // FT factorizer は default ON で `--no-ft-factorize` が opt-out。Simple の feature set は
+    // threat / effect bucket を持たないので mode は Base 固定 (piece-input 仮想行のみ)。仮想行を
+    // 持つ .bin は無いため `--init-from` とは排他で auto-suppress する。量子化 .bin は仮想行を
+    // 実行へ畳み込んで shape が非 factorize と同形になるので推論側の変更は不要。
+    let feature_set = if cli.ft_factorize_enabled() {
+        if cli.init_from.is_some() {
+            println!(
+                "[train] --init-from set → ft-factorizer disabled (a quantised .bin has no \
+                 virtual factorizer rows)"
+            );
+            feature_set
+        } else {
+            println!(
+                "[train] ft-factorizer ON (virtual piece-input rows folded into the exported .bin)"
+            );
+            feature_set.with_ft_factorize_mode(FtFactorizeMode::Base)
+        }
+    } else {
+        feature_set
+    };
     let id = SimpleId {
         feature_set,
         activation,
@@ -1599,13 +1845,9 @@ pub(crate) fn run_simple_training(
     if !(cli.scale.is_finite() && cli.scale > 0.0) {
         return Err(format!("--scale must be finite and > 0 (got {})", cli.scale).into());
     }
-    let loss = if cli.win_rate_model {
-        build_wrm_loss(cli)?
-    } else {
-        LossKind::Sigmoid {
-            scale: 1.0 / cli.scale,
-        }
-    };
+    // loss_wdl は `require_simple_win_rate_model` が入口で弾く (dense int8 clamp と非整合)
+    // ため、simple の loss は WRM に限られる。
+    let loss = build_wrm_loss(cli)?;
 
     // `--init-l1f` は Simple では受け付けないため CUDA 初期化より前に解決して
     // 早期 reject する (CUDA context 作成のコストを払わせない)。
@@ -1620,10 +1862,20 @@ pub(crate) fn run_simple_training(
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building SimpleGpuTrainer...");
+    println!("[train] optimizer: {}", shared.optimizer.name());
     // 推論側 evaluation scale。FT 活性化出力は活性化に依らず 127-scale のため
     // fv_scale も活性化非依存 (round(FT_OUTPUT_QA × QB / 学習 scale))。`cli.scale`
     // は前段で有限・正値を保証済。
     let fv_scale = nnue_format::simple_weights::simple_fv_scale(cli.scale);
+    let norm_loss_factor = if cli.norm_loss {
+        println!(
+            "[train] norm loss active (factor = {})",
+            cli.norm_loss_factor
+        );
+        Some(cli.norm_loss_factor)
+    } else {
+        None
+    };
     // `--all-optim` は 4 risky 速度 flag を一括 ON にする shortcut (個別 flag と OR)。
     // 実効値は起動時 log に展開出力し reproducibility 確保 (--all-optim だけでなく
     // どの flag が ON になったかを後で `tail train.log` で見て experiment.json の
@@ -1644,7 +1896,9 @@ pub(crate) fn run_simple_training(
         &ctx,
         cli.batch_size,
         id,
+        shared.optimizer,
         cli.weight_decay,
+        norm_loss_factor,
         fv_scale,
         PrecisionFlags {
             tf32,
@@ -1663,7 +1917,7 @@ pub(crate) fn run_simple_training(
                 fp16_opt_state,
                 "--l1",
                 ft_out,
-                None,
+                OomFeatureConfig::default(),
             )
         } else {
             e
@@ -1695,10 +1949,11 @@ pub(crate) fn run_simple_training(
         (None, None, None)
     };
 
-    // `--ft-fp16` の FP16 weight mirror を学習開始時の `ft_w` (init / --init-from /
-    // --resume いずれか) と一度同期する。以降は optimizer が step ごとに維持する。
-    // `--ft-fp16` 未指定なら no-op。
-    trainer.sync_ft_w_h_mirror()?;
+    // forward が読む FT weight (factorizer の comb / `--ft-fp16` mirror) を学習開始時の
+    // `ft_w` (init / --init-from / --resume いずれか) から一度同期する。以降は factorizer
+    // の comb は step 末の fold、`--ft-fp16` mirror は optimizer が維持する。factorizer 無効
+    // かつ `--ft-fp16` 未指定なら no-op。
+    trainer.sync_ft_forward_weights()?;
 
     let start_superbatch = shared.start_superbatch(cli, resumed_superbatch)?;
     if start_superbatch > cli.superbatches {
@@ -1720,9 +1975,12 @@ pub(crate) fn run_simple_training(
         batches_per_superbatch: cli.batches_per_superbatch,
         batch_size: cli.batch_size,
         save_rate: cli.save_rate,
+        fv_scale: Some(trainer.fv_scale()),
+        output_format: cli.output_format.into(),
         keep_raw_checkpoints: cli.keep_checkpoints,
         loss,
         score_drop_abs: cli.score_drop_abs,
+        score_clamp_abs: cli.score_clamp_abs,
         threads: cli.threads,
         test_data: cli.test_data.clone(),
         test_positions: cli.test_positions,
@@ -1733,6 +1991,7 @@ pub(crate) fn run_simple_training(
         // 通すための placeholder。
         num_buckets: 1,
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
+        monitor_active_features: cli.monitor_active_features,
     };
 
     let mut experiment = build_experiment_logger_simple(
@@ -1747,6 +2006,7 @@ pub(crate) fn run_simple_training(
         fp16_opt_state,
         tf32,
         lr_scheduler.to_string(),
+        trainer.fv_scale(),
     );
     println!("[train] experiment log: {}", experiment.path().display());
 
@@ -1775,6 +2035,44 @@ pub(crate) fn run_simple_training(
 #[cfg(test)]
 mod shared_cli_tests {
     use super::*;
+
+    #[test]
+    fn layerstack_fv_scale_follows_loss_and_override() {
+        let wrm = LossKind::Wrm {
+            nnue2score: 600.0,
+            in_scaling: 340.0,
+            in_offset: 270.0,
+            target_offset: 270.0,
+            target_scaling: 380.0,
+            pow_exp: 2.0,
+            qp_asymmetry: 0.0,
+            weight_boost_w1: 0.0,
+            weight_boost_w2: 0.5,
+        };
+        assert_eq!(
+            layerstack_export_fv_scale(None, LossKind::Sigmoid { scale: 1.0 / 290.0 }, 290.0,),
+            Some(28)
+        );
+        assert_eq!(layerstack_export_fv_scale(None, wrm, 290.0), None);
+        assert_eq!(layerstack_export_fv_scale(Some(41), wrm, 290.0), Some(41));
+
+        let cli = Cli::try_parse_from(["nnue-trainer", "layerstack", "--fv-scale", "37"])
+            .expect("cli parse");
+        let ArchCommand::LayerStack(args) = cli.arch else {
+            unreachable!()
+        };
+        assert_eq!(args.fv_scale, Some(37));
+
+        for invalid in ["0", "-1"] {
+            let error = Cli::try_parse_from(["nnue-trainer", "layerstack", "--fv-scale", invalid])
+                .expect_err("non-positive fv_scale must be rejected")
+                .to_string();
+            assert!(
+                error.contains("fv_scale must be greater than zero"),
+                "{error}"
+            );
+        }
+    }
     use clap::Parser;
 
     fn parse(extra: &[&str]) -> Cli {
@@ -1800,7 +2098,7 @@ mod shared_cli_tests {
         );
         assert!(
             shared_cli_error(&["--optimizer", "adam"], false)
-                .contains("--optimizer 'adam' is not implemented")
+                .contains("--optimizer 'adam' is not a known optimizer")
         );
         assert!(shared_cli_error(&["--lr", "0"], false).contains("--lr must be finite and > 0"));
         assert!(
@@ -1823,6 +2121,20 @@ mod shared_cli_tests {
             shared_cli_error(&["--keep-checkpoints", "0"], false)
                 .contains("--keep-checkpoints must be >= 1 when set")
         );
+    }
+
+    #[test]
+    fn shared_cli_validation_resolves_optimizer_kind() {
+        for (arg, expected) in [
+            ("ranger", OptimizerKind::Ranger),
+            ("radam", OptimizerKind::RAdam),
+            ("adamw", OptimizerKind::AdamW),
+            ("AdamW", OptimizerKind::AdamW),
+        ] {
+            let shared = validate_shared_cli(&parse(&["--optimizer", arg]), false, false)
+                .expect("valid shared CLI");
+            assert_eq!(shared.optimizer, expected, "--optimizer {arg}");
+        }
     }
 
     #[test]
@@ -1933,6 +2245,59 @@ mod tests {
         );
     }
 
+    /// `results.fv_scale` は builder に渡された実効値 (trainer が export に使う値) を
+    /// 記録する。CLI の `--scale` から再計算すると `--init-from` で入力 `.bin` の値を
+    /// 引き継いだ場合に export と食い違うため、素通しであることを固定する。
+    #[test]
+    fn simple_logger_records_effective_fv_scale_not_cli_scale() {
+        let dir = std::env::temp_dir().join(format!("tatara-fv-scale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let data = dir.join("teacher.psv");
+        std::fs::write(&data, [0u8; PSV_RECORD_BYTES as usize]).expect("write teacher");
+
+        let out = dir.join("out");
+        let mut argv = vec!["nnue-trainer"];
+        let out_str = out.to_str().expect("utf8 path");
+        argv.extend_from_slice(&["--scale", "600", "--output", out_str]);
+        argv.push("simple");
+        let cli = Cli::try_parse_from(argv).expect("cli parse");
+
+        // CLI 由来値と実効値を意図的にずらす (`--init-from` で入力 `.bin` の値を
+        // 引き継いだ状況に相当)。
+        let cli_derived = nnue_format::simple_weights::simple_fv_scale(cli.scale);
+        let effective = cli_derived + 14;
+        assert_ne!(cli_derived, effective);
+
+        let logger = build_experiment_logger_simple(
+            &cli,
+            SimpleId {
+                feature_set: FeatureSet::HalfKp.spec(),
+                activation: SimpleActivation::CReLU,
+                ft_out: 256,
+                l1_out: 32,
+                l2_out: 32,
+            },
+            0,
+            None,
+            None,
+            &data,
+            false,
+            false,
+            false,
+            false,
+            "step".to_string(),
+            effective,
+        );
+        logger.write().expect("write experiment.json");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(logger.path()).expect("read json"))
+                .expect("parse json");
+        assert_eq!(json["results"]["fv_scale"], serde_json::json!(effective));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn init_from_run_logs_no_summary() {
         // `--init-from` は重みを上書きするので override 指定は実 weight に効かない。
@@ -1984,8 +2349,19 @@ mod tests {
     #[test]
     fn gpu_oom_error_lists_relevant_remedies() {
         // fp16-opt-state off + threat on: current 値を出し、全 remedy を提示。
-        let m =
-            gpu_oom_error(65536, false, false, false, "--ft-out", 1536, Some("full")).to_string();
+        let m = gpu_oom_error(
+            65536,
+            false,
+            false,
+            false,
+            "--ft-out",
+            1536,
+            OomFeatureConfig {
+                threat_profile: Some("full"),
+                effect_bucket_config: Some("off"),
+            },
+        )
+        .to_string();
         assert!(m.contains("--ft-out=1536"));
         assert!(m.contains("threat-profile=full"));
         assert!(m.contains("add `--fp16-opt-state`"));
@@ -1994,7 +2370,16 @@ mod tests {
         assert!(m.contains("smaller `--batch-size`"));
 
         // fp16-opt-state 既に on + threat off (Simple): 該当しない remedy は省く。
-        let m2 = gpu_oom_error(4096, true, false, true, "--l1", 256, None).to_string();
+        let m2 = gpu_oom_error(
+            4096,
+            true,
+            false,
+            true,
+            "--l1",
+            256,
+            OomFeatureConfig::default(),
+        )
+        .to_string();
         assert!(m2.contains("--l1=256"));
         assert!(!m2.contains("add `--fp16-opt-state`"));
         assert!(!m2.contains("smaller `--threat-profile`"));

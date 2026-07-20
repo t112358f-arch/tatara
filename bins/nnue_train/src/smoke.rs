@@ -2,12 +2,26 @@ use gpu_runtime::CudaContext;
 use nnue_format::LayerStackWeights;
 use nnue_format::{ArchKind, SimpleActivation, SimpleId, SimpleWeights};
 use nnue_train::init::{LayerStackInit, SimpleInit};
+use nnue_train::optimizer::OptimizerKind;
 use shogi_features::FeatureSet;
 
 use crate::{arch::*, trainer_common::*, trainer_layerstack::*, trainer_simple::*};
 
+fn native_simple_smoke_scope() -> bool {
+    #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+    {
+        crate::kernel_module::native_backend_requested()
+    }
+    #[cfg(not(any(feature = "native-cuda", feature = "native-cuda-host")))]
+    {
+        false
+    }
+}
+
 /// Simple アーキ用 smoke test。preset `256x2-32-32` (HalfKaHmMerged + CReLU) で
-/// `SimpleGpuTrainer` を構築し、以下 4 段を踏む:
+/// `SimpleGpuTrainer` を構築し、以下 4 段を踏む。native backendではfactorizerと
+/// FP16 weight/output/optimizer stateを同時に有効化し、portable host pathも含めて検査する。
+/// cuda-oxide backendでは追加の活性化/loss経路も検査する:
 /// 1. forward sanity — CReLU + SCReLU 両活性化 + sigmoid / WRM 両 loss kernel を
 ///    1 step ずつ launch して loss が finite であること。
 /// 2. step が gradient を正しく配線していることを 10 step の loss 推移で確認する
@@ -17,10 +31,32 @@ use crate::{arch::*, trainer_common::*, trainer_layerstack::*, trainer_simple::*
 /// 4. `save_raw_checkpoint` → 新 trainer での `load_raw_checkpoint` 後の forward が
 ///    元と完全一致 (raw f32 round-trip の exact preservation)。
 pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
+    let native_scope = native_simple_smoke_scope();
+    let primary_loss = if native_scope {
+        SMOKE_LOSS_WRM
+    } else {
+        SMOKE_LOSS_SIGMOID
+    };
+    let primary_loss_name = if native_scope {
+        "default WRM"
+    } else {
+        "sigmoid-MSE"
+    };
     let ctx = CudaContext::new(0)?;
     println!("[smoke/simple] CUDA context created, loading kernel module...");
+    if native_scope {
+        println!(
+            "[smoke/simple] native scope: CReLU, FT factorizer, FP16 weight/output/state, \
+             Ranger, default WRM"
+        );
+    }
+    let feature_set = if native_scope {
+        FeatureSet::HalfKaHmMerged.spec().with_ft_factorize()
+    } else {
+        FeatureSet::HalfKaHmMerged.spec()
+    };
     let id = SimpleId {
-        feature_set: FeatureSet::HalfKaHmMerged.spec(),
+        feature_set,
         activation: SimpleActivation::CReLU,
         ft_out: 256,
         l1_out: 32,
@@ -28,15 +64,28 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     };
     let smoke_fv_scale = 16_i32;
     let smoke_weight_decay = 1e-7_f32;
+    let smoke_precision = if native_scope {
+        PrecisionFlags {
+            ft_fp16: true,
+            ft_fp16_out: true,
+            fp16_opt_state: true,
+            ..PrecisionFlags::default()
+        }
+    } else {
+        PrecisionFlags::default()
+    };
     let mut trainer = SimpleGpuTrainer::new(
         &ctx,
         SMOKE_BATCH,
         id,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
+        None,
         smoke_fv_scale,
-        PrecisionFlags::default(),
+        smoke_precision,
         &SimpleInit::default_uniform(),
     )?;
+    trainer.sync_ft_forward_weights()?;
     let params = id.ft_in() * id.ft_out
         + id.ft_out
         + id.combined_dim() * id.l1_out
@@ -58,36 +107,40 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     trainer.assert_all_weights_finite()?;
 
     let batch = BatchData::smoke_dummy(SMOKE_BATCH, id.feature_set);
-    let loss = trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
-    println!("[smoke/simple] forward 1 (sigmoid-MSE, crelu): loss = {loss:.6e}");
+    let loss = trainer.forward(&batch.as_ref(), 0.0, primary_loss)?;
+    println!("[smoke/simple] forward 1 ({primary_loss_name}, crelu): loss = {loss:.6e}");
     if !loss.is_finite() {
         return Err(format!("forward 1 loss = {loss} is not finite").into());
     }
     trainer.assert_all_weights_finite()?;
 
-    let id_screlu = SimpleId {
-        activation: SimpleActivation::SCReLU,
-        ..id
-    };
-    let mut trainer_screlu = SimpleGpuTrainer::new(
-        &ctx,
-        SMOKE_BATCH,
-        id_screlu,
-        smoke_weight_decay,
-        smoke_fv_scale,
-        PrecisionFlags::default(),
-        &SimpleInit::default_uniform(),
-    )?;
-    let loss_screlu = trainer_screlu.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
-    println!("[smoke/simple] forward 2 (sigmoid-MSE, screlu): loss = {loss_screlu:.6e}");
-    if !loss_screlu.is_finite() {
-        return Err(format!("forward 2 loss = {loss_screlu} is not finite").into());
-    }
+    if !native_scope {
+        let id_screlu = SimpleId {
+            activation: SimpleActivation::SCReLU,
+            ..id
+        };
+        let mut trainer_screlu = SimpleGpuTrainer::new(
+            &ctx,
+            SMOKE_BATCH,
+            id_screlu,
+            OptimizerKind::Ranger,
+            smoke_weight_decay,
+            None,
+            smoke_fv_scale,
+            PrecisionFlags::default(),
+            &SimpleInit::default_uniform(),
+        )?;
+        let loss_screlu = trainer_screlu.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+        println!("[smoke/simple] forward 2 (sigmoid-MSE, screlu): loss = {loss_screlu:.6e}");
+        if !loss_screlu.is_finite() {
+            return Err(format!("forward 2 loss = {loss_screlu} is not finite").into());
+        }
 
-    let loss_wrm_val = trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
-    println!("[smoke/simple] forward 3 (win-rate-model, crelu): loss = {loss_wrm_val:.6e}");
-    if !loss_wrm_val.is_finite() {
-        return Err(format!("forward 3 (wrm) loss = {loss_wrm_val} is not finite").into());
+        let loss_wrm_val = trainer.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_WRM)?;
+        println!("[smoke/simple] forward 3 (win-rate-model, crelu): loss = {loss_wrm_val:.6e}");
+        if !loss_wrm_val.is_finite() {
+            return Err(format!("forward 3 (wrm) loss = {loss_wrm_val} is not finite").into());
+        }
     }
     println!("[smoke/simple] forward sanity OK ✓");
 
@@ -102,16 +155,16 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     for w in training_batch.wdl.iter_mut() {
         *w = 0.8;
     }
-    let lr = 1e-1_f32;
-    let initial_loss = trainer.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    let lr = if native_scope { 1e-3_f32 } else { 1e-1_f32 };
+    let initial_loss = trainer.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     for step_idx in 0..10 {
-        let step_loss = trainer.step(&training_batch.as_ref(), lr, 0.0, SMOKE_LOSS_SIGMOID)?;
+        let step_loss = trainer.step(&training_batch.as_ref(), lr, 0.0, primary_loss)?;
         if !step_loss.is_finite() {
             return Err(format!("step {step_idx} loss = {step_loss} is not finite").into());
         }
     }
     trainer.assert_all_weights_finite()?;
-    let final_loss = trainer.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    let final_loss = trainer.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     println!("[smoke/simple] 10-step training: loss {initial_loss:.6e} -> {final_loss:.6e}");
     // NaN は `>=` でも `<` でも false になるので、`is_finite` で別途弾く。
     if !final_loss.is_finite() || final_loss >= initial_loss {
@@ -130,7 +183,9 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let weights = trainer.to_simple_weights()?;
     let mut quantised_bytes = Vec::new();
     weights.save_quantised(&mut quantised_bytes)?;
-    let reloaded = SimpleWeights::load(&mut std::io::Cursor::new(&quantised_bytes), id)?;
+    // Factorized training exports folded base-shape weights, so preserve the exported ID when
+    // loading them instead of reattaching the trainer's virtual-row factorizer modifier.
+    let reloaded = SimpleWeights::load(&mut std::io::Cursor::new(&quantised_bytes), weights.id)?;
     if reloaded.fv_scale != smoke_fv_scale {
         return Err(format!(
             "SimpleWeights round-trip: fv_scale mismatch (got {}, want {smoke_fv_scale})",
@@ -141,14 +196,17 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     let mut trainer_q = SimpleGpuTrainer::new(
         &ctx,
         SMOKE_BATCH,
-        id,
+        reloaded.id,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
+        None,
         smoke_fv_scale,
-        PrecisionFlags::default(),
+        smoke_precision,
         &SimpleInit::default_uniform(),
     )?;
     trainer_q.load_simple_weights(&reloaded)?;
-    let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    trainer_q.sync_ft_forward_weights()?;
+    let loss_q = trainer_q.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     println!(
         "[smoke/simple] quantised round-trip: trained loss {final_loss:.6e} \
          -> reloaded loss {loss_q:.6e} ({} bytes)",
@@ -170,16 +228,19 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         SMOKE_BATCH,
         id,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
+        None,
         smoke_fv_scale,
-        PrecisionFlags::default(),
+        smoke_precision,
         &SimpleInit::default_uniform(),
     )?;
     let (sb, _producer, _lr_horizon) = trainer_r.load_raw_checkpoint(&raw_path)?;
+    trainer_r.sync_ft_forward_weights()?;
     if sb != 1 {
         return Err(format!("raw round-trip superbatch mismatch: got {sb}, want 1").into());
     }
-    let loss_r = trainer_r.forward(&training_batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
+    let loss_r = trainer_r.forward(&training_batch.as_ref(), 0.0, primary_loss)?;
     let _ = std::fs::remove_file(&raw_path);
     let loss_r_rel = ((loss_r - final_loss).abs() / final_loss.abs().max(1e-12)) as f32;
     println!(
@@ -194,6 +255,14 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         .into());
     }
 
+    if native_scope {
+        println!(
+            "[smoke/simple] PASSED — native factorized FP16 CReLU/default-WRM forward + \
+             gradient + quantised round-trip + raw round-trip OK"
+        );
+        return Ok(());
+    }
+
     // Pairwise 活性化: forward sanity + 10-step gradient + 量子化 round-trip。
     // Pairwise は L1 入力次元が半減する (combined_dim = ft_out) ため、workspace buffer /
     // cuBLAS Sgemm shape / l1_w layout / 量子化 format がその dim で一貫することを確認する。
@@ -205,7 +274,9 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         SMOKE_BATCH,
         id_pairwise,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
+        None,
         smoke_fv_scale,
         PrecisionFlags::default(),
         &SimpleInit::default_uniform(),
@@ -245,7 +316,9 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
         &ctx,
         SMOKE_BATCH,
         id_pairwise,
+        OptimizerKind::Ranger,
         smoke_weight_decay,
+        None,
         smoke_fv_scale,
         PrecisionFlags::default(),
         &SimpleInit::default_uniform(),
@@ -269,7 +342,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
     // `--ft-fp16-out` 経路 (FT activation を FP16 で保持) を 3 活性化すべてで確認する。
     // f16 FT-out kernel が活性化別に正しく分岐し、loss scaling 込みの backward が
     // finite に走って loss を下げることを見る。`ft_fp16` を要求するので両 flag ON、
-    // `ft_w_h` mirror は `sync_ft_w_h_mirror` で初期同期する (`run_simple_training` と同じ)。
+    // `ft_w_h` mirror は `sync_ft_forward_weights` で初期同期する (`run_simple_training` と同じ)。
     for act in [
         SimpleActivation::CReLU,
         SimpleActivation::SCReLU,
@@ -283,7 +356,9 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
             &ctx,
             SMOKE_BATCH,
             id_fp16,
+            OptimizerKind::Ranger,
             smoke_weight_decay,
+            None,
             smoke_fv_scale,
             PrecisionFlags {
                 ft_fp16: true, // ft_fp16_out requires this
@@ -293,7 +368,7 @@ pub(crate) fn simple_smoke_test() -> Result<(), Box<dyn std::error::Error>> {
             },
             &SimpleInit::default_uniform(),
         )?;
-        trainer_fp16.sync_ft_w_h_mirror()?;
+        trainer_fp16.sync_ft_forward_weights()?;
         let fwd = trainer_fp16.forward(&batch.as_ref(), 0.0, SMOKE_LOSS_SIGMOID)?;
         if !fwd.is_finite() {
             return Err(format!("--ft-fp16-out {act:?} forward loss = {fwd} is not finite").into());
@@ -347,8 +422,10 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
         DEFAULT_NUM_BUCKETS,
+        nnue_train::dataloader::BucketMode::Progress8KpAbs,
         PrecisionFlags::default(),
         feature_set,
+        OptimizerKind::Ranger,
         // smoke は per-group override 無し (全 group weight_decay=0 / lr_mult=1.0)。
         OptimGroupConfig::resolve(0.0, None, None, None, None, None, None),
         None,
@@ -415,7 +492,8 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         println!("[smoke] saving trained weights to {out_path_str} ...");
         let saved_weights = trainer.to_layerstack_weights()?;
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
-        saved_weights.save_quantised(&mut writer)?;
+        saved_weights
+            .save_quantised(&mut writer, Some(nnue_format::layerstack_weights::FV_SCALE))?;
         drop(writer);
         let out_size = std::fs::metadata(&out_path)?.len();
         println!("[smoke] wrote {out_path_str}: {out_size} bytes");
@@ -458,7 +536,8 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         let out_path_str = out_path.display();
         let saved_weights = trainer.to_layerstack_weights()?;
         let mut writer = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
-        saved_weights.save_quantised(&mut writer)?;
+        saved_weights
+            .save_quantised(&mut writer, Some(nnue_format::layerstack_weights::FV_SCALE))?;
         drop(writer);
         let out_size = std::fs::metadata(&out_path)?.len();
         println!("[smoke] wrote {out_path_str}: {out_size} bytes");

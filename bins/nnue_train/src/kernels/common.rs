@@ -29,8 +29,9 @@ pub fn screlu_grad(x: &[f32], dl_dy: &[f32], mut dl_dx: DisjointSlice<f32>, n: u
     } else {
         0.0_f32
     };
+    let j = i.get();
     if let Some(out) = dl_dx.get_mut(i) {
-        *out = dl_dy[i.get()] * dydx;
+        *out = dl_dy[j] * dydx;
     }
 }
 
@@ -360,7 +361,7 @@ macro_rules! radam_finish {
         // kernel 冒頭で `i < n` を確認し、各 thread は自分の `i` のみ書く。
         let mirror_ptr = $mirror.as_mut_ptr();
         unsafe {
-            mirror_ptr.add($i.get()).write($p_clamped as f16);
+            mirror_ptr.add($i).write($p_clamped as f16);
         }
     };
 }
@@ -381,18 +382,31 @@ macro_rules! radam_step_body {
         $eps:ident,
         $min_w:ident,
         $max_w:ident,
-        $n:ident;
+        $n:ident,
+        $i:ident;
         $state:ident $(, $m_scale:ident, $v_scale:ident)?;
         $grad_mode:ident, $mirror_mode:ident $(, $mirror:ident)?
     ) => {
-        let i = thread::index_1d();
-        if i.get() >= $n as usize {
+        if $i.get() >= $n as usize {
             return;
         }
-        let g_opt = $grad.get_mut(i);
-        let m_opt = $m.get_mut(i);
-        let v_opt = $v.get_mut(i);
-        let w_opt = $weights.get_mut(i);
+        let i = $i.get();
+        let (g_opt, m_opt, v_opt, w_opt) =
+            if i < $grad.len() && i < $m.len() && i < $v.len() && i < $weights.len() {
+                // SAFETY: 上の bounds check を通過し、4 buffer は互いに別 allocation。
+                // 1D launch の各 thread は一意な i の cell だけを更新する。
+                let (g, m, v, w) = unsafe {
+                    (
+                        $grad.get_unchecked_mut(i),
+                        $m.get_unchecked_mut(i),
+                        $v.get_unchecked_mut(i),
+                        $weights.get_unchecked_mut(i),
+                    )
+                };
+                (Some(g), Some(m), Some(v), Some(w))
+            } else {
+                (None, None, None, None)
+            };
         if let (Some(g_ref), Some(m_ref), Some(v_ref), Some(w_ref)) =
             (g_opt, m_opt, v_opt, w_opt)
         {
@@ -451,8 +465,9 @@ pub fn radam_step(
     max_w: f32,
     n: u32,
 ) {
+    let i = thread::index_1d();
     radam_step_body!(
-        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n, i;
         f32;
         reset, no_mirror
     );
@@ -485,8 +500,9 @@ pub fn radam_step_fp16_mirror(
     max_w: f32,
     n: u32,
 ) {
+    let i = thread::index_1d();
     radam_step_body!(
-        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n, i;
         f32;
         keep_grad, mirror, mirror
     );
@@ -639,8 +655,9 @@ pub fn radam_step_f16state(
     v_scale: f32,
     n: u32,
 ) {
+    let i = thread::index_1d();
     radam_step_body!(
-        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n, i;
         f16, m_scale, v_scale;
         keep_grad, no_mirror
     );
@@ -672,8 +689,9 @@ pub fn radam_step_f16state_mirror(
     v_scale: f32,
     n: u32,
 ) {
+    let i = thread::index_1d();
     radam_step_body!(
-        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n;
+        weights, m, v, grad, lr, step_size, denom, decay, beta1, beta2, eps, min_w, max_w, n, i;
         f16, m_scale, v_scale;
         keep_grad, mirror, mirror
     );
@@ -695,8 +713,8 @@ pub fn ranger_lookahead_lerp(
         return;
     }
     let one_minus_alpha = 1.0_f32 - alpha;
-    let w_opt = weights.get_mut(i);
-    let s_opt = slow.get_mut(i);
+    let w_opt = weights.get_mut(thread::index_1d());
+    let s_opt = slow.get_mut(thread::index_1d());
     if let (Some(w_ref), Some(s_ref)) = (w_opt, s_opt) {
         let new_w = alpha * *w_ref + one_minus_alpha * *s_ref;
         *w_ref = new_w;
@@ -722,8 +740,8 @@ pub fn ranger_lookahead_lerp_fp16_mirror(
         return;
     }
     let one_minus_alpha = 1.0_f32 - alpha;
-    let w_opt = weights.get_mut(i);
-    let s_opt = slow.get_mut(i);
+    let w_opt = weights.get_mut(thread::index_1d());
+    let s_opt = slow.get_mut(thread::index_1d());
     if let (Some(w_ref), Some(s_ref)) = (w_opt, s_opt) {
         let new_w = alpha * *w_ref + one_minus_alpha * *s_ref;
         *w_ref = new_w;
@@ -735,74 +753,123 @@ pub fn ranger_lookahead_lerp_fp16_mirror(
     }
 }
 
+macro_rules! sparse_ft_weight_read {
+    (f32, $weight_ptr:ident, $index:expr) => {
+        unsafe { $weight_ptr.add($index).read() }
+    };
+    (f16, $weight_ptr:ident, $index:expr) => {
+        unsafe { $weight_ptr.add($index).read() } as f32
+    };
+}
+
+macro_rules! sparse_ft_out_write {
+    (f32, $out_ptr:ident, $out_base:ident, $s0:ident, $s1:ident, $s2:ident, $s3:ident) => {
+        unsafe {
+            $out_ptr.add($out_base).write($s0);
+            $out_ptr.add($out_base + 1).write($s1);
+            $out_ptr.add($out_base + 2).write($s2);
+            $out_ptr.add($out_base + 3).write($s3);
+        }
+    };
+    (f16, $out_ptr:ident, $out_base:ident, $s0:ident, $s1:ident, $s2:ident, $s3:ident) => {
+        unsafe {
+            $out_ptr.add($out_base).write($s0 as f16);
+            $out_ptr.add($out_base + 1).write($s1 as f16);
+            $out_ptr.add($out_base + 2).write($s2 as f16);
+            $out_ptr.add($out_base + 3).write($s3 as f16);
+        }
+    };
+}
+
+// sparse FT forward の各変種で index 解決、4-row 累算、出力のコアを共有する。
+macro_rules! sparse_ft_forward_body {
+    (
+        $weight:ident,
+        $indices:ident,
+        $nnz_arr:ident,
+        $out:ident,
+        $batch:ident,
+        $rows:ident,
+        $cols:ident,
+        $max_active:ident,
+        $tid:ident;
+        $weight_type:ident,
+        $out_type:ident
+    ) => {
+        let rows_u = $rows as usize;
+        let rows_q = rows_u / 4;
+        let total = ($batch as usize) * rows_q;
+        if $tid.get() >= total {
+            return;
+        }
+        let bi = $tid.get() / rows_q;
+        let ri_q = $tid.get() % rows_q;
+        let ri_base = ri_q * 4;
+
+        // caller は indices.len() == batch * max_active、nnz_arr.len() == batch、
+        // 0 <= nnz_arr[bi] <= max_active、weight.len() == cols * rows、
+        // out.len() == batch * rows、rows % 4 == 0 を保証する。idx の範囲検査は
+        // padding と異常入力を除外する。idx*rows は 4 の倍数 (rows は 128 の倍数)、
+        // ri_base も 4 の倍数なので、4 連続 row は最低 8-byte 境界に整列する。
+        let indices_ptr = $indices.as_ptr();
+        let weight_ptr = $weight.as_ptr();
+        let mut s0: f32 = 0.0;
+        let mut s1: f32 = 0.0;
+        let mut s2: f32 = 0.0;
+        let mut s3: f32 = 0.0;
+        let base = bi * ($max_active as usize);
+        let row_nnz = $nnz_arr[bi];
+        let mut ni: i32 = 0;
+        while ni < row_nnz {
+            let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
+            if idx >= 0 && (idx as u32) < $cols {
+                let off = (idx as usize) * rows_u + ri_base;
+                // f32 path は LLVM/NVPTX が pointer の 4-byte alignment しか推論せず
+                // vector load 化しない。align(16) の struct cast も SROA 後に alignment
+                // を保持せず scalar load + local-mem spill になる。scalar load のままでも
+                // warp の 32 thread × 4 row が同じ feature の 128 連続 row を読み、
+                // coalescing を維持する。
+                let w0 = sparse_ft_weight_read!($weight_type, weight_ptr, off);
+                let w1 = sparse_ft_weight_read!($weight_type, weight_ptr, off + 1);
+                let w2 = sparse_ft_weight_read!($weight_type, weight_ptr, off + 2);
+                let w3 = sparse_ft_weight_read!($weight_type, weight_ptr, off + 3);
+                s0 += w0;
+                s1 += w1;
+                s2 += w2;
+                s3 += w3;
+            }
+            ni += 1;
+        }
+        let out_ptr = $out.as_mut_ptr();
+        let out_base = bi * rows_u + ri_base;
+        sparse_ft_out_write!($out_type, out_ptr, out_base, s0, s1, s2, s3);
+    };
+}
+
 /// Sparse feature transform forward (HalfKA_hm 用)。
 ///
-/// 1 thread = 4 連続 row (output cells)、column-major weight (`weight[idx * rows + ri]`)、
-/// atomics 不要 (各 thread は別 4 output cell に書く)。`-1` padding と `idx >= cols`
-/// の異常入力は silent skip。caller は `rows % 4 == 0` を保証する (`rows` は FT 出力
-/// 次元で `--ft-out` 検証により 128 の倍数)、grid は `cfg_1d(batch * rows / 4)`。
-///
-/// inner loop は 4 連続 scalar weight read + 4 scalar partial-sum 更新形 (LLVM/NVPTX
-/// backend は `f32` pointer の 4-byte alignment 推論止まりで `ld.global.v4.f32` へ
-/// 集約しない、`#[repr(C, align(16))]` struct cast 経由でも SROA が align を保持せず
-/// scalar load + local-mem spill になる)。warp coalesce は 32 thread × 4 row = 128
-/// 連続 row が同 idx の cache line をまたいで読まれる pattern で維持される。
+/// 1 thread = 4 連続 row (output cells)、column-major weight
+/// (`weight[idx * rows + ri]`)、atomics 不要 (各 thread は別 4 output cell に書く)。
+/// `-1` padding と `idx >= cols` の異常入力は silent skip。caller は `rows % 4 == 0`
+/// を保証する (`rows` は FT 出力次元で `--ft-out` 検証により 128 の倍数)、grid は
+/// `cfg_1d(batch * rows / 4)`。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn sparse_ft_forward(
     weight: &[f32],
     indices: &[i32],
+    nnz_arr: &[i32],
     mut out: DisjointSlice<f32>,
     batch: u32,
     rows: u32,
     cols: u32,
-    nnz: u32,
+    max_active: u32,
 ) {
     let tid = thread::index_1d();
-    let rows_u = rows as usize;
-    let rows_q = rows_u / 4;
-    let total = (batch as usize) * rows_q;
-    if tid.get() >= total {
-        return;
-    }
-    let bi = tid.get() / rows_q;
-    let ri_q = tid.get() % rows_q;
-    let ri_base = ri_q * 4;
-
-    // raw pointer 版。unsafe 妥当性: indices.len() == batch * nnz (dataloader が `-1`
-    // padding 含めて確保)、weight.len() == cols * rows (FT 重み、arch 固定、rows %
-    // 4 == 0)、`if idx >= 0 && (idx as u32) < cols` のロジックチェックは値検査として保持。
-    let indices_ptr = indices.as_ptr();
-    let weight_ptr = weight.as_ptr();
-    let mut s0: f32 = 0.0;
-    let mut s1: f32 = 0.0;
-    let mut s2: f32 = 0.0;
-    let mut s3: f32 = 0.0;
-    let base = bi * (nnz as usize);
-    let mut ni: u32 = 0;
-    while ni < nnz {
-        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
-        if idx >= 0 && (idx as u32) < cols {
-            let off = (idx as usize) * rows_u + ri_base;
-            let w0 = unsafe { weight_ptr.add(off).read() };
-            let w1 = unsafe { weight_ptr.add(off + 1).read() };
-            let w2 = unsafe { weight_ptr.add(off + 2).read() };
-            let w3 = unsafe { weight_ptr.add(off + 3).read() };
-            s0 += w0;
-            s1 += w1;
-            s2 += w2;
-            s3 += w3;
-        }
-        ni += 1;
-    }
-    let out_ptr = out.as_mut_ptr();
-    let out_base = bi * rows_u + ri_base;
-    unsafe {
-        out_ptr.add(out_base).write(s0);
-        out_ptr.add(out_base + 1).write(s1);
-        out_ptr.add(out_base + 2).write(s2);
-        out_ptr.add(out_base + 3).write(s3);
-    }
+    sparse_ft_forward_body!(
+        weight, indices, nnz_arr, out, batch, rows, cols, max_active, tid;
+        f32, f32
+    );
 }
 
 /// [`sparse_ft_forward`] の FP16 weight 版。`weight` を `f16` で読み、各値を `f32` に
@@ -820,58 +887,18 @@ pub fn sparse_ft_forward(
 pub fn sparse_ft_forward_fp16(
     weight: &[f16],
     indices: &[i32],
+    nnz_arr: &[i32],
     mut out: DisjointSlice<f32>,
     batch: u32,
     rows: u32,
     cols: u32,
-    nnz: u32,
+    max_active: u32,
 ) {
     let tid = thread::index_1d();
-    let rows_u = rows as usize;
-    let rows_q = rows_u / 4;
-    let total = (batch as usize) * rows_q;
-    if tid.get() >= total {
-        return;
-    }
-    let bi = tid.get() / rows_q;
-    let ri_q = tid.get() % rows_q;
-    let ri_base = ri_q * 4;
-
-    // raw pointer 版。unsafe 妥当性は [`sparse_ft_forward`] と同一 (indices.len() ==
-    // batch * nnz、weight.len() == cols * rows、out.len() == batch * rows、
-    // rows % 4 == 0)。weight のみ要素型が `f16` で、4 連続 row の read は 8 byte
-    // 境界に整列する (idx*rows は 4 の倍数 [rows は 128 の倍数]、ri_base は 4 の倍数)。
-    let indices_ptr = indices.as_ptr();
-    let weight_ptr = weight.as_ptr();
-    let mut s0: f32 = 0.0;
-    let mut s1: f32 = 0.0;
-    let mut s2: f32 = 0.0;
-    let mut s3: f32 = 0.0;
-    let base = bi * (nnz as usize);
-    let mut ni: u32 = 0;
-    while ni < nnz {
-        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
-        if idx >= 0 && (idx as u32) < cols {
-            let off = (idx as usize) * rows_u + ri_base;
-            let w0 = unsafe { weight_ptr.add(off).read() } as f32;
-            let w1 = unsafe { weight_ptr.add(off + 1).read() } as f32;
-            let w2 = unsafe { weight_ptr.add(off + 2).read() } as f32;
-            let w3 = unsafe { weight_ptr.add(off + 3).read() } as f32;
-            s0 += w0;
-            s1 += w1;
-            s2 += w2;
-            s3 += w3;
-        }
-        ni += 1;
-    }
-    let out_ptr = out.as_mut_ptr();
-    let out_base = bi * rows_u + ri_base;
-    unsafe {
-        out_ptr.add(out_base).write(s0);
-        out_ptr.add(out_base + 1).write(s1);
-        out_ptr.add(out_base + 2).write(s2);
-        out_ptr.add(out_base + 3).write(s3);
-    }
+    sparse_ft_forward_body!(
+        weight, indices, nnz_arr, out, batch, rows, cols, max_active, tid;
+        f16, f32
+    );
 }
 
 /// [`sparse_ft_forward_fp16`] の出力も `f16` にした版 (`--ft-fp16-out`)。`weight` を
@@ -880,64 +907,25 @@ pub fn sparse_ft_forward_fp16(
 ///
 /// `out` (`ft_*_out`、b × ft_out) を `f16` にすると書き出し DRAM traffic が半減し、
 /// 後続の [`ft_post_perspective_fwd_fp16`] / [`ft_post_perspective_grad_fused_fp16`]
-/// の read も半精度になる。`ft_*_out` は CReLU 前の FT accumulator で値域は ~O(1〜数十)、
-/// f16 の有限域に収まる (loss scaling 不要、underflow する dft とは異なる)。
+/// の read も半精度になる。`ft_*_out` は CReLU 前の FT accumulator で値域は
+/// ~O(1〜数十)、f16 の有限域に収まる (loss scaling 不要、underflow する dft とは異なる)。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn sparse_ft_forward_fp16_out(
     weight: &[f16],
     indices: &[i32],
+    nnz_arr: &[i32],
     mut out: DisjointSlice<f16>,
     batch: u32,
     rows: u32,
     cols: u32,
-    nnz: u32,
+    max_active: u32,
 ) {
     let tid = thread::index_1d();
-    let rows_u = rows as usize;
-    let rows_q = rows_u / 4;
-    let total = (batch as usize) * rows_q;
-    if tid.get() >= total {
-        return;
-    }
-    let bi = tid.get() / rows_q;
-    let ri_q = tid.get() % rows_q;
-    let ri_base = ri_q * 4;
-
-    // unsafe 妥当性は [`sparse_ft_forward_fp16`] と同一。`weight` / `out` とも `f16` で、
-    // 4 連続 row の read / write は 8 byte 境界に整列する (idx*rows は 4 の倍数
-    // [rows は 128 の倍数]、ri_base は 4 の倍数)。
-    let indices_ptr = indices.as_ptr();
-    let weight_ptr = weight.as_ptr();
-    let mut s0: f32 = 0.0;
-    let mut s1: f32 = 0.0;
-    let mut s2: f32 = 0.0;
-    let mut s3: f32 = 0.0;
-    let base = bi * (nnz as usize);
-    let mut ni: u32 = 0;
-    while ni < nnz {
-        let idx = unsafe { indices_ptr.add(base + (ni as usize)).read() };
-        if idx >= 0 && (idx as u32) < cols {
-            let off = (idx as usize) * rows_u + ri_base;
-            let w0 = unsafe { weight_ptr.add(off).read() } as f32;
-            let w1 = unsafe { weight_ptr.add(off + 1).read() } as f32;
-            let w2 = unsafe { weight_ptr.add(off + 2).read() } as f32;
-            let w3 = unsafe { weight_ptr.add(off + 3).read() } as f32;
-            s0 += w0;
-            s1 += w1;
-            s2 += w2;
-            s3 += w3;
-        }
-        ni += 1;
-    }
-    let out_ptr = out.as_mut_ptr();
-    let out_base = bi * rows_u + ri_base;
-    unsafe {
-        out_ptr.add(out_base).write(s0 as f16);
-        out_ptr.add(out_base + 1).write(s1 as f16);
-        out_ptr.add(out_base + 2).write(s2 as f16);
-        out_ptr.add(out_base + 3).write(s3 as f16);
-    }
+    sparse_ft_forward_body!(
+        weight, indices, nnz_arr, out, batch, rows, cols, max_active, tid;
+        f16, f16
+    );
 }
 
 /// `f32` buffer を `f16` buffer へ要素ごとに round-to-nearest 変換する。
@@ -958,39 +946,68 @@ pub fn cast_f32_to_f16(src: &[f32], mut dst: DisjointSlice<f16>, n: u32) {
     }
 }
 
-/// FT factorizer の forward 用畳み込み: base king-bucket セルの各要素へ同じ piece
-/// plane の仮想行を加算し、forward が読む畳み込み済み weight `comb` (export 形状
-/// `ft_in × ft_out` = base + threat) を作る。`w` は train 形状
-/// (`(ft_in + piece_inputs) × ft_out`、column-major で `w[feature * ft_out + ri]`)。
-/// 線形性により base 実行は `Σ_active (w_real + w_virt) = Σ_active comb`。
-/// `base_ft_in` が仮想行を持つ base セル数、`ft_in` (= base + threat) が仮想 P plane
-/// の手前。threat real 行 (`[base_ft_in, ft_in)`) は仮想行を持たないので `comb = w`
-/// で素通しする。threat 無効時は `base_ft_in == ft_in` で全セルが畳まれ threat
-/// 連結前と bit-identical。1 thread = 1 出力要素。仮想要素 offset は恒等式
-/// `(ft_in + p)·ft_out + ri == ft_in·ft_out + (i mod pi·ft_out)` で mod 1 回。
+/// FT factorizer の forward 用畳み込み: forward が読む畳み込み済み weight `comb`
+/// (export 形状 `ft_in × ft_out` = base + threat) を作る。`w` は train 形状
+/// `[base real | threat real | virtual piece-input rows | virtual threat-pair rows]`。
+/// base 実行には mode ごとの virtual piece-input row を加算し、threat 実行には
+/// `threat_pair_starts` で求めた同 pair の virtual threat-pair row を加算する。
+/// `ft_bounds` は下位 32 bit が `base_ft_in`、上位 32 bit が `ft_in`。1 thread = 1 出力要素。
 #[kernel]
 pub fn ft_fold_virtual(
     w: &[f32],
     mut comb: DisjointSlice<f32>,
-    base_ft_in: u32,
-    ft_in: u32,
+    threat_pair_starts: &[u32],
+    ft_bounds: u64,
     ft_out: u32,
     piece_inputs: u32,
-    n: u32,
+    effect_bucket_factorize: u32,
 ) {
+    let base_ft_in = (ft_bounds & 0xffff_ffff) as u32;
+    let ft_in = (ft_bounds >> 32) as u32;
     let i = thread::index_1d();
+    let n = ft_in * ft_out;
     if i.get() >= n as usize {
         return;
     }
-    // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
+    // caller が `n == ft_in * ft_out`、`w.len() == train_ft_in * ft_out`、
     // `comb.len() == n`、`base_ft_in <= ft_in` を保証。
-    let feature = i.get() / (ft_out as usize);
+    let ft_out_u = ft_out as usize;
+    let pi_u = piece_inputs as usize;
+    let nb = effect_bucket_factorize & 0xffff;
+    let mode = effect_bucket_factorize >> 16;
+    let nb_u = nb as usize;
+    let feature = i.get() / ft_out_u;
+    let ri = i.get() - feature * ft_out_u;
     let v = if feature < base_ft_in as usize {
-        let virt_block = (piece_inputs as usize) * (ft_out as usize);
-        let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
+        let p = if mode == 0 {
+            feature % pi_u
+        } else {
+            (feature / nb_u) % pi_u
+        };
+        let vrow = if mode == 2 {
+            p * nb_u + feature % nb_u
+        } else {
+            p
+        };
+        let virt = ((ft_in as usize) + vrow) * ft_out_u + ri;
+        w[i.get()] + w[virt]
+    } else if threat_pair_starts.len() >= 2 {
+        let rel = feature - base_ft_in as usize;
+        let mut lo = 0usize;
+        let mut hi = threat_pair_starts.len() - 1;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if threat_pair_starts[mid] as usize <= rel {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let base_vrows = if mode == 2 { pi_u * nb_u } else { pi_u };
+        let virt = ((ft_in as usize) + base_vrows + lo) * ft_out_u + ri;
         w[i.get()] + w[virt]
     } else {
-        w[i.get()] // threat real 行: 仮想行を持たない
+        w[i.get()]
     };
     let comb_ptr = comb.as_mut_ptr();
     unsafe {
@@ -1008,23 +1025,55 @@ pub fn ft_fold_virtual(
 pub fn ft_fold_virtual_f16(
     w: &[f32],
     mut comb: DisjointSlice<f16>,
-    base_ft_in: u32,
-    ft_in: u32,
+    threat_pair_starts: &[u32],
+    ft_bounds: u64,
     ft_out: u32,
     piece_inputs: u32,
-    n: u32,
+    effect_bucket_factorize: u32,
 ) {
+    let base_ft_in = (ft_bounds & 0xffff_ffff) as u32;
+    let ft_in = (ft_bounds >> 32) as u32;
     let i = thread::index_1d();
+    let n = ft_in * ft_out;
     if i.get() >= n as usize {
         return;
     }
-    // caller が `n == ft_in * ft_out`、`w.len() == (ft_in + piece_inputs) * ft_out`、
-    // `comb.len() == n`、`base_ft_in <= ft_in` を保証。threat 行 (`feature >=
-    // base_ft_in`) は仮想行を持たないので素通し。
-    let feature = i.get() / (ft_out as usize);
+    // caller が `n == ft_in * ft_out`、`w.len() == train_ft_in * ft_out`、
+    // `comb.len() == n`、`base_ft_in <= ft_in` を保証。
+    let ft_out_u = ft_out as usize;
+    let pi_u = piece_inputs as usize;
+    let nb = effect_bucket_factorize & 0xffff;
+    let mode = effect_bucket_factorize >> 16;
+    let nb_u = nb as usize;
+    let feature = i.get() / ft_out_u;
+    let ri = i.get() - feature * ft_out_u;
     let v = if feature < base_ft_in as usize {
-        let virt_block = (piece_inputs as usize) * (ft_out as usize);
-        let virt = (ft_in as usize) * (ft_out as usize) + i.get() % virt_block;
+        let p = if mode == 0 {
+            feature % pi_u
+        } else {
+            (feature / nb_u) % pi_u
+        };
+        let vrow = if mode == 2 {
+            p * nb_u + feature % nb_u
+        } else {
+            p
+        };
+        let virt = ((ft_in as usize) + vrow) * ft_out_u + ri;
+        w[i.get()] + w[virt]
+    } else if threat_pair_starts.len() >= 2 {
+        let rel = feature - base_ft_in as usize;
+        let mut lo = 0usize;
+        let mut hi = threat_pair_starts.len() - 1;
+        while lo + 1 < hi {
+            let mid = (lo + hi) / 2;
+            if threat_pair_starts[mid] as usize <= rel {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        let base_vrows = if mode == 2 { pi_u * nb_u } else { pi_u };
+        let virt = ((ft_in as usize) + base_vrows + lo) * ft_out_u + ri;
         w[i.get()] + w[virt]
     } else {
         w[i.get()]
@@ -1035,45 +1084,99 @@ pub fn ft_fold_virtual_f16(
     }
 }
 
-/// FT factorizer の backward 縮約: 仮想行 p の勾配を同じ piece plane を持つ
+/// FT factorizer の backward 縮約: virtual piece-input rows の勾配を同じ piece-input ordinal を持つ
 /// **base** 実行の勾配和で埋める (`grad[(ft_in + p) * ft_out + ri] =
 /// Σ_{kb < base_ft_in/pi} grad[(kb * piece_inputs + p) * ft_out + ri]`)。各仮想
 /// 特徴の出現列が「同 p を持つ base 実特徴の出現列の合併」である (base 実特徴 1 つ
 /// につき仮想特徴ちょうど 1 つが対応) ことから、仮想 index を sparse backward に
-/// 流す直接 gather と数学的に等価 (f32 加算順のみ異なる)。`base_ft_in` が縮約対象
-/// の king-bucket セル数、`ft_in` (= base + threat) が仮想 P plane の手前。threat
-/// real 行は仮想行に寄与しない。threat 無効時は `base_ft_in == ft_in` で threat
-/// 連結前と bit-identical。実 block の gather (`gather_and_sum_per_feature_*`) が stm / nstm
+/// 流す直接 gather と数学的に等価 (f32 加算順のみ異なる)。virtual threat-pair rows は
+/// 同じ pair に属する threat 実行の勾配和で埋める。実 block の gather (`gather_and_sum_per_feature_*`) が stm / nstm
 /// 両方完了した後に launch する。1 thread = 1 仮想要素、仮想 block は overwrite。
 #[kernel]
 pub fn ft_reduce_virtual_grad(
     grad: &[f32],
-    base_ft_in: u32,
-    ft_in: u32,
+    threat_pair_starts: &[u32],
+    ft_bounds: u64,
     ft_out: u32,
     piece_inputs: u32,
+    effect_bucket_factorize: u32,
 ) {
+    let base_ft_in = (ft_bounds & 0xffff_ffff) as u32;
+    let ft_in = (ft_bounds >> 32) as u32;
     let i = thread::index_1d();
     let ft_out_u = ft_out as usize;
     let pi_u = piece_inputs as usize;
-    if i.get() >= pi_u * ft_out_u {
+    let nb = effect_bucket_factorize & 0xffff;
+    let mode = effect_bucket_factorize >> 16;
+    let nb_u = nb as usize;
+    let base_vrows = if mode == 2 { pi_u * nb_u } else { pi_u };
+    let threat_vrows = threat_pair_starts.len().saturating_sub(1);
+    let virtual_rows = base_vrows + threat_vrows;
+    if i.get() >= virtual_rows * ft_out_u {
         return;
     }
-    let p = i.get() / ft_out_u;
-    let ri = i.get() - p * ft_out_u;
-    let n_kb = (base_ft_in as usize) / pi_u;
+    let vrow = i.get() / ft_out_u;
+    let ri = i.get() - vrow * ft_out_u;
+    let grad_ptr = grad.as_ptr();
+    if vrow >= base_vrows {
+        let pair = vrow - base_vrows;
+        let start = base_ft_in as usize + threat_pair_starts[pair] as usize;
+        let end = base_ft_in as usize + threat_pair_starts[pair + 1] as usize;
+        let mut sum = 0.0_f32;
+        for feature in start..end {
+            sum += unsafe { grad_ptr.add(feature * ft_out_u + ri).read() };
+        }
+        let out_ptr = grad_ptr as *mut f32;
+        unsafe {
+            out_ptr
+                .add((ft_in as usize + vrow) * ft_out_u + ri)
+                .write(sum);
+        }
+        return;
+    }
+    let p = if mode == 2 { vrow / nb_u } else { vrow };
+    let bucket = if mode == 2 { vrow - p * nb_u } else { 0 };
+    let n_kb = if mode == 0 {
+        (base_ft_in as usize) / pi_u
+    } else {
+        (base_ft_in as usize) / (pi_u * nb_u)
+    };
 
     // raw pointer 版 (PTX の bounds check 除去)。unsafe 妥当性: caller が
-    // `grad.len() == (ft_in + piece_inputs) * ft_out`、`base_ft_in <= ft_in`、
+    // `grad.len() == train_ft_in * ft_out`、`base_ft_in <= ft_in`、
     // `base_ft_in % piece_inputs == 0` を保証し、読みは base 実 block
     // (`feature < base_ft_in`)、書きは thread ごとに disjoint な仮想 cell
     // (`ft_in + p` 行) に閉じる。
     // 4-way unroll: 1-load-1-fadd の依存 chain を 4 accumulator に分割して
     // in-flight load を確保する (`gather_and_sum_per_feature_*` と同じ理由)。
     // 加算順は kb 逐次和と異なるが f32 非結合則の丸め差のみ。
-    let grad_ptr = grad.as_ptr();
-    let row_stride = pi_u * ft_out_u;
-    let base = p * ft_out_u + ri;
+    if mode == 1 {
+        let mut sum = 0.0_f32;
+        let kb_stride = pi_u * nb_u * ft_out_u;
+        for kb in 0..n_kb {
+            let kb_base = kb * kb_stride + p * nb_u * ft_out_u + ri;
+            for b in 0..nb_u {
+                sum += unsafe { grad_ptr.add(kb_base + b * ft_out_u).read() };
+            }
+        }
+        let out_ptr = grad_ptr as *mut f32;
+        unsafe {
+            out_ptr
+                .add((ft_in as usize + vrow) * ft_out_u + ri)
+                .write(sum);
+        }
+        return;
+    }
+    let row_stride = if mode == 0 {
+        pi_u * ft_out_u
+    } else {
+        pi_u * nb_u * ft_out_u
+    };
+    let base = if mode == 0 {
+        p * ft_out_u + ri
+    } else {
+        (p * nb_u + bucket) * ft_out_u + ri
+    };
     let mut sum0 = 0.0_f32;
     let mut sum1 = 0.0_f32;
     let mut sum2 = 0.0_f32;
@@ -1094,22 +1197,45 @@ pub fn ft_reduce_virtual_grad(
     let sum = (sum0 + sum1) + (sum2 + sum3);
     let out_ptr = grad_ptr as *mut f32;
     unsafe {
-        out_ptr.add((ft_in as usize + p) * ft_out_u + ri).write(sum);
+        out_ptr
+            .add((ft_in as usize + vrow) * ft_out_u + ri)
+            .write(sum);
     }
 }
 
 /// Phase 1 of inverse-index sparse_ft_backward: per-feature 出現回数を histogram。
 /// `counts[f]` に (b, slot) で `indices[b*nnz+slot] == f` の数を atomic accumulate。
 /// host が呼出前に `counts` を 0 reset。
+///
+/// 1 thread = 1 (b, slot)。`nnz_arr[b]` は position b の実 active 数で、`slot >=
+/// nnz_arr[b]` の padding slot は index を DRAM から読む前に捨てる (dataloader が
+/// padding slot を `-1` で埋めない契約に更新されたため、実長超の slot は前 batch の
+/// 残骸を持ちうる。`idx >= 0 && idx < cols` の防御 skip だけでは有効範囲内の残骸を
+/// 除外できないので、実長で必ず打ち切る)。caller は `nnz_arr.len() == batch`、
+/// `0 <= nnz_arr[b] <= nnz` を保証する。
 #[kernel]
-pub fn build_feature_counts(indices: &[i32], counts: &[u32], batch: u32, nnz: u32, cols: u32) {
+pub fn build_feature_counts(
+    indices: &[i32],
+    nnz_arr: &[i32],
+    counts: &[u32],
+    batch: u32,
+    nnz: u32,
+    cols: u32,
+) {
     let tid = thread::index_1d();
     let total = (batch as usize) * (nnz as usize);
     if tid.get() >= total {
         return;
     }
+    let b = tid.get() / (nnz as usize);
+    let slot = tid.get() % (nnz as usize);
+    if (slot as i32) >= nnz_arr[b] {
+        return;
+    }
     let idx = indices[tid.get()];
     if idx >= 0 && (idx as u32) < cols {
+        // SAFETY: `counts.len() == cols` (caller 契約) かつ `idx < cols`。`u32` と
+        // `DeviceAtomicU32` は同 layout で、本 kernel 中の書き込みは atomic add のみ。
         let cell = unsafe { &*(counts.as_ptr().add(idx as usize) as *const DeviceAtomicU32) };
         cell.fetch_add(1, AtomicOrdering::Relaxed);
     }
@@ -1179,6 +1305,8 @@ pub fn exclusive_prefix_sum_small(counts: &[u32], offsets: &[u32], n: u32) {
     thread::sync_threads();
 
     // Phase 3: per-thread output exclusive scan of chunk
+    // SAFETY: `offsets.len() == n + 1` (caller 契約)。各 thread の `[start, end)` は
+    // 互いに重ならず、末尾 `offsets[n]` は最後の thread だけが書く。
     let out_ptr = offsets.as_ptr() as *mut u32;
     let mut acc = chunk_offset;
     let mut j = start;
@@ -1301,9 +1429,16 @@ pub fn prefix_sum_add_block_offset(
 /// Phase 3 of inverse-index: 各 (b, slot) を inverse 順 (feature 別) に配置。
 /// `write_counters[f]` を atomic increment、`positions[offsets[f] + write_counters[f]] = bi`。
 /// host が呼出前に `write_counters` を 0 reset。
+///
+/// 1 thread = 1 (b, slot)。`build_feature_counts` と同じく `slot >= nnz_arr[b]` の
+/// padding slot は index load 前に捨てる (両 kernel が同じ実長で打ち切ることで counts
+/// と positions が整合し、`gather_and_sum_per_feature_*` が読む区間長 = offsets 差分と
+/// 一致する)。caller は `nnz_arr.len() == batch`、`0 <= nnz_arr[b] <= nnz` を保証する。
+#[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn scatter_positions(
     indices: &[i32],
+    nnz_arr: &[i32],
     offsets: &[u32],
     write_counters: &[u32],
     positions: &[u32],
@@ -1316,18 +1451,169 @@ pub fn scatter_positions(
     if tid.get() >= total {
         return;
     }
-    let bi = (tid.get() / (nnz as usize)) as u32;
+    let b = tid.get() / (nnz as usize);
+    let slot = tid.get() % (nnz as usize);
+    if (slot as i32) >= nnz_arr[b] {
+        return;
+    }
+    let bi = b as u32;
     let idx = indices[tid.get()];
     if idx >= 0 && (idx as u32) < cols {
         let cell =
             unsafe { &*(write_counters.as_ptr().add(idx as usize) as *const DeviceAtomicU32) };
         let pos = cell.fetch_add(1, AtomicOrdering::Relaxed);
         let abs_pos = offsets[idx as usize] + pos;
+        // SAFETY: `positions.len() == batch * nnz`、`offsets` は `counts` の prefix sum、
+        // `write_counters[idx] < counts[idx]` なので `abs_pos` は範囲内。atomic increment
+        // が同じ feature 内の rank を一意にするため、各 thread の書き込み先は重ならない。
         unsafe {
             let p = positions.as_ptr().add(abs_pos as usize) as *mut u32;
             p.write(bi);
         }
     }
+}
+
+macro_rules! gather_grad_read {
+    (f32, $grad_out_ptr:ident, $index:expr) => {
+        unsafe { $grad_out_ptr.add($index).read() }
+    };
+    (f16, $grad_out_ptr:ident, $index:expr) => {
+        unsafe { $grad_out_ptr.add($index).read() } as f32
+    };
+}
+
+macro_rules! gather_grad_scale {
+    (noscale, $sum:ident) => {
+        $sum
+    };
+    (scale, $sum:ident, $dft_inv_scale:ident) => {
+        $sum * $dft_inv_scale
+    };
+}
+
+macro_rules! gather_grad_flush {
+    (overwrite, $grad_w:ident, $index:expr, $value:expr) => {{
+        // 範囲外 (n_f=0、off_start == off_end) でも sum=0 を書き、host の事前 0-reset を不要にする。
+        let out_ptr = $grad_w.as_ptr() as *mut f32;
+        unsafe {
+            out_ptr.add($index).write($value);
+        }
+    }};
+    (add, $grad_w:ident, $index:expr, $sum:ident, $value:expr) => {
+        if $sum != 0.0_f32 {
+            // DeviceAtomicF32 は f32 と同じ layout / alignment で、同じ cell を
+            // non-atomic に更新する path はこの kernel の実行中に存在しない。
+            let cell = unsafe { &*($grad_w.as_ptr().add($index) as *const DeviceAtomicF32) };
+            cell.fetch_add($value, AtomicOrdering::Relaxed);
+        }
+    };
+}
+
+macro_rules! gather_grad_finish {
+    (
+        overwrite,
+        $scale:ident,
+        $grad_w:ident,
+        $index:expr,
+        $sum:ident
+        $(, $dft_inv_scale:ident)?
+    ) => {
+        gather_grad_flush!(
+            overwrite,
+            $grad_w,
+            $index,
+            gather_grad_scale!($scale, $sum $(, $dft_inv_scale)?)
+        );
+    };
+    (
+        add,
+        $scale:ident,
+        $grad_w:ident,
+        $index:expr,
+        $sum:ident
+        $(, $dft_inv_scale:ident)?
+    ) => {
+        gather_grad_flush!(
+            add,
+            $grad_w,
+            $index,
+            $sum,
+            gather_grad_scale!($scale, $sum $(, $dft_inv_scale)?)
+        );
+    };
+}
+
+// gather kernel の各変種で index 解決、4-way unroll、累算のコアを共有する。
+macro_rules! gather_and_sum_per_feature_body {
+    (
+        $grad_out:ident,
+        $positions:ident,
+        $offsets:ident,
+        $grad_w:ident,
+        $n_features:ident,
+        $ft_out:ident;
+        $grad_type:ident,
+        $scale:ident,
+        $flush:ident
+        $(, $dft_inv_scale:ident)?
+    ) => {
+        let feature = thread::blockIdx_x() as usize;
+        let ri_block = thread::blockIdx_y() as usize;
+        let tid_local = thread::threadIdx_x() as usize;
+        let block_dim = thread::blockDim_x() as usize;
+        let ri = ri_block * block_dim + tid_local;
+        let ft_out_u = $ft_out as usize;
+        if ri >= ft_out_u || feature >= ($n_features as usize) {
+            return;
+        }
+
+        let off_start = $offsets[feature] as usize;
+        let off_end = $offsets[feature + 1] as usize;
+
+        // caller は positions の容量、offsets が示す有効範囲、grad_out / grad_w の
+        // arch 固定長を保証する。launch config と上の検査により ri < ft_out_u。
+        let grad_out_ptr = $grad_out.as_ptr();
+        let positions_ptr = $positions.as_ptr();
+        // 1-load-1-fadd では in-flight load が 1 個に限られ Long Scoreboard stall 中に
+        // warp scheduler が idle になるため、4-way unroll で load 待ちを分散する。
+        // 加算順は kernel の数値挙動の一部。
+        let mut sum0 = 0.0_f32;
+        let mut sum1 = 0.0_f32;
+        let mut sum2 = 0.0_f32;
+        let mut sum3 = 0.0_f32;
+        let mut i = off_start;
+        let unroll_end = if off_end >= off_start + 3 {
+            off_end - 3
+        } else {
+            off_start
+        };
+        while i < unroll_end {
+            let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
+            let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
+            let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
+            let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
+            sum0 += gather_grad_read!($grad_type, grad_out_ptr, bi0 * ft_out_u + ri);
+            sum1 += gather_grad_read!($grad_type, grad_out_ptr, bi1 * ft_out_u + ri);
+            sum2 += gather_grad_read!($grad_type, grad_out_ptr, bi2 * ft_out_u + ri);
+            sum3 += gather_grad_read!($grad_type, grad_out_ptr, bi3 * ft_out_u + ri);
+            i += 4;
+        }
+        while i < off_end {
+            let bi = unsafe { positions_ptr.add(i).read() } as usize;
+            sum0 += gather_grad_read!($grad_type, grad_out_ptr, bi * ft_out_u + ri);
+            i += 1;
+        }
+        let sum = (sum0 + sum1) + (sum2 + sum3);
+
+        gather_grad_finish!(
+            $flush,
+            $scale,
+            $grad_w,
+            feature * ft_out_u + ri,
+            sum
+            $(, $dft_inv_scale)?
+        );
+    };
 }
 
 /// Phase 4 of inverse-index: 各 feature について grad_out の対応 row を sum し、
@@ -1347,64 +1633,10 @@ pub fn gather_and_sum_per_feature_overwrite(
     n_features: u32,
     ft_out: u32,
 ) {
-    let feature = thread::blockIdx_x() as usize;
-    let ri_block = thread::blockIdx_y() as usize;
-    let tid_local = thread::threadIdx_x() as usize;
-    let block_dim = thread::blockDim_x() as usize;
-    let ri = ri_block * block_dim + tid_local;
-    let ft_out_u = ft_out as usize;
-    if ri >= ft_out_u || feature >= (n_features as usize) {
-        return;
-    }
-
-    let off_start = offsets[feature] as usize;
-    let off_end = offsets[feature + 1] as usize;
-
-    // raw pointer 版 (PTX で `setp.ge.u64; @%p bra` の bounds check 3 箇所を除去)。
-    // unsafe 妥当性: caller (`step_impl`) が `feature_positions.len() == batch * max_active` を保証、
-    // `feat_offsets[feature]..feat_offsets[feature+1]` は phase B が正しく構築。
-    // grad_out / grad_w の範囲は arch (ft_in × ft_out) で固定、launch config 上 ri < ft_out_u。
-    let grad_out_ptr = grad_out.as_ptr();
-    let positions_ptr = positions.as_ptr();
-    // 4-way unroll: 1 thread あたり 4 outstanding load + 4 accumulator で fadd dep chain
-    // を分割。1-load-1-fadd 版は per-thread に in-flight load 1 個しかなく、warp scheduler は
-    // memory load 待ちの Long Scoreboard stall で大半 idle になる (occupancy は full でも eligible
-    // warps が極小)。partial sum 加算順が変わるため f32 fadd 非結合則で sum bit-pattern は
-    // 同値ではなくなる (`gpu_cpu_equivalence_tests` の release tolerance 範囲)。
-    let mut sum0 = 0.0_f32;
-    let mut sum1 = 0.0_f32;
-    let mut sum2 = 0.0_f32;
-    let mut sum3 = 0.0_f32;
-    let mut i = off_start;
-    let unroll_end = if off_end >= off_start + 3 {
-        off_end - 3
-    } else {
-        off_start
-    };
-    while i < unroll_end {
-        let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
-        let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
-        let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
-        let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
-        sum0 += unsafe { grad_out_ptr.add(bi0 * ft_out_u + ri).read() };
-        sum1 += unsafe { grad_out_ptr.add(bi1 * ft_out_u + ri).read() };
-        sum2 += unsafe { grad_out_ptr.add(bi2 * ft_out_u + ri).read() };
-        sum3 += unsafe { grad_out_ptr.add(bi3 * ft_out_u + ri).read() };
-        i += 4;
-    }
-    while i < off_end {
-        let bi = unsafe { positions_ptr.add(i).read() } as usize;
-        sum0 += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
-        i += 1;
-    }
-    let sum = (sum0 + sum1) + (sum2 + sum3);
-
-    // 範囲外 (n_f=0、つまり off_start == off_end) でも sum=0 を書く: stm/nstm 共通の host が
-    // 呼出前 0-reset を委ねる代わりに本 kernel が常に書き切るほうが simpler。
-    let out_ptr = grad_w.as_ptr() as *mut f32;
-    unsafe {
-        out_ptr.add(feature * ft_out_u + ri).write(sum);
-    }
+    gather_and_sum_per_feature_body!(
+        grad_out, positions, offsets, grad_w, n_features, ft_out;
+        f32, noscale, overwrite
+    );
 }
 
 /// Phase 4 (add 版): nstm 第 2 回呼び出し用。stm の overwrite 結果に atomic 加算。
@@ -1418,57 +1650,10 @@ pub fn gather_and_sum_per_feature_add(
     n_features: u32,
     ft_out: u32,
 ) {
-    let feature = thread::blockIdx_x() as usize;
-    let ri_block = thread::blockIdx_y() as usize;
-    let tid_local = thread::threadIdx_x() as usize;
-    let block_dim = thread::blockDim_x() as usize;
-    let ri = ri_block * block_dim + tid_local;
-    let ft_out_u = ft_out as usize;
-    if ri >= ft_out_u || feature >= (n_features as usize) {
-        return;
-    }
-
-    let off_start = offsets[feature] as usize;
-    let off_end = offsets[feature + 1] as usize;
-
-    // raw pointer 版 (overwrite と同じ理由、bounds check 3 箇所除去)。
-    let grad_out_ptr = grad_out.as_ptr();
-    let positions_ptr = positions.as_ptr();
-    // 4-way unroll: overwrite kernel と同方針 (Long Scoreboard stall 分散)。
-    let mut sum0 = 0.0_f32;
-    let mut sum1 = 0.0_f32;
-    let mut sum2 = 0.0_f32;
-    let mut sum3 = 0.0_f32;
-    let mut i = off_start;
-    let unroll_end = if off_end >= off_start + 3 {
-        off_end - 3
-    } else {
-        off_start
-    };
-    while i < unroll_end {
-        let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
-        let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
-        let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
-        let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
-        sum0 += unsafe { grad_out_ptr.add(bi0 * ft_out_u + ri).read() };
-        sum1 += unsafe { grad_out_ptr.add(bi1 * ft_out_u + ri).read() };
-        sum2 += unsafe { grad_out_ptr.add(bi2 * ft_out_u + ri).read() };
-        sum3 += unsafe { grad_out_ptr.add(bi3 * ft_out_u + ri).read() };
-        i += 4;
-    }
-    while i < off_end {
-        let bi = unsafe { positions_ptr.add(i).read() } as usize;
-        sum0 += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() };
-        i += 1;
-    }
-    let sum = (sum0 + sum1) + (sum2 + sum3);
-
-    // atomicAdd で stm の結果に加算。
-    if sum != 0.0_f32 {
-        let cell =
-            unsafe { &*(grad_w.as_ptr().add(feature * ft_out_u + ri) as *const DeviceAtomicF32) };
-        cell.fetch_add(sum, AtomicOrdering::Relaxed);
-    }
+    gather_and_sum_per_feature_body!(
+        grad_out, positions, offsets, grad_w, n_features, ft_out;
+        f32, noscale, add
+    );
 }
 
 /// [`gather_and_sum_per_feature_overwrite`] の FP16 入力版。`grad_out` (dft) を `f16`
@@ -1493,57 +1678,10 @@ pub fn gather_and_sum_per_feature_overwrite_fp16(
     ft_out: u32,
     dft_inv_scale: f32, // = 1 / dft_scale、loss scaling を打ち消す
 ) {
-    let feature = thread::blockIdx_x() as usize;
-    let ri_block = thread::blockIdx_y() as usize;
-    let tid_local = thread::threadIdx_x() as usize;
-    let block_dim = thread::blockDim_x() as usize;
-    let ri = ri_block * block_dim + tid_local;
-    let ft_out_u = ft_out as usize;
-    if ri >= ft_out_u || feature >= (n_features as usize) {
-        return;
-    }
-
-    let off_start = offsets[feature] as usize;
-    let off_end = offsets[feature + 1] as usize;
-
-    // unsafe 妥当性は [`gather_and_sum_per_feature_overwrite`] と同一。`grad_out` のみ
-    // 要素型が `f16`、read 時に `f32` へ変換する。
-    let grad_out_ptr = grad_out.as_ptr();
-    let positions_ptr = positions.as_ptr();
-    let mut sum0 = 0.0_f32;
-    let mut sum1 = 0.0_f32;
-    let mut sum2 = 0.0_f32;
-    let mut sum3 = 0.0_f32;
-    let mut i = off_start;
-    let unroll_end = if off_end >= off_start + 3 {
-        off_end - 3
-    } else {
-        off_start
-    };
-    while i < unroll_end {
-        let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
-        let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
-        let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
-        let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
-        sum0 += unsafe { grad_out_ptr.add(bi0 * ft_out_u + ri).read() } as f32;
-        sum1 += unsafe { grad_out_ptr.add(bi1 * ft_out_u + ri).read() } as f32;
-        sum2 += unsafe { grad_out_ptr.add(bi2 * ft_out_u + ri).read() } as f32;
-        sum3 += unsafe { grad_out_ptr.add(bi3 * ft_out_u + ri).read() } as f32;
-        i += 4;
-    }
-    while i < off_end {
-        let bi = unsafe { positions_ptr.add(i).read() } as usize;
-        sum0 += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() } as f32;
-        i += 1;
-    }
-    let sum = (sum0 + sum1) + (sum2 + sum3);
-
-    let out_ptr = grad_w.as_ptr() as *mut f32;
-    unsafe {
-        out_ptr
-            .add(feature * ft_out_u + ri)
-            .write(sum * dft_inv_scale);
-    }
+    gather_and_sum_per_feature_body!(
+        grad_out, positions, offsets, grad_w, n_features, ft_out;
+        f16, scale, overwrite, dft_inv_scale
+    );
 }
 
 /// [`gather_and_sum_per_feature_add`] の FP16 入力版。`grad_out` (dft) を `f16` で読み、
@@ -1560,63 +1698,10 @@ pub fn gather_and_sum_per_feature_add_fp16(
     ft_out: u32,
     dft_inv_scale: f32, // = 1 / dft_scale、loss scaling を打ち消す
 ) {
-    let feature = thread::blockIdx_x() as usize;
-    let ri_block = thread::blockIdx_y() as usize;
-    let tid_local = thread::threadIdx_x() as usize;
-    let block_dim = thread::blockDim_x() as usize;
-    let ri = ri_block * block_dim + tid_local;
-    let ft_out_u = ft_out as usize;
-    if ri >= ft_out_u || feature >= (n_features as usize) {
-        return;
-    }
-
-    let off_start = offsets[feature] as usize;
-    let off_end = offsets[feature + 1] as usize;
-
-    // unsafe 妥当性は [`gather_and_sum_per_feature_overwrite`] / その `_fp16` 版と同一:
-    // caller が `positions.len() == batch * max_active` を保証、`off_start..off_end` は
-    // phase B が構築した有効範囲、`grad_out` (`f16`) / `grad_w` (`f32`) の範囲は arch
-    // (ft_in × ft_out) 固定で launch config 上 `ri < ft_out_u`。`grad_out` のみ要素型が
-    // `f16` で read 時に `f32` へ変換する。`grad_w` への書き込みは atomic add: 末尾の
-    // `&*(grad_w.as_ptr().add(..) as *const DeviceAtomicF32)` cast は、`DeviceAtomicF32`
-    // が `f32` (align 4) と同レイアウト (`#[repr(transparent)]` over `UnsafeCell<f32>`)
-    // で `grad_w` の backing allocation が要求 alignment を満たすため有効。同 cell へ
-    // non-atomic に書く path は本 kernel / host loop に無い。
-    let grad_out_ptr = grad_out.as_ptr();
-    let positions_ptr = positions.as_ptr();
-    let mut sum0 = 0.0_f32;
-    let mut sum1 = 0.0_f32;
-    let mut sum2 = 0.0_f32;
-    let mut sum3 = 0.0_f32;
-    let mut i = off_start;
-    let unroll_end = if off_end >= off_start + 3 {
-        off_end - 3
-    } else {
-        off_start
-    };
-    while i < unroll_end {
-        let bi0 = unsafe { positions_ptr.add(i).read() } as usize;
-        let bi1 = unsafe { positions_ptr.add(i + 1).read() } as usize;
-        let bi2 = unsafe { positions_ptr.add(i + 2).read() } as usize;
-        let bi3 = unsafe { positions_ptr.add(i + 3).read() } as usize;
-        sum0 += unsafe { grad_out_ptr.add(bi0 * ft_out_u + ri).read() } as f32;
-        sum1 += unsafe { grad_out_ptr.add(bi1 * ft_out_u + ri).read() } as f32;
-        sum2 += unsafe { grad_out_ptr.add(bi2 * ft_out_u + ri).read() } as f32;
-        sum3 += unsafe { grad_out_ptr.add(bi3 * ft_out_u + ri).read() } as f32;
-        i += 4;
-    }
-    while i < off_end {
-        let bi = unsafe { positions_ptr.add(i).read() } as usize;
-        sum0 += unsafe { grad_out_ptr.add(bi * ft_out_u + ri).read() } as f32;
-        i += 1;
-    }
-    let sum = (sum0 + sum1) + (sum2 + sum3);
-
-    if sum != 0.0_f32 {
-        let cell =
-            unsafe { &*(grad_w.as_ptr().add(feature * ft_out_u + ri) as *const DeviceAtomicF32) };
-        cell.fetch_add(sum * dft_inv_scale, AtomicOrdering::Relaxed);
-    }
+    gather_and_sum_per_feature_body!(
+        grad_out, positions, offsets, grad_w, n_features, ft_out;
+        f16, scale, add, dft_inv_scale
+    );
 }
 
 /// Sparse feature transform backward (atomic scatter)。

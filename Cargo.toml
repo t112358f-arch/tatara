@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/shogi-format",
     "crates/shogi-features",
+    "crates/cuda-native-runtime",
     "crates/gpu-kernels",
     "crates/gpu-runtime",
     "crates/nnue-format",
@@ -10,6 +11,12 @@ members = [
     "bins/progress_kpabs_train",
     "bins/nnue_train",
     "bins/progress_bucket_survey",
+    "bins/eval_sfen",
+    "bins/net_fv_scale",
+    "bins/net_header_rewrite",
+    "bins/net_from_yo",
+    "bins/net_to_yo",
+    "bins/threat_symmetric_survey",
 ]
 
 [workspace.package]
@@ -23,7 +30,8 @@ rust-version = "1.96"
 shogi-format = { path = "crates/shogi-format" }
 shogi-features = { path = "crates/shogi-features" }
 gpu-kernels = { path = "crates/gpu-kernels" }
-gpu-runtime = { path = "crates/gpu-runtime" }
+gpu-runtime = { path = "crates/gpu-runtime", default-features = false }
+cuda-native-runtime = { path = "crates/cuda-native-runtime" }
 nnue-format = { path = "crates/nnue-format" }
 nnue-train = { path = "crates/nnue-train" }
 clap = { version = "4.5", features = ["derive"] }
@@ -35,9 +43,9 @@ clap = { version = "4.5", features = ["derive"] }
 # rev を読んで `cargo install --rev` する。channel は rust-toolchain.toml と
 # 必ず一致させる (ずれると link-time fail)。選定理由は
 # docs/decisions/2026-05-09-cuda-oxide-adoption.md、手順は docs/setup.md。
-cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
-cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
-cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "6de0509" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "b5d35e0" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

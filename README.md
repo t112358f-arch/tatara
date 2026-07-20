@@ -2,18 +2,30 @@
 
 # tatara
 
+![tatara — forging shogi NNUE in Rust](docs/tatara-hero.jpg)
+
 **A fast Rust trainer for shogi NNUE evaluation networks.**
 
 tatara trains shogi NNUE (Efficiently Updatable Neural Network) evaluation
-networks on the GPU. It is written in **Rust end to end**, from host to device:
-GPU kernels are compiled to PTX at build time by
-[cuda-oxide](https://github.com/NVlabs/cuda-oxide) (NVIDIA Labs' Rust → PTX
-rustc backend) — no C / C++ / CUDA C++ anywhere in the pipeline.
+networks on NVIDIA GPUs. The trainer, data pipeline, and CUDA Driver API runtime
+are written in Rust, while the native GPU backend compiles hand-fused CUDA C++
+kernels with NVCC into an embedded fat binary.
 
-Hand-fusing the GPU kernels makes it **very fast** — it out-throughputs its
-upstream CUDA C++ trainer [bullet-shogi](https://github.com/SH11235/bullet-shogi).
+The [cuda-oxide](https://github.com/NVlabs/cuda-oxide) Rust → PTX backend is
+also maintained as the default Cargo feature and as a numerical and performance
+reference for the native backend. A `native-cuda-host` build uses only the
+NVCC-built kernels and portable Rust host runtime, without cuda-oxide. The
+`native-cuda` feature enables parity and benchmark comparisons across both
+device backends; it builds the NVCC fat binary only, so generate the cuda-oxide
+PTX first with `bash scripts/build-kernels.sh` (see
+[docs/native-cuda-benchmark.md](docs/native-cuda-benchmark.md)).
 
-**vs bullet-shogi (measured on RTX 3080 Ti)**: for LayerStack, even the
+Hand-fusing the GPU kernels makes it **very fast** — the measured cuda-oxide
+backend out-throughputs its upstream CUDA C++ trainer
+[bullet-shogi](https://github.com/SH11235/bullet-shogi), while the native backend
+keeps the same fused training design.
+
+**cuda-oxide vs bullet-shogi (measured on RTX 3080 Ti)**: for LayerStack, even the
 bit-identical default path is **+37%**, and stacking the opt-in FP16 modes reaches
 up to **~2.1×**. For Simple (HalfKP `512x2-8-64`) it is around **+20%** on the
 default and around **+55%** with `--all-optim` (FP16/TF32).
@@ -37,17 +49,26 @@ cargo run --release --bin nnue-train -- \
   --feature-set halfka-hm-merged --batch-size 65536 --superbatches 8 [--all-optim] \
   layerstack --ft-out {1536|768} --l1 {16|8} --l2 32
 
-# HalfKP (simple, no progress needed)
+# HalfKP (simple, no progress needed; the simple trainer requires --win-rate-model)
 cargo run --release --bin nnue-train -- \
   --data /path/to/teacher.psv \
   --feature-set halfkp --batch-size 65536 --superbatches 8 [--all-optim] \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple --arch 256x2-32-32
 ```
+
+The simple trainer only supports the win-rate-model loss (its int8 output
+layer cannot represent the centipawn-scale output that the plain sigmoid loss
+converges to). The `--wrm-*` values above degenerate the WRM to a plain
+sigmoid; use the same scale for `--scale` and every `--wrm-*-scaling` /
+`--wrm-nnue2score`, since `--scale` also sets the exported `fv_scale`.
 
 *tatara (踏鞴), the traditional Japanese furnace that smelts iron sand (raw
 material) into tamahagane steel — forging a net out of raw data.*
 
-> **NVIDIA only** — because cuda-oxide only generates PTX, ROCm / AMD is out of
+> **NVIDIA only** — both GPU backends target NVIDIA CUDA; ROCm / AMD is out of
 > scope. To train comparable shogi NNUE nets on an AMD GPU, see the upstream
 > [bullet-shogi](https://github.com/SH11235/bullet-shogi), which has both CUDA
 > and HIP backends.
@@ -63,7 +84,7 @@ vector.
 
 | Architecture | Subcommand | Structure |
 |---|---|---|
-| **LayerStack** | `layerstack` | Specializes the output layer per bucket by game progress (`--num-buckets`, default 9; the same idea as Stockfish's "LayerStacks"). FT output `--ft-out` (default 1536) → `--l1` (default 16) → `--l2` (default 32) |
+| **LayerStack** | `layerstack` | Specializes the output layer per position bucket. `--bucket-mode progress8kpabs` uses progress coefficients and 2–9 buckets; `--bucket-mode kingrank9` uses YaneuraOu KingRank9 with exactly 9 buckets and no progress coefficients. FT output `--ft-out` (default 1536) → `--l1` (default 16) → `--l2` (default 32) |
 | **Simple** | `simple` | A plain NNUE with no bucket split (FT → 2 hidden layers → single output). Layer dimensions are set with `--arch <l1>x2-<l2>-<l3>` (`l1` = FT output, `l2`/`l3` = hidden layers; default `256x2-32-32`); activation crelu / screlu / pairwise |
 
 ### Input feature set
@@ -92,21 +113,17 @@ from [a post by nodchip](https://nodchip.hatenablog.com/entry/2026/02/04/000000)
 
 ### Requirements
 
-- **OS** — Linux is first-class; Windows is supported via WSL2; macOS cannot
-  build the GPU crates
-- **NVIDIA GPU** (Ampere and later / sm_80+ is officially supported; Turing /
-  sm_75 also runs simple kernels with the `CUDA_OXIDE_TARGET=sm_75` environment
-  variable)
+- **OS** — Linux is first-class; Windows is supported via WSL2, with experimental
+  native Windows support through `native-cuda-host`; macOS cannot build the GPU
+  crates
+- **NVIDIA GPU** (see the backend-specific support matrix in `docs/setup.md`)
 - **CUDA Toolkit 12.x** (verified with 12.9)
-- **LLVM 21+** (`llc-21` is the floor; `llc-22` is recommended because it is
-  needed for fully correct atomics syncscope)
-- **Rust nightly** (`rust-toolchain.toml` tracks the cuda-oxide upstream
-  channel; do not change the channel yourself, since it depends on the rustc
-  internal ABI)
+- **NVCC** for `native-cuda-host`; **LLVM 21+** and `cargo-oxide` for the default
+  cuda-oxide backend
+- **Rust nightly** (pinned in `rust-toolchain.toml`)
 
-To set up `cargo-oxide`, which builds the GPU kernels, run
-`bash scripts/setup-cuda-oxide.sh`. For detailed installation steps, per-OS
-guidance, and the supported-GPU matrix, see [docs/setup.md](docs/setup.md).
+For the native CUDA C++ build command, cuda-oxide setup, detailed per-OS
+instructions, and the supported-GPU matrix, see [docs/setup.md](docs/setup.md).
 
 ### Build and train
 
@@ -116,12 +133,14 @@ For building the kernels and running the smoke test, see
 
 ## Documentation
 
-- [Setup guide](docs/setup.md) — per-OS guidance, CUDA / LLVM / `cargo-oxide`
+- [Setup guide](docs/setup.md) — per-OS guidance, native CUDA / cuda-oxide build
   setup, supported-GPU matrix, CUDA toolkit root resolution
 - [Training quickstart](docs/training-quickstart.md) — per-architecture training
   examples + key CLI options + resume / checkpoint workflow
 - [Game-progress buckets: preparing `progress.bin`](docs/progress-bin.md) —
   training the LayerStack bucket coefficients and surveying the bucket split
+- [End-to-end training benchmark](docs/bench-pos.md) — reproducible real-data
+  throughput measurement on Linux/WSL and native Windows
 - [Held-out validation](docs/held-out-validation.md) — `test_loss` / `test_acc`
   setup, choosing the held-out source, and reading the metrics
 - [Training schedules](docs/training-schedule.md) — scheduling the learning rate
@@ -134,6 +153,8 @@ For building the kernels and running the smoke test, see
 - [Arch string](docs/arch-string.md) — how the architecture-description string
   embedded in the quantised `.bin` header is assembled and checked at load time
   (Japanese only)
+- [Converting between tatara and YaneuraOu LayerStack nets](docs/net-to-yaneuraou.md) —
+  `net_to_yo` / `net_from_yo` usage, supported architecture, and binary layout (Japanese only)
 
 ## Using the trained net
 
@@ -142,7 +163,9 @@ The quantised `.bin` that tatara produces is designed to be loaded by the
 SCReLU / Pairwise activations are specific to this project, so other shogi
 engines such as YaneuraOu cannot necessarily load it as-is; depending on the
 architecture, some nets need additional inference code before they can be
-loaded. Pre-trained reference nets are attached to the
+loaded. A supported LayerStack net can be converted to and from the YaneuraOu
+format with [`net_to_yo` / `net_from_yo`](docs/net-to-yaneuraou.md).
+Pre-trained reference nets are attached to the
 [GitHub Releases](https://github.com/SH11235/tatara/releases). To train your
 own net, see the [setup guide](docs/setup.md).
 
@@ -154,15 +177,18 @@ own net, see the [setup guide](docs/setup.md).
 | **FT** | Feature Transformer — the NNUE's sparse-input → dense layer |
 | **L1f** | The bucket-independent (shared across all buckets) L1 dense layer of the LayerStack architecture; its output is added to the per-bucket L1 output |
 | **PSV** | PackedSfenValue — a training-data format from bullet-shogi (one position + score + WDL) |
+| **HCPE** | HuffmanCodedPosAndEval — the 38-byte Apery / dlshogi position, score, move, and game-result format |
 | **KP / KP-abs** | King-Piece relative feature and its absolute-value variant (for progress / entering-king detection) |
 | **bucket** | Per-output-bucket weight separation (branching by game phase / progress) |
 | **PSQT** | Piece-Square Table — a linear per-piece-per-square evaluation table. The LayerStack `--psqt` option adds a per-bucket PSQT output to the network output so the dense path only has to learn non-material structure |
+| **EffectBucket** | Feature-set extension that maps each base feature row to `base_index * NB + effect_bucket`, where `EffectBucket=<config>` in the arch string records the bucket count and whether king features are bucketed |
 | **FT factorizer** | Training-time virtual FT rows shared across king buckets (LayerStack; **ON by default**, disable with `--no-ft-factorize`). Each virtual row learns the king-bucket-independent component of one piece plane and is folded into the real rows on export, so the `.bin` shape and inference are unchanged. The same idea as nnue-pytorch's feature factorizer (whose default feature set `HalfKAv2_hm^` is also factorized). Works together with `--psqt` (the PSQT block gets the same virtual rows); `--init-from` automatically disables it (logged, since a quantised `.bin` has no virtual rows) |
 | **CReLU / SCReLU / Pairwise** | NNUE activation functions. CReLU = Clipped ReLU, SCReLU = Squared Clipped ReLU, Pairwise = elementwise product of the first and second halves, halving the input dimension. Selected by `--activation` on the `simple` architecture |
 | **RAdam / Ranger** | Rectified Adam / Ranger optimizer (Ranger = RAdam + lookahead) |
 | **WRM** | Win-rate model loss (from bullet `--win-rate-model`) |
 | **QA / QB / FV_SCALE** | Quantisation scale constants. QA = the FT weight / bias quantisation multiplier (on the `simple` architecture it is set by the activation: 127 for CReLU / Pairwise, 255 for SCReLU); QB = dense-weight scale (64). Activation outputs are always on a 127 scale regardless of activation, so FV_SCALE = `round(127 × QB / training scale)` is the factor that converts the net output back to a centipawn evaluation |
 | **WDL** | Win/Draw/Loss — the game-result target (1.0 / 0.5 / 0.0) blended against the teacher score by the WDL lambda; see [docs/training-schedule.md](docs/training-schedule.md) |
+| **CV** | Coefficient of variation — sample standard deviation divided by the mean, reported as a percentage for benchmark run-to-run variability |
 | **SPRT** | Sequential Probability Ratio Test — a method that plays two nets against each other and sequentially tests the strength difference. Used to confirm the quality of a trained net |
 | **superbatch** | A bullet term: the unit of "multiple batches treated as one, advancing the lr/wdl scheduler" |
 | **PTX** | Parallel Thread Execution — a virtual ISA for NVIDIA GPUs. CUDA C++ / Rust → PTX (`.ptx` text) → the CUDA driver's JIT compiles it to SASS (real machine code) for execution. It is portable across generations (PTX built for sm_80 runs forward-compatibly on sm_86/89/90). See the supported-GPU matrix in `docs/setup.md` |

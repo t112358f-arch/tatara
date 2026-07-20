@@ -4,6 +4,7 @@
 //! - atomics は host が呼出前に gradient buffer を 0 初期化する accumulate semantics
 //! - DisjointSlice<f32> は 1 thread = 1 cell の排他書き込み、&[f32] + raw atomic は
 //!   多 thread → 1 cell の atomic accumulate
+//! - perm を使う non-atomic scatter は caller が real row に対する単射性を保証する
 //! - cuda-oxide 制限: `f32::clamp` / `f32::max` / `f32::min` は if-else 展開
 
 use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU32, DeviceAtomicU64};
@@ -451,41 +452,15 @@ pub fn ft_post_perspective_grad_fused_fp16(
     // atomic counter で、host (`--monitor-fp16-clamps`) が sb 末に D2H read する。
     let da = grad_a * dft_scale;
     let mut local_clamps: u64 = 0;
-    let da_c = if da > 65504.0_f32 {
-        local_clamps += 1;
-        65504.0_f32
-    } else if da < -65504.0_f32 {
-        local_clamps += 1;
-        -65504.0_f32
-    } else {
-        da
-    };
+    let da_c = clamp_f16_value!(da, local_clamps);
     let db = grad_b * dft_scale;
-    let db_c = if db > 65504.0_f32 {
-        local_clamps += 1;
-        65504.0_f32
-    } else if db < -65504.0_f32 {
-        local_clamps += 1;
-        -65504.0_f32
-    } else {
-        db
-    };
+    let db_c = clamp_f16_value!(db, local_clamps);
     let out_ptr = grad_ft_out.as_mut_ptr();
     unsafe {
         out_ptr.add(ft_base + pair_idx).write(da_c as f16);
         out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
     }
-    if local_clamps > 0 {
-        // SAFETY: `clamp_counter.len() == 1` (host 契約)、`DeviceAtomicU64` は `u64`
-        // (align 8) と同 layout (`#[repr(transparent)]` over `UnsafeCell<u64>`)。
-        // 同 cell を更新するのは本 kernel および同 file の `ft_post_perspective_
-        // grad_fp16`、`bins/nnue_train/src/kernels/simple.rs` の `simple_act_grad_
-        // to_fp16_{crelu,screlu}_with_scale` の計 4 kernel 関数で、いずれも
-        // `DeviceAtomicU64::fetch_add` 経由でのみ書く (non-atomic 経路無し)。
-        // cumulative counter なので host も memset reset を出さない。
-        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
-        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
-    }
+    finish_f16_clamp_count!(clamp_counter, local_clamps);
 
     // grad_bias は f32 accumulate を維持 (f32 の grad_a / grad_b をそのまま atomic add)。
     let bias_cell_a = unsafe { &*(grad_bias.as_ptr().add(pair_idx) as *const DeviceAtomicF32) };
@@ -573,25 +548,9 @@ pub fn ft_post_perspective_grad_fp16(
     // `clamp_counter` は cap が当たった要素数の cumulative atomic counter。
     let da = grad_a * dft_scale;
     let mut local_clamps: u64 = 0;
-    let da_c = if da > 65504.0_f32 {
-        local_clamps += 1;
-        65504.0_f32
-    } else if da < -65504.0_f32 {
-        local_clamps += 1;
-        -65504.0_f32
-    } else {
-        da
-    };
+    let da_c = clamp_f16_value!(da, local_clamps);
     let db = grad_b * dft_scale;
-    let db_c = if db > 65504.0_f32 {
-        local_clamps += 1;
-        65504.0_f32
-    } else if db < -65504.0_f32 {
-        local_clamps += 1;
-        -65504.0_f32
-    } else {
-        db
-    };
+    let db_c = clamp_f16_value!(db, local_clamps);
     // SAFETY: grad_ft_out.len() == batch * ft_dim (caller 契約)、`ft_dim = 2 * half` の
     // 偶数性で pair_idx ∈ [0, half) → {pair_idx, half + pair_idx} ⊂ [0, ft_dim)、tid 範囲
     // チェックで bi < batch。同一 (bi, ii) cell を書く thread は他に無い (pair_idx 単射)。
@@ -600,11 +559,7 @@ pub fn ft_post_perspective_grad_fp16(
         out_ptr.add(ft_base + pair_idx).write(da_c as f16);
         out_ptr.add(ft_base + half + pair_idx).write(db_c as f16);
     }
-    if local_clamps > 0 {
-        // SAFETY: see `ft_post_perspective_grad_fused_fp16` clamp_counter atomic add。
-        let cell = unsafe { &*(clamp_counter.as_ptr() as *const DeviceAtomicU64) };
-        cell.fetch_add(local_clamps, AtomicOrdering::Relaxed);
-    }
+    finish_f16_clamp_count!(clamp_counter, local_clamps);
 
     // grad_bias は f32 accumulate を維持 (scale 無しの grad_a / grad_b を atomic add)。
     // SAFETY: grad_bias.len() == ft_dim、pair_idx < half、half + pair_idx < ft_dim。
@@ -1470,6 +1425,9 @@ pub fn count_buckets(bucket_idx: &[i32], counts: &[u32], batch: u32, num_buckets
     } else {
         num_buckets
     };
+    // SAFETY: `counts.len() == num_buckets + 1` (caller 契約) かつ
+    // `bin <= num_buckets`。`u32` と `DeviceAtomicU32` は同 layout で、本 kernel 中の
+    // 書き込みは atomic add のみ。
     unsafe {
         let atom = &*(counts.as_ptr().add(bin as usize) as *const DeviceAtomicU32);
         atom.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1495,6 +1453,8 @@ pub fn exclusive_scan_aligned(counts: &[u32], offsets: &[u32], n: u32, align: u3
         if rem != 0 {
             acc += align - rem;
         }
+        // SAFETY: `offsets.len() == n` (caller 契約) かつ `i < n`。kernel は thread 0
+        // だけが実行するため、書き込みは他 thread と競合しない。
         unsafe {
             let dst = offsets.as_ptr().add(i) as *mut u32;
             *dst = acc;
@@ -1534,6 +1494,10 @@ pub fn scatter_bucket_perm(
         atom.fetch_add(1, AtomicOrdering::Relaxed)
     };
     let dst = (offsets[bin as usize] + rank) as usize;
+    // SAFETY: `perm.len() == sorted_bucket.len() == padded_batch`、`offsets[bin]` は
+    // bucket の確保範囲先頭、`rank < counts[bin]` なので `dst < padded_batch`
+    // (caller 契約)。atomic increment が bucket 内 rank を一意にするため、各 thread
+    // の書き込み先は重ならない。
     unsafe {
         let perm_dst = perm.as_ptr().add(dst) as *mut i32;
         *perm_dst = tid.get() as i32;
@@ -1587,6 +1551,11 @@ pub fn inverse_permute_rows_f32(input: &[f32], perm: &[i32], output: &[f32], bat
         return;
     }
     let dst_idx = (dst_row as usize) * (dim as usize) + col;
+    // SAFETY: `batch` は padding 込みの入力行数で、`output` は実 batch 行 (≤ batch)
+    // しか確保されない。caller 契約: `perm` の real entry は原 batch row index
+    // (< 実 batch 行数) の単射、padding 行は `perm = -1` で上の guard により skip。
+    // よって書き込みは `dst_row < 実 batch 行数` / `col < dim` に収まり、各
+    // (dst_row, col) は thread 間で重ならない。
     unsafe {
         let dst = output.as_ptr().add(dst_idx) as *mut f32;
         *dst = input[tid.get()];
@@ -2470,10 +2439,10 @@ pub fn concat_l1sqr_main_grad(
     let da_val = dout[bi * out_dim + ii];
     let db_val = dout[bi * out_dim + (dim as usize) + ii];
 
-    if let Some(o) = da.get_mut(tid) {
+    if let Some(o) = da.get_mut(thread::index_1d()) {
         *o = da_val;
     }
-    if let Some(o) = db.get_mut(tid) {
+    if let Some(o) = db.get_mut(thread::index_1d()) {
         *o = db_val;
     }
 }
@@ -2494,6 +2463,37 @@ pub fn bias_add_per_row(bias: &[f32], mut out: DisjointSlice<f32>, batch: u32, n
     }
 }
 
+/// Per-bucket broadcast bias add — `out[bi, oi] += bias[bucket_idx[bi]][oi]`。per-bucket
+/// dense を cuBLAS Sgemm (matmul のみ) で計算した後、original row order の出力に
+/// bucket ごとの bias を足す post-pass。`bias` は `[num_buckets, out_dim]` row-major。
+/// `bucket_idx[bi]` が range 外 (< 0 / >= num_buckets) の row は skip する
+/// (caller は real row の bucket_idx が `[0, num_buckets)` に収まることを保証する)。
+#[kernel]
+pub fn bias_add_per_bucket_row(
+    bias: &[f32],
+    bucket_idx: &[i32],
+    mut out: DisjointSlice<f32>,
+    batch: u32,
+    out_dim: u32,
+    num_buckets: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (out_dim as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (out_dim as usize);
+    let oi = tid.get() % (out_dim as usize);
+    let buc = bucket_idx[bi];
+    if buc < 0 || (buc as u32) >= num_buckets {
+        return;
+    }
+    let bias_val = bias[(buc as usize) * (out_dim as usize) + oi];
+    if let Some(o) = out.get_mut(tid) {
+        *o += bias_val;
+    }
+}
+
 /// Elementwise add — `c[i] = a[i] + b[i]`。forward (l1+l1f, l3+l1_skip) と
 /// gradient-copy (双方に同 grad 配る) 両用。1 thread = 1 element。
 #[kernel]
@@ -2502,8 +2502,9 @@ pub fn elementwise_add(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>, n: u32) 
     if i.get() >= n as usize {
         return;
     }
+    let j = i.get();
     if let Some(out) = c.get_mut(i) {
-        *out = a[i.get()] + b[i.get()];
+        *out = a[j] + b[j];
     }
 }
 
@@ -2572,7 +2573,7 @@ pub fn slice_scatter_2d(
 //
 // 形式:
 //   psqt_w shape   = (rows, NUM_BUCKETS) row-major (`psqt_w[feat * NB + bucket]`、
-//                    rows は base `ft_in`、factorizer 有効時は仮想 P 行込みの
+//                    rows は base `ft_in`、factorizer 有効時はpiece-input 仮想行込みの
 //                    `train_ft_in`。本 kernel は `feat < ft_in` の実 block のみ touch)
 //   forward 出力   = net_output[b] += 0.5 * (Σ_f∈stm_active psqt_w[f,bk]
 //                                            − Σ_f∈nstm_active psqt_w[f,bk])
@@ -2595,10 +2596,11 @@ pub fn psqt_diff_sparse_fwd_inplace(
     psqt_w: &[f32],
     stm_indices: &[i32],
     nstm_indices: &[i32],
+    nnz_arr: &[i32],
     bucket_idx: &[i32],
     mut net_output: DisjointSlice<f32>,
     batch: u32,
-    nnz: u32,
+    max_active: u32,
     num_buckets: u32,
     ft_in: u32,
 ) {
@@ -2612,11 +2614,12 @@ pub fn psqt_diff_sparse_fwd_inplace(
     }
     let bucket_u = bucket as usize;
     let nb_u = num_buckets as usize;
-    let base = b.get() * (nnz as usize);
+    let base = b.get() * (max_active as usize);
+    let row_nnz = nnz_arr[b.get()];
     let mut sum_stm: f32 = 0.0;
     let mut sum_nstm: f32 = 0.0;
-    let mut ni: u32 = 0;
-    while ni < nnz {
+    let mut ni: i32 = 0;
+    while ni < row_nnz {
         let idx_s = stm_indices[base + (ni as usize)];
         if idx_s >= 0 && (idx_s as u32) < ft_in {
             sum_stm += psqt_w[(idx_s as usize) * nb_u + bucket_u];
@@ -2643,12 +2646,19 @@ pub fn psqt_diff_sparse_fwd_inplace(
 /// `bucket_idx[b] < 0` または `>= num_buckets` の position は skip。num_buckets
 /// 上限 9 が小さく contention は限定的 (例: N=9, batch=65536 / nnz=40 / stm+nstm
 /// 両 add で 5.2M atomic-add / 660K cells ≒ 平均 8 thread/cell)。
+///
+/// `nnz_arr[bi]` は position bi の実 active 数で、`ni >= nnz_arr[bi]` の padding slot
+/// は index / bucket / dnet を DRAM から読む前に捨てる (dataloader が padding slot を
+/// `-1` で埋めない契約になったため、実長超の slot は前 batch の残骸を持ちうる。範囲内
+/// 残骸を `idx < ft_in` 防御だけでは除外できないので実長で打ち切る)。caller は
+/// `nnz_arr.len() == batch`、`0 <= nnz_arr[bi] <= nnz` を保証する。
 #[allow(clippy::too_many_arguments)]
 #[kernel]
 pub fn psqt_diff_sparse_bwd(
     dnet: &[f32],
     stm_indices: &[i32],
     nstm_indices: &[i32],
+    nnz_arr: &[i32],
     bucket_idx: &[i32],
     psqt_w_grad: &[f32],
     batch: u32,
@@ -2663,6 +2673,9 @@ pub fn psqt_diff_sparse_bwd(
     }
     let bi = tid.get() / (nnz as usize);
     let ni = tid.get() % (nnz as usize);
+    if (ni as i32) >= nnz_arr[bi] {
+        return;
+    }
     let bucket = bucket_idx[bi];
     if bucket < 0 || (bucket as u32) >= num_buckets {
         return;

@@ -22,7 +22,7 @@
 //!     net_output[b] += 0.5 * (sum_stm - sum_nstm)
 //!
 //! backward (accumulate semantics, host 0 初期化):
-//!   for (b, ni):
+//!   for (b, ni < nnz_arr[b]):
 //!     bucket = bucket_idx[b]; if invalid: skip
 //!     g = 0.5 * dnet[b]
 //!     psqt_w_grad[stm_indices[b, ni],  bucket] += +g
@@ -39,10 +39,11 @@ pub fn psqt_diff_sparse_fwd_inplace_cpu(
     psqt_w: &[f32],
     stm_indices: &[i32],
     nstm_indices: &[i32],
+    nnz_arr: &[i32],
     bucket_idx: &[i32],
     net_output: &mut [f32],
     batch: usize,
-    nnz: usize,
+    max_active: usize,
     num_buckets: usize,
     ft_in: usize,
 ) {
@@ -52,10 +53,10 @@ pub fn psqt_diff_sparse_fwd_inplace_cpu(
             continue;
         }
         let bucket_u = bucket as usize;
-        let base = b * nnz;
+        let base = b * max_active;
         let mut sum_stm = 0.0_f32;
         let mut sum_nstm = 0.0_f32;
-        for ni in 0..nnz {
+        for ni in 0..nnz_arr[b] as usize {
             let idx_s = stm_indices[base + ni];
             if idx_s >= 0 && (idx_s as usize) < ft_in {
                 sum_stm += psqt_w[(idx_s as usize) * num_buckets + bucket_u];
@@ -73,12 +74,15 @@ pub fn psqt_diff_sparse_fwd_inplace_cpu(
 ///
 /// `psqt_w_grad` は呼出前に 0 初期化されている前提 (GPU は `memset_async(0)`)。stm
 /// 側に `+0.5*dnet[b]`、nstm 側に `-0.5*dnet[b]` を、対応 `(feat, bucket)` cell に
-/// add する。重複 index は累積 (atomic sum)。
+/// add する。重複 index は累積 (atomic sum)。`nnz_arr[b]` は position b の実 active
+/// 数で、`ni >= nnz_arr[b]` の padding slot は走査しない (GPU kernel の early-out と
+/// 同契約。`nnz` は index の row stride、`0 <= nnz_arr[b] <= nnz`)。
 #[allow(clippy::too_many_arguments)]
 pub fn psqt_diff_sparse_bwd_cpu(
     dnet: &[f32],
     stm_indices: &[i32],
     nstm_indices: &[i32],
+    nnz_arr: &[i32],
     bucket_idx: &[i32],
     psqt_w_grad: &mut [f32],
     batch: usize,
@@ -93,7 +97,7 @@ pub fn psqt_diff_sparse_bwd_cpu(
         }
         let bucket_u = bucket as usize;
         let half_g = 0.5_f32 * dnet[b];
-        for ni in 0..nnz {
+        for ni in 0..nnz_arr[b] as usize {
             let idx_s = stm_indices[b * nnz + ni];
             if idx_s >= 0 && (idx_s as usize) < ft_in {
                 psqt_w_grad[(idx_s as usize) * num_buckets + bucket_u] += half_g;
@@ -124,7 +128,7 @@ mod tests {
         let nstm = vec![0_i32]; // feat 0
         let bucket = vec![1_i32]; // bucket=1
         let mut out = vec![10.0_f32]; // pre-existing net_output value
-        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &bucket, &mut out, 1, 1, 2, 3);
+        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &[1], &bucket, &mut out, 1, 1, 2, 3);
         // delta = 0.5 * (psqt_w[1,1] - psqt_w[0,1]) = 0.5 * (8 - 2) = 3
         assert_eq!(out[0], 13.0);
     }
@@ -137,7 +141,7 @@ mod tests {
         let nstm = vec![-1_i32, 99];
         let bucket = vec![0_i32];
         let mut out = vec![5.0_f32];
-        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &bucket, &mut out, 1, 2, 2, 2);
+        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &[2], &bucket, &mut out, 1, 2, 2, 2);
         assert_eq!(out[0], 5.0, "delta = 0 when all indices invalid");
     }
 
@@ -155,6 +159,7 @@ mod tests {
             &psqt_w,
             &stm,
             &nstm,
+            &[1],
             &bucket_neg,
             &mut out_neg,
             1,
@@ -166,6 +171,7 @@ mod tests {
             &psqt_w,
             &stm,
             &nstm,
+            &[1],
             &bucket_oob,
             &mut out_oob,
             1,
@@ -185,7 +191,7 @@ mod tests {
         let nstm = vec![2_i32];
         let bucket = vec![0_i32];
         let mut grad = vec![0.0_f32; 3 * 2]; // ft_in=3, num_buckets=2
-        psqt_diff_sparse_bwd_cpu(&dnet, &stm, &nstm, &bucket, &mut grad, 1, 1, 2, 3);
+        psqt_diff_sparse_bwd_cpu(&dnet, &stm, &nstm, &[1], &bucket, &mut grad, 1, 1, 2, 3);
         // stm += 0.5*4 = 2 at (feat=1, bucket=0)
         // nstm += -0.5*4 = -2 at (feat=2, bucket=0)
         assert_eq!(grad[2], 2.0); // feat=1, bucket=0 → 1*2 + 0
@@ -204,7 +210,7 @@ mod tests {
         let nstm = vec![-1_i32, -1, -1, -1];
         let bucket = vec![0_i32, 0];
         let mut grad = vec![0.0_f32; 5]; // ft_in=5, num_buckets=1 → 5*1 = 5
-        psqt_diff_sparse_bwd_cpu(&dnet, &stm, &nstm, &bucket, &mut grad, 2, 2, 1, 5);
+        psqt_diff_sparse_bwd_cpu(&dnet, &stm, &nstm, &[2, 2], &bucket, &mut grad, 2, 2, 1, 5);
         // feat 3 + bucket 0: b=0 が 2 回 (0.5*10*2=10) + b=1 が 1 回 (0.5*20=10) = 20
         assert_eq!(grad[3], 20.0);
     }
@@ -218,12 +224,23 @@ mod tests {
         let nstm = vec![1_i32];
         let bucket = vec![1_i32];
         let mut out = vec![0.0_f32];
-        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &bucket, &mut out, 1, 1, 2, 2);
+        psqt_diff_sparse_fwd_inplace_cpu(&psqt_w, &stm, &nstm, &[1], &bucket, &mut out, 1, 1, 2, 2);
         // delta = 0.5 * (psqt_w[0,1] - psqt_w[1,1]) = 0.5 * (-2 - 4) = -3
         assert_eq!(out[0], -3.0);
         // backward に dnet=delta を入れると stm 側 += 0.5*-3 = -1.5、nstm 側 += +1.5。
         let mut grad = vec![0.0_f32; 4];
-        psqt_diff_sparse_bwd_cpu(&[-3.0_f32], &stm, &nstm, &bucket, &mut grad, 1, 1, 2, 2);
+        psqt_diff_sparse_bwd_cpu(
+            &[-3.0_f32],
+            &stm,
+            &nstm,
+            &[1],
+            &bucket,
+            &mut grad,
+            1,
+            1,
+            2,
+            2,
+        );
         assert_eq!(grad[1], -1.5); // feat=0, bucket=1 → 0*2 + 1
         assert_eq!(grad[3], 1.5); // feat=1, bucket=1 → 1*2 + 1
     }

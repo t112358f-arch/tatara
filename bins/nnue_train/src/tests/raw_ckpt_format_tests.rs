@@ -1,7 +1,7 @@
 //! raw checkpoint format helper tests (GPU 不要)。
 
 use nnue_format::ArchKind;
-use shogi_features::FeatureSet;
+use shogi_features::{EffectBucketConfig, FeatureSet};
 
 use crate::{arch::*, ckpt::*};
 
@@ -53,10 +53,10 @@ fn read_exact_or_invalid_maps_eof_to_invalid_data() {
 
 #[test]
 fn raw_ckpt_constants_are_stable() {
-    // magic は format identity。version は後方互換読み (version 1..=4 file の受理)
+    // magic は format identity。version は後方互換読み (version 1..=7 file の受理)
     // を維持しつつ前進するので、現行値を pin して意図しない変更を検出する。
     assert_eq!(&RAW_CKPT_MAGIC, b"RNRC");
-    assert_eq!(RAW_CKPT_VERSION, 6);
+    assert_eq!(RAW_CKPT_VERSION, 8);
 }
 
 #[test]
@@ -138,11 +138,30 @@ const DEFAULT_LAYERSTACK_TOPOLOGY: [u64; 4] = layerstack_topology(
 );
 
 fn layerstack_arch() -> RawCkptArch<'static> {
+    layerstack_arch_with_mode("progress8kpabs")
+}
+
+fn layerstack_arch_with_mode(bucket_mode: &'static str) -> RawCkptArch<'static> {
     RawCkptArch {
         feature_set: FeatureSet::HalfKaHmMerged.spec(),
         arch_kind: ArchKind::LayerStack,
+        bucket_mode: Some(bucket_mode),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+    }
+}
+
+fn simple_arch() -> RawCkptArch<'static> {
+    RawCkptArch {
+        feature_set: FeatureSet::HalfKaHmMerged.spec(),
+        arch_kind: ArchKind::Simple,
+        bucket_mode: None,
+        ft_out: DEFAULT_FT_OUT as u64,
+        topology: &[
+            DEFAULT_FT_OUT as u64,
+            DEFAULT_L1_OUT as u64,
+            DEFAULT_L2_OUT as u64,
+        ],
     }
 }
 
@@ -151,9 +170,111 @@ fn layerstack_arch_factorized() -> RawCkptArch<'static> {
     RawCkptArch {
         feature_set: FeatureSet::HalfKaHmMerged.spec().with_ft_factorize(),
         arch_kind: ArchKind::LayerStack,
+        bucket_mode: Some("progress8kpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
     }
+}
+
+fn layerstack_arch_effect_bucket(config: EffectBucketConfig) -> RawCkptArch<'static> {
+    RawCkptArch {
+        feature_set: FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_effect_bucket_config(config),
+        arch_kind: ArchKind::LayerStack,
+        bucket_mode: Some("progress8kpabs"),
+        ft_out: DEFAULT_FT_OUT as u64,
+        topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
+    }
+}
+
+fn bucket_mode_field_offset(buf: &[u8], arch: &RawCkptArch) -> usize {
+    let mut off = 4 + 4 + 4 + arch.feature_set.canonical_name().len() + 8 + 8 + 8 + 1 + 4;
+    let run_id_len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+    off += 4 + run_id_len;
+    let arch_name_len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+    off + 4 + arch_name_len
+}
+
+fn downgrade_v8_to_v7(buf: &mut Vec<u8>, arch: &RawCkptArch) {
+    let off = bucket_mode_field_offset(buf, arch);
+    let len = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap()) as usize;
+    buf.drain(off..off + 4 + len);
+    buf[4..8].copy_from_slice(&7u32.to_le_bytes());
+}
+
+fn remove_v7_feature_hash(buf: &mut Vec<u8>, arch: &RawCkptArch) {
+    downgrade_v8_to_v7(buf, arch);
+    buf[4..8].copy_from_slice(&6u32.to_le_bytes());
+    let max_active_off = 4 + 4 + 4 + arch.feature_set.canonical_name().len() + 8 + 8;
+    let feature_hash_off = max_active_off + 8 + 1;
+    buf.drain(feature_hash_off..feature_hash_off + 4);
+}
+
+#[test]
+fn raw_ckpt_v8_bucket_modes_round_trip() {
+    for arch in [
+        layerstack_arch_with_mode("progress8kpabs"),
+        layerstack_arch_with_mode("kingrank9"),
+        simple_arch(),
+    ] {
+        let mut buf = Vec::new();
+        write_raw_ckpt_header(&mut buf, &arch, "bucket-mode-roundtrip", 2, 20, None, 10).unwrap();
+        let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch).unwrap();
+        assert_eq!((h.superbatch, h.step_count, h.num_groups), (2, 20, 10));
+    }
+}
+
+#[test]
+fn raw_ckpt_v8_rejects_cross_bucket_mode_resume_in_both_directions() {
+    for (written, requested) in [
+        ("progress8kpabs", "kingrank9"),
+        ("kingrank9", "progress8kpabs"),
+    ] {
+        let mut buf = Vec::new();
+        write_raw_ckpt_header(
+            &mut buf,
+            &layerstack_arch_with_mode(written),
+            "",
+            1,
+            0,
+            None,
+            10,
+        )
+        .unwrap();
+        let err = read_raw_ckpt_header(
+            &mut Cursor::new(&buf),
+            &layerstack_arch_with_mode(requested),
+        )
+        .expect_err("cross-bucket-mode resume must be rejected");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "checkpoint bucket mode '{written}' does not match --bucket-mode '{requested}'"
+            )
+        );
+    }
+}
+
+#[test]
+fn raw_ckpt_v7_layerstack_defaults_to_progress8kpabs() {
+    let progress = layerstack_arch_with_mode("progress8kpabs");
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &progress, "legacy-v7", 7, 70, Some(100), 10).unwrap();
+    downgrade_v8_to_v7(&mut buf, &progress);
+
+    let h = read_raw_ckpt_header(&mut Cursor::new(&buf), &progress).unwrap();
+    assert_eq!((h.superbatch, h.step_count, h.num_groups), (7, 70, 10));
+
+    let err = read_raw_ckpt_header(
+        &mut Cursor::new(&buf),
+        &layerstack_arch_with_mode("kingrank9"),
+    )
+    .expect_err("v7 layerstack checkpoint must not resume as kingrank9");
+    assert_eq!(
+        err.to_string(),
+        "checkpoint bucket mode 'progress8kpabs' does not match --bucket-mode 'kingrank9'"
+    );
 }
 
 #[test]
@@ -166,6 +287,53 @@ fn raw_ckpt_header_ft_factorize_round_trips() {
 }
 
 #[test]
+fn raw_ckpt_header_rejects_effect_bucket_config_hash_mismatch() {
+    let fixed = layerstack_arch_effect_bucket(EffectBucketConfig::KINGFIXED_2X2);
+    let bucketed = layerstack_arch_effect_bucket(EffectBucketConfig::KINGBUCKETED_2X2);
+    assert_eq!(
+        fixed.feature_set.canonical_name(),
+        bucketed.feature_set.canonical_name()
+    );
+    assert_eq!(
+        fixed.feature_set.train_ft_in(),
+        bucketed.feature_set.train_ft_in()
+    );
+    assert_eq!(
+        fixed.feature_set.max_active(),
+        bucketed.feature_set.max_active()
+    );
+    assert_ne!(
+        fixed.feature_set.feature_hash(),
+        bucketed.feature_set.feature_hash()
+    );
+
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &fixed, "effect_bucket-fixed", 5, 50, None, 10).unwrap();
+    let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &bucketed)
+        .expect_err("effect bucket config mismatch must be rejected");
+    assert!(
+        err.to_string().contains("feature hash mismatch"),
+        "error should mention feature hash mismatch: {err}"
+    );
+}
+
+#[test]
+fn raw_ckpt_header_rejects_hashless_effect_bucket_checkpoint() {
+    let arch = layerstack_arch_effect_bucket(EffectBucketConfig::KINGFIXED_2X2);
+    let mut buf = Vec::new();
+    write_raw_ckpt_header(&mut buf, &arch, "hashless-effect-bucket", 5, 50, None, 10).unwrap();
+    remove_v7_feature_hash(&mut buf, &arch);
+
+    let err = read_raw_ckpt_header(&mut Cursor::new(&buf), &arch)
+        .expect_err("hashless effect bucket checkpoint must be rejected");
+    assert!(
+        err.to_string()
+            .contains("requires a checkpoint with feature hash"),
+        "error should mention feature hash requirement: {err}"
+    );
+}
+
+#[test]
 fn raw_ckpt_header_accepts_legacy_factorized_max_active() {
     // v6 の factorized file には max_active = 2×base の個体が存在する (仮想
     // 特徴を sparse index 列に流す実装が書いたもの、RAW_CKPT_VERSION doc 参照)。
@@ -174,6 +342,7 @@ fn raw_ckpt_header_accepts_legacy_factorized_max_active() {
     let arch = layerstack_arch_factorized();
     let mut buf = Vec::new();
     write_raw_ckpt_header(&mut buf, &arch, "run-legacy", 3, 30, None, 10).unwrap();
+    remove_v7_feature_hash(&mut buf, &arch);
     let base = arch.feature_set.max_active() as u64;
     // max_active field の offset = magic(4) + version(4) + name_len(4) +
     // name + ft_in(8) + ft_out(8)。書き換え前に base 値が居ることを確認して
@@ -192,6 +361,7 @@ fn raw_ckpt_header_accepts_legacy_factorized_max_active() {
     let off_arch = layerstack_arch();
     let mut buf_off = Vec::new();
     write_raw_ckpt_header(&mut buf_off, &off_arch, "", 1, 0, None, 10).unwrap();
+    remove_v7_feature_hash(&mut buf_off, &off_arch);
     buf_off[off..off + 8].copy_from_slice(&(2 * base).to_le_bytes());
     let err = read_raw_ckpt_header(&mut Cursor::new(&buf_off), &off_arch)
         .expect_err("non-factorize header with 2x max_active must be rejected");
@@ -235,6 +405,7 @@ fn layerstack_arch_threat_factorized() -> RawCkptArch<'static> {
             .with_threat_profile(shogi_features::ThreatProfile::CrossSide)
             .with_ft_factorize(),
         arch_kind: ArchKind::LayerStack,
+        bucket_mode: Some("progress8kpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
     }
@@ -363,6 +534,7 @@ fn raw_ckpt_header_rejects_wrong_arch_kind() {
     let written = RawCkptArch {
         feature_set: fs,
         arch_kind: ArchKind::Simple,
+        bucket_mode: None,
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &DEFAULT_LAYERSTACK_TOPOLOGY,
     };
@@ -380,6 +552,7 @@ fn raw_ckpt_header_rejects_wrong_topology() {
     let written = RawCkptArch {
         feature_set: fs,
         arch_kind: ArchKind::LayerStack,
+        bucket_mode: Some("progress8kpabs"),
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &wrong_topo,
     };
@@ -400,6 +573,7 @@ fn raw_ckpt_header_rejects_legacy_non_layerstack_request() {
     let simple_arch = RawCkptArch {
         feature_set: fs,
         arch_kind: ArchKind::Simple,
+        bucket_mode: None,
         ft_out: DEFAULT_FT_OUT as u64,
         topology: &simple_topo,
     };

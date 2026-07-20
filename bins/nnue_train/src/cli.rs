@@ -6,6 +6,16 @@ use nnue_format::ArchKind;
 
 use crate::arch::*;
 
+fn parse_positive_i32(value: &str) -> Result<i32, String> {
+    let parsed = value
+        .parse::<i32>()
+        .map_err(|_| "fv_scale must be an integer greater than zero".to_string())?;
+    if parsed <= 0 {
+        return Err("fv_scale must be greater than zero".to_string());
+    }
+    Ok(parsed)
+}
+
 // ===========================================================================
 // CLI (clap)
 // ===========================================================================
@@ -23,7 +33,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) data: Option<PathBuf>,
 
-    /// PSV file for held-out validation. Pass positions that are never used for
+    /// PSV or HCPE file for held-out validation. Pass positions that are never used for
     /// a gradient update, separate from the training `--data`. When set, a
     /// forward-only validation pass runs at the end of each superbatch and
     /// reports test_loss (mean held-out loss) and test_accuracy (agreement
@@ -53,6 +63,12 @@ pub(crate) struct Cli {
     /// Output directory for checkpoints (writes `{net_id}-{superbatch}.bin`).
     #[arg(long, default_value = "checkpoints", global = true)]
     pub(crate) output: PathBuf,
+
+    /// Inference checkpoint format. `yaneuraou` is available only for a
+    /// LayerStack trained with `--bucket-mode kingrank9` and writes an SFNN
+    /// evaluation file directly.
+    #[arg(long, value_enum, default_value_t = OutputFormatArg::Tatara, global = true)]
+    pub(crate) output_format: OutputFormatArg,
 
     /// Network id (used in checkpoint file names).
     #[arg(long, default_value = "rshogi", global = true)]
@@ -175,9 +191,11 @@ pub(crate) struct Cli {
     #[arg(long, global = true, conflicts_with = "wdl")]
     pub(crate) end_wdl: Option<f32>,
 
-    /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). Not used
-    /// when `--win-rate-model` is set (WRM loss uses the `--wrm-*` scaling
-    /// instead).
+    /// Score scale for the sigmoid loss (`loss_scale = 1 / scale`). On the
+    /// layerstack subcommand this is unused when `--win-rate-model` is set (WRM
+    /// loss uses the `--wrm-*` scaling instead). The simple trainer always uses
+    /// it to derive the exported `fv_scale`, so it stays in effect even under
+    /// the WRM there.
     #[arg(long, default_value_t = 290.0, global = true)]
     pub(crate) scale: f32,
 
@@ -189,8 +207,16 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) score_drop_abs: Option<i32>,
 
+    /// Saturate the teacher score of surviving positions to `[-N, N]` (applied
+    /// after the `--score-drop-abs` filter when set, so e.g. mate stamps are
+    /// dropped, not clamped; without that filter they are clamped into range).
+    /// Useful to normalise teacher files whose encode variants clip at
+    /// different ceilings. Must be in `[1, 32767]`.
+    #[arg(long, global = true, value_parser = clap::value_parser!(i16).range(1..))]
+    pub(crate) score_clamp_abs: Option<i16>,
+
     /// Inject weights from a quantised NNUE binary before training starts
-    /// (pretrained start). The optimizer state (Ranger m/v/slow/step) is
+    /// (pretrained start). The optimizer state (m/v/slow/step) is
     /// **reset** — use `--resume` for a true resume (`--init-from` and
     /// `--resume` are mutually exclusive).
     #[arg(long, global = true)]
@@ -214,7 +240,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) threat_norm_dump: bool,
 
-    /// Resume training by restoring weights + Ranger optimizer state
+    /// Resume training by restoring weights + optimizer state
     /// (m/v/slow/step) from a raw checkpoint (`{net_id}-{sb}.ckpt`) — a true
     /// resume. Mutually exclusive with `--init-from` (which injects weights only
     /// and resets the optimizer). When `--start-superbatch` is omitted, resumes
@@ -296,10 +322,15 @@ pub(crate) struct Cli {
     /// Used only when `--win-rate-model` is set.
     #[arg(long, default_value_t = 0.5, global = true)]
     pub(crate) loss_weight_boost_w2: f32,
-    /// Optimizer name (only "ranger" is implemented).
+    /// Optimizer: "ranger" (RAdam + lookahead, beta1=0.99), "radam" (rectified
+    /// Adam without lookahead, beta1=0.9), or "adamw" (Adam without bias
+    /// correction, decoupled weight decay, beta1=0.9). All three share
+    /// beta2=0.999 and the per-layer weight clamp. When resuming from a raw
+    /// checkpoint, pass the same optimizer as the original run (the checkpoint
+    /// stores moment buffers but not the optimizer name).
     #[arg(long, default_value = "ranger", global = true)]
     pub(crate) optimizer: String,
-    /// Weight decay coefficient for the Ranger optimizer (AdamW-style decoupled
+    /// Weight decay coefficient for the optimizer (AdamW-style decoupled
     /// weight decay). The default 0.0 means no decay. A non-zero value slightly
     /// decays the weights of every weight group toward 0 on each step.
     #[arg(long, default_value_t = 0.0, global = true)]
@@ -343,7 +374,7 @@ pub(crate) struct Cli {
     pub(crate) bias_lr_mult: Option<f32>,
     /// Enable norm loss (per-weight-group L2-norm regularisation, Georgiou et
     /// al. 2021). With the default `false`, the optimizer step is bit-identical
-    /// to the baseline. When enabled, each step (just before the Ranger update)
+    /// to the baseline. When enabled, each step (just before the optimizer update)
     /// every targeted weight group is nudged so its L2 norm relaxes toward 1
     /// (the oblique manifold): the 2D layer weights per output neuron (FT /
     /// L1f / L1 / L2 / L3), the PSQT shortcut weights per output bucket (when
@@ -428,16 +459,35 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) monitor_fp16_clamps: bool,
 
+    /// Log a histogram of the real active-feature count per position (the value
+    /// returned by the feature extractor before `-1` padding) at the end of every
+    /// superbatch. Used to check how much of the `max_active` sparse capacity is
+    /// actually used and whether any feature set (e.g. with threats appended)
+    /// pushes counts toward the cap.
+    ///
+    /// Each superbatch prints a one-line summary over the cumulative histogram
+    /// (`[active-hist] sb=... positions=... mean=... p50=... p90=... p99=...
+    /// max=...`); at the end of training the full non-zero histogram is dumped
+    /// once (`[active-hist] count[<active>]=<n>`). Off by default: when unset the
+    /// dataloader allocates no histogram and runs no counting code on the hot
+    /// path. Works for any feature set (threats on or off).
+    #[arg(long, global = true)]
+    pub(crate) monitor_active_features: bool,
+
     /// Override the feature-transformer (L0) weight initialiser. Applies to a
-    /// fresh run; ignored when `--init-from` / `--resume` loads weights. The
-    /// default weight init is `[-0.01, 0.01]` uniform.
+    /// fresh run; ignored when `--init-from` / `--resume` loads weights.
+    ///
+    /// Defaults differ per architecture: `layerstack` initialises the FT with
+    /// `uniform:fanin` (half-width `sqrt(1 / fan_in)`), while `simple` uses
+    /// `[-0.01, 0.01]` uniform. Every other weight defaults to `[-0.01, 0.01]`
+    /// uniform in both architectures.
     ///
     /// Grammar: `zero`, `<uniform|normal>:abs:<value>`, or
     /// `<uniform|normal>:fanin[:<gain>[:<effective>]]` where the magnitude is
     /// `sqrt(gain / effective_or_fan_in)` (half-width for uniform, std for
     /// normal). Examples: `uniform:fanin`, `normal:fanin:2:32`
-    /// (`sqrt(2/32) = 0.25`), `uniform:abs:0.01` (the default). Applies to the
-    /// weight only; the bias keeps the default.
+    /// (`sqrt(2/32) = 0.25`), `uniform:abs:0.01`. Applies to the weight only;
+    /// the bias keeps the default.
     #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
     pub(crate) init_ft: Option<nnue_train::init::LayerInitOverride>,
 
@@ -458,9 +508,65 @@ pub(crate) struct Cli {
     #[arg(long, global = true, value_name = "SPEC", value_parser = nnue_train::init::parse_layer_init_spec)]
     pub(crate) init_l3: Option<nnue_train::init::LayerInitOverride>,
 
+    /// FT factorizer (training-time virtual features). **Default ON.** Pass
+    /// `--no-ft-factorize` to disable. Supported by both the `layerstack` and
+    /// `simple` trainers.
+    ///
+    /// The FT weight table gains virtual piece-input rows for piece values independent
+    /// of the king position. Each virtual row accumulates the gradients of
+    /// every real row sharing its piece-input ordinal, so rarely visited king-square
+    /// cells inherit a sensible shared prior instead of staying near their
+    /// initial values. The virtual rows are folded into the real rows when the
+    /// quantised `.bin` is saved, so
+    /// the exported net is identical in shape to a non-factorized net and
+    /// inference engines need no changes.
+    ///
+    /// The sparse input stream is unchanged (the active-feature count stays
+    /// the base value); virtual rows are wired through two dense kernels per
+    /// optimizer step (a forward weight fold and a backward gradient
+    /// reduction), costing a single-digit percentage of training throughput
+    /// and zero inference cost.
+    ///
+    /// This flag is accepted for explicitness/back-compat but is redundant
+    /// with the default. It is auto-disabled (logged at startup) only by
+    /// `--init-from` (a quantised `.bin` has no virtual rows to initialise
+    /// from); resume across the resulting on/off is rejected (checkpoint
+    /// dimensions differ). On the layerstack trainer it coexists with `--psqt`
+    /// (the PSQT shortcut rows share the same fold), `--threat-profile`, and
+    /// `--effect-bucket`; the `simple` trainer has no such modifiers, so it
+    /// always shares one virtual row per piece input.
+    #[arg(
+        long = "ft-factorize",
+        global = true,
+        overrides_with = "no_ft_factorize"
+    )]
+    pub(crate) ft_factorize: bool,
+
+    /// Disable the FT factorizer (it is ON by default; see `--ft-factorize`).
+    /// Use this to train the non-factorized network. Only `--init-from`
+    /// auto-disables it otherwise.
+    #[arg(
+        long = "no-ft-factorize",
+        global = true,
+        overrides_with = "ft_factorize"
+    )]
+    pub(crate) no_ft_factorize: bool,
+
     /// Subcommand selecting the NNUE architecture to train (`layerstack` / `simple`).
     #[command(subcommand)]
     pub(crate) arch: ArchCommand,
+}
+
+impl Cli {
+    /// FT factorizer の実効 ON/OFF (default ON、`--no-ft-factorize` で OFF)。
+    /// `--ft-factorize` は back-compat の明示 ON で、`overrides_with` により
+    /// command-line 上で後勝ちする。`--init-from` との排他は呼び出し側
+    /// (`run_training` / `run_simple_training`) が auto-suppress で解決するため、
+    /// ここには含めない (この値は「ユーザーが factorizer を望むか」だけを表す)。
+    #[cfg(any(feature = "gpu", test))]
+    pub(crate) fn ft_factorize_enabled(&self) -> bool {
+        !self.no_ft_factorize
+    }
 }
 
 /// `--lr-schedule` の選択肢。lib 側 schedule 型への runtime selection。
@@ -475,6 +581,22 @@ pub(crate) enum LrScheduleArg {
     Exponential,
     #[value(name = "one-cycle")]
     OneCycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum OutputFormatArg {
+    #[default]
+    Tatara,
+    Yaneuraou,
+}
+
+impl From<OutputFormatArg> for nnue_train::trainer::OutputFormat {
+    fn from(value: OutputFormatArg) -> Self {
+        match value {
+            OutputFormatArg::Tatara => Self::Tatara,
+            OutputFormatArg::Yaneuraou => Self::Yaneuraou,
+        }
+    }
 }
 
 /// `--ft-fp16-out` が `--ft-fp16` を要求する制約を **実効値** (`--all-optim` の含意込み)
@@ -498,11 +620,18 @@ pub(crate) fn ft_fp16_out_missing_ft_fp16(
 /// 学習対象の NNUE アーキを選ぶサブコマンド。アーキ固有の引数を持つ。
 #[derive(Subcommand, Debug)]
 pub(crate) enum ArchCommand {
-    /// progress-kpabs N-bucket LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2; bucket count by --num-buckets).
+    /// Bucketed LayerStack architecture (FT → L1 → L2; layer dimensions set by --ft-out / --l1 / --l2).
     #[command(name = "layerstack")]
     LayerStack(LayerstackArgs),
     /// Simple 4-layer dense architecture (no buckets / PSQT / skip).
     Simple(SimpleArgs),
+    /// Run reproducible end-to-end training benchmarks from TOML configuration.
+    #[command(name = "bench-pos")]
+    BenchPos(BenchPosArgs),
+    /// Run the fixed native CUDA throughput benchmark and write a JSON report.
+    #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+    #[command(name = "native-bench")]
+    NativeBench(NativeBenchArgs),
 }
 
 impl ArchCommand {
@@ -512,20 +641,138 @@ impl ArchCommand {
         match self {
             ArchCommand::LayerStack(_) => ArchKind::LayerStack,
             ArchCommand::Simple(_) => ArchKind::Simple,
+            ArchCommand::BenchPos(_) => {
+                unreachable!("bench-pos does not select a training architecture")
+            }
+            #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+            ArchCommand::NativeBench(_) => {
+                unreachable!("native-bench does not select a training architecture")
+            }
         }
     }
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct BenchPosArgs {
+    /// Tracked benchmark profile containing measurement parameters and cases.
+    #[arg(long, default_value = "bench-pos.toml")]
+    pub(crate) profile: PathBuf,
+
+    /// Gitignored machine-local paths and hardware settings.
+    #[arg(long, default_value = "bench-pos.local.toml")]
+    pub(crate) local_config: PathBuf,
+
+    /// Run only the named case. Repeat this option to select multiple cases.
+    #[arg(long = "case", value_name = "ID")]
+    pub(crate) cases: Vec<String>,
+
+    /// Directory receiving JSON reports and per-run logs.
+    #[arg(long, default_value = "target/benchmark-results/bench-pos")]
+    pub(crate) output_dir: PathBuf,
+
+    /// Permit benchmarking an uncommitted working tree (recorded in JSON).
+    #[arg(long)]
+    pub(crate) allow_dirty: bool,
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Args, Debug)]
+pub(crate) struct NativeBenchArgs {
+    /// Fixed fixture profile. Changing fixture defaults requires a new profile version.
+    #[arg(long, value_enum, default_value_t = NativeBenchProfileArg::V1)]
+    pub(crate) profile: NativeBenchProfileArg,
+
+    /// Architecture fixture(s) to measure.
+    #[arg(long, value_enum, default_value_t = NativeBenchArchitectureArg::All)]
+    pub(crate) architecture: NativeBenchArchitectureArg,
+
+    /// Precision configuration(s) to measure.
+    #[arg(long, value_enum, default_value_t = NativeBenchPrecisionArg::All)]
+    pub(crate) precision: NativeBenchPrecisionArg,
+
+    /// `native-only` runs CUDA C++ alone; `compare` alternates cuda-oxide and CUDA C++.
+    #[arg(long, value_enum, default_value_t = NativeBenchModeArg::NativeOnly)]
+    pub(crate) mode: NativeBenchModeArg,
+
+    /// Warm-up steps excluded from timing.
+    #[arg(long, default_value_t = 3)]
+    pub(crate) warmup_steps: usize,
+
+    /// Timed training steps per run.
+    #[arg(long, default_value_t = 100)]
+    pub(crate) steps: usize,
+
+    /// Independent runs per backend and precision.
+    #[arg(long, default_value_t = 3)]
+    pub(crate) runs: usize,
+
+    /// CUDA device ordinal.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) device: usize,
+
+    /// Directory receiving a timestamped JSON report.
+    #[arg(long, default_value = "target/benchmark-results/native-cuda")]
+    pub(crate) output_dir: PathBuf,
+
+    /// Permit benchmarking an uncommitted working tree (recorded as dirty in JSON).
+    #[arg(long)]
+    pub(crate) allow_dirty: bool,
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum NativeBenchProfileArg {
+    #[default]
+    V1,
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum NativeBenchArchitectureArg {
+    Layerstack,
+    Simple,
+    #[default]
+    All,
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum NativeBenchPrecisionArg {
+    Fp32,
+    #[value(name = "all-optim")]
+    AllOptim,
+    #[default]
+    All,
+}
+
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum NativeBenchModeArg {
+    #[default]
+    #[value(name = "native-only")]
+    NativeOnly,
+    Compare,
 }
 
 /// LayerStack アーキ固有の引数。
 #[derive(Args, Debug)]
 pub(crate) struct LayerstackArgs {
+    /// Evaluation scale written to the LayerStack architecture string. When
+    /// omitted, sigmoid loss derives it from `--scale`; WRM loss leaves the
+    /// token out so the consuming engine can supply it through its FV_SCALE
+    /// option.
+    #[arg(long, allow_hyphen_values = true, value_parser = parse_positive_i32)]
+    pub(crate) fv_scale: Option<i32>,
+
     /// progress8kpabs coefficient file (`progress.bin`; f64 LE x 125388 = 81
-    /// king squares x 1548 KP-abs piece inputs). When omitted, every position
-    /// falls in bucket 4 (zero weights → `sigmoid(0) = 0.5`).
+    /// king squares x 1548 KP-abs piece inputs). When omitted in progress8kpabs
+    /// mode, every position falls in bucket 4 (zero weights → `sigmoid(0) =
+    /// 0.5`). Do not specify this option in kingrank9 mode.
     #[arg(long)]
     pub(crate) progress_coeff: Option<PathBuf>,
 
-    /// Bucket mode (only "progress8kpabs" is implemented).
+    /// Bucket assignment: `progress8kpabs` uses the KP-absolute progress model;
+    /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets.
     #[arg(long, default_value = "progress8kpabs")]
     pub(crate) bucket_mode: String,
 
@@ -553,9 +800,9 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = DEFAULT_L2_OUT)]
     pub(crate) l2: usize,
 
-    /// LayerStack output bucket count. Each position is routed to bucket
-    /// `min(N-1, floor(p * N))` where `p` is the progress estimate. Specify a
-    /// value in `[2, 9]`; the upper bound is the fixed 9-register accumulator
+    /// LayerStack output bucket count. In progress8kpabs mode, each position is
+    /// routed to `min(N-1, floor(p * N))` and N must be in `[2, 9]`. In
+    /// kingrank9 mode this value must be 9. The upper bound is the fixed 9-register accumulator
     /// in the per-bucket weight backward kernels. The default 9 keeps the
     /// binning and weight-buffer shape identical to the standard layout and
     /// resume-compatible with existing checkpoints. The historical 8-bucket
@@ -630,45 +877,20 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, value_enum, default_value_t = PsqtInit::Zeroed, requires = "psqt")]
     pub(crate) psqt_init: PsqtInit,
 
-    /// FT factorizer (training-time virtual features). **Default ON.** Pass
-    /// `--no-ft-factorize` to disable.
-    ///
-    /// The FT weight table gains a king-bucket-independent virtual row per
-    /// piece plane. Each virtual row accumulates the gradients of every real
-    /// row sharing its piece plane (~king-bucket-count times more data per
-    /// row), so rarely visited king-square cells inherit a sensible shared
-    /// prior instead of staying near their initial values. The virtual rows
-    /// are folded into the real rows when the quantised `.bin` is saved, so
-    /// the exported net is identical in shape to a non-factorized net and
-    /// inference engines need no changes.
-    ///
-    /// The sparse input stream is unchanged (the active-feature count stays
-    /// the base value); virtual rows are wired through two dense kernels per
-    /// optimizer step (a forward weight fold and a backward gradient
-    /// reduction), costing a single-digit percentage of training throughput
-    /// and zero inference cost.
-    ///
-    /// This flag is accepted for explicitness/back-compat but is redundant
-    /// with the default. `--psqt` and `--init-from` automatically disable the
-    /// factorizer (logged at startup): the separate PSQT shortcut block has no
-    /// virtual-row fold yet, and a quantised `.bin` has no virtual rows to
-    /// initialise from. Resume across the resulting on/off is rejected
-    /// (checkpoint dimensions differ).
-    #[arg(long = "ft-factorize", overrides_with = "no_ft_factorize")]
-    pub(crate) ft_factorize: bool,
-
-    /// Disable the FT factorizer (it is ON by default; see `--ft-factorize`).
-    /// Use this to train the non-factorized network. (The factorizer now
-    /// coexists with `--threat-profile`; `--psqt` and `--init-from` auto-disable
-    /// it.)
-    #[arg(long = "no-ft-factorize", overrides_with = "ft_factorize")]
-    pub(crate) no_ft_factorize: bool,
+    /// effect bucket FT factorizer sharing mode. `pool-buckets` shares one virtual row
+    /// for each piece across effect buckets; `per-bucket` keeps effect buckets
+    /// separate.
+    #[arg(long = "ft-factorize-effect-bucket-share", value_enum, default_value_t = EffectBucketFactorizeShare::PoolBuckets)]
+    pub(crate) ft_factorize_effect_bucket_share: EffectBucketFactorizeShare,
 
     /// Threat sparse feature profile. One of: off (default), full, same-class,
-    /// same-class-major-pawn, step-attacker, cross-side. When not `off`, threat edge features
-    /// (one piece attacking another) are concatenated after the base feature
-    /// transformer inputs, growing the FT input dimension and the active-feature
-    /// count. `off` is bit-identical to the base feature set.
+    /// same-class-major-pawn, step-attacker, full-symdedup, cross-side. When not
+    /// `off`, threat edge features (one piece attacking another) are concatenated
+    /// after the base feature transformer inputs, growing the FT input dimension
+    /// and the active-feature count. `off` is bit-identical to the base feature
+    /// set. `full-symdedup` shares `full`'s input dimension but drops each
+    /// symmetric-redundant edge (one side of a mutually-implied attack pair),
+    /// lowering the active-feature count without changing the index space.
     ///
     /// Threat coexists with the FT factorizer (the fold/reduce/coalesce paths
     /// stay within the base rows and never touch the threat block); it is still
@@ -679,18 +901,14 @@ pub(crate) struct LayerstackArgs {
     /// OOMs.
     #[arg(long = "threat-profile", default_value = "off")]
     pub(crate) threat_profile: String,
-}
 
-impl LayerstackArgs {
-    /// FT factorizer の実効 ON/OFF (default ON、`--no-ft-factorize` で OFF)。
-    /// `--ft-factorize` は back-compat の明示 ON で、`overrides_with` により
-    /// command-line 上で後勝ちする。`--psqt` / `--init-from` との排他は
-    /// 呼び出し側 (`run_training`) が auto-suppress で解決するため、ここには
-    /// 含めない (この値は「ユーザーが factorizer を望むか」だけを表す)。
-    #[cfg(any(feature = "gpu", test))]
-    pub(crate) fn ft_factorize_enabled(&self) -> bool {
-        !self.no_ft_factorize
-    }
+    /// effect bucket feature config. One of: off (default),
+    /// 2x2-kingfixed, 2x2-kingbucketed, 3x3-kingfixed,
+    /// 3x3-kingbucketed. effect bucket rewrites every base feature row as
+    /// `base_index * NB + bucket`, so it is mutually exclusive with
+    /// `--threat-profile` and `--psqt`.
+    #[arg(long = "effect-bucket", default_value = "off")]
+    pub(crate) effect_bucket_config: String,
 }
 
 /// PSQT shortcut の初期化方式。
@@ -700,6 +918,12 @@ pub(crate) enum PsqtInit {
     Zeroed,
     /// Pre-load PSQT with centipawn piece values / out_scaling (Material prior).
     Material,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum EffectBucketFactorizeShare {
+    PoolBuckets,
+    PerBucket,
 }
 
 /// Simple 4 層アーキ固有の引数。

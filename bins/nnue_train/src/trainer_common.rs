@@ -1,9 +1,50 @@
-use cuda_core::IntoResult as _;
 use gpu_runtime::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, LaunchConfig};
 use nnue_train::dataloader::Batch;
 use shogi_features::FeatureSetSpec;
 
 use crate::kernel_module::*;
+
+pub(crate) trait SaveQuantisedExport {
+    fn save_quantised_export<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        fv_scale: Option<i32>,
+        output_format: nnue_train::trainer::OutputFormat,
+    ) -> std::io::Result<()>;
+}
+
+impl SaveQuantisedExport for nnue_format::LayerStackWeights {
+    fn save_quantised_export<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        fv_scale: Option<i32>,
+        output_format: nnue_train::trainer::OutputFormat,
+    ) -> std::io::Result<()> {
+        match output_format {
+            nnue_train::trainer::OutputFormat::Tatara => self.save_quantised(writer, fv_scale),
+            nnue_train::trainer::OutputFormat::Yaneuraou => {
+                nnue_format::save_yaneuraou(writer, self)
+            }
+        }
+    }
+}
+
+impl SaveQuantisedExport for nnue_format::SimpleWeights {
+    fn save_quantised_export<W: std::io::Write>(
+        &self,
+        writer: &mut W,
+        _fv_scale: Option<i32>,
+        output_format: nnue_train::trainer::OutputFormat,
+    ) -> std::io::Result<()> {
+        match output_format {
+            nnue_train::trainer::OutputFormat::Tatara => self.save_quantised(writer),
+            nnue_train::trainer::OutputFormat::Yaneuraou => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "--output-format yaneuraou is supported only for the LayerStack architecture",
+            )),
+        }
+    }
+}
 
 /// GPU trainer の数値精度と optimizer state の形式を選択する。既定値はすべて無効。
 #[derive(Debug, Clone, Copy, Default)]
@@ -19,7 +60,7 @@ pub(crate) struct PrecisionFlags {
     pub(crate) fp16_opt_state: bool,
 }
 
-/// `ft_w` の Ranger moment (`m` / `v`) buffer。既定は `f32`、`--fp16-opt-state` で
+/// `ft_w` の optimizer moment (`m` / `v`) buffer。既定は `f32`、`--fp16-opt-state` で
 /// `f16` (格納時 scale 付き、[`radam_step_f16state`])。`ft_w` は 112.6M 要素で
 /// optimizer phase の DRAM traffic を占めるため `f16` 化の効果がある一方、他 9 group
 /// の moment は小さく `f16` 化の意味が無いので `f32` (`DeviceBuffer<f32>`) のまま。
@@ -102,9 +143,10 @@ pub(crate) struct BatchData<'a> {
     pub(crate) n_pos: usize,
     pub(crate) stm_indices: &'a [i32], // (n_pos × max_active)、-1 padding 可
     pub(crate) nstm_indices: &'a [i32],
+    pub(crate) nnz: &'a [i32], // (n_pos)、両 perspective 共通の実 active 数
     pub(crate) bucket_idx: &'a [i32], // (n_pos)、progress-kpabs が emit する 0..num_buckets-1
-    pub(crate) score: &'a [f32],      // (n_pos)、target eval cp の元
-    pub(crate) wdl: &'a [f32],        // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
+    pub(crate) score: &'a [f32], // (n_pos)、target eval cp の元
+    pub(crate) wdl: &'a [f32], // (n_pos)、0.0 (Loss) / 0.5 (Draw) / 1.0 (Win)
     pub(crate) per_pos_norm: f32, // 1/n_pos scalar (loss kernel が `norm[bi]` を本値の broadcast で読む)
 }
 
@@ -114,6 +156,7 @@ pub(crate) struct BatchDataOwned {
     pub(crate) n_pos: usize,
     pub(crate) stm_indices: Vec<i32>,
     pub(crate) nstm_indices: Vec<i32>,
+    pub(crate) nnz: Vec<i32>,
     pub(crate) bucket_idx: Vec<i32>,
     pub(crate) score: Vec<f32>,
     pub(crate) wdl: Vec<f32>,
@@ -126,6 +169,7 @@ impl BatchDataOwned {
             n_pos: n,
             stm_indices: &self.stm_indices,
             nstm_indices: &self.nstm_indices,
+            nnz: &self.nnz,
             bucket_idx: &self.bucket_idx,
             score: &self.score,
             wdl: &self.wdl,
@@ -166,6 +210,7 @@ impl BatchData<'_> {
             n_pos,
             stm_indices,
             nstm_indices,
+            nnz: vec![max_active as i32; n_pos],
             bucket_idx: vec![0_i32; n_pos],
             score: vec![0.0_f32; n_pos],
             wdl: vec![0.5_f32; n_pos],
@@ -219,6 +264,7 @@ impl BatchData<'_> {
             n_pos,
             stm_indices: &batch.stm_indices[..span],
             nstm_indices: &batch.nstm_indices[..span],
+            nnz: &batch.nnz[..n_pos],
             bucket_idx,
             score: &batch.score[..n_pos],
             wdl: &batch.wdl[..n_pos],
@@ -306,7 +352,12 @@ macro_rules! trainer_backend_impl {
                     .map_err(|e| std::io::Error::other(format!($flush_error, e)))
             }
 
-            fn save_checkpoint(&mut self, path: &std::path::Path) -> std::io::Result<()> {
+            fn save_checkpoint(
+                &mut self,
+                path: &std::path::Path,
+                fv_scale: Option<i32>,
+                output_format: nnue_train::trainer::OutputFormat,
+            ) -> std::io::Result<()> {
                 let weights = self
                     .$weights()
                     .map_err(|e| std::io::Error::other(format!($weights_error, e)))?;
@@ -316,7 +367,7 @@ macro_rules! trainer_backend_impl {
                     std::fs::create_dir_all(parent)?;
                 }
                 let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-                weights.save_quantised(&mut writer)?;
+                weights.save_quantised_export(&mut writer, fv_scale, output_format)?;
                 std::io::Write::flush(&mut writer)?;
                 Ok(())
             }
@@ -375,9 +426,9 @@ pub(crate) fn cfg_1d(n: usize) -> LaunchConfig {
 /// caller は out_dim がこれを超える層では generic `bias_grad` に fall back する。
 pub(crate) const DENSE_BIAS_GRAD_MAX_OUT: u32 = 256;
 
-/// Grid sizing 用の device occupancy パラメータ。`dense_bias_grad_tiled` の grid 上限を
-/// 実機の SM 数から導出するため、trainer 構築時に 1 度だけ問い合わせて保持する。特定
-/// GPU 固定の grid 上限を避けるためのもの。
+/// Grid sizing 用の device occupancy パラメータ。grid 上限を実機の SM 数から導出する
+/// ため、trainer 構築時に 1 度だけ問い合わせて保持する。特定 GPU 固定の grid 上限を
+/// 避けるためのもの。
 #[derive(Clone, Copy)]
 pub(crate) struct DeviceOccupancy {
     /// SM 数 (`CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT`)。
@@ -390,39 +441,19 @@ impl DeviceOccupancy {
     /// `ctx` の device から SM 数 / SM あたり thread 上限を問い合わせる。driver attribute
     /// 照会で kernel launch には非依存 (`CudaContext::compute_capability` と同経路)。
     pub(crate) fn query(ctx: &CudaContext) -> Result<Self, Box<dyn std::error::Error>> {
-        ctx.bind_to_thread()?;
-        let dev = ctx.cu_device();
-        let mut sm = std::mem::MaybeUninit::<i32>::uninit();
-        let mut threads = std::mem::MaybeUninit::<i32>::uninit();
-        // SAFETY: 出力先は MaybeUninit の有効ポインタ、属性 enum は driver の有効な ID、
-        // `dev` は `ctx` 由来の有効な CUdevice。`result()?` 成功時のみ assume_init する。
-        unsafe {
-            cuda_core::sys::cuDeviceGetAttribute(
-                sm.as_mut_ptr(),
-                cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-                dev,
-            )
-            .result()?;
-            cuda_core::sys::cuDeviceGetAttribute(
-                threads.as_mut_ptr(),
-                cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
-                dev,
-            )
-            .result()?;
-            Ok(Self {
-                sm_count: sm.assume_init().max(1) as u32,
-                max_threads_per_sm: threads.assume_init().max(1) as u32,
-            })
-        }
+        let (sm, threads) = gpu_runtime::device_occupancy_attributes(ctx)?;
+        Ok(Self {
+            sm_count: sm.max(1) as u32,
+            max_threads_per_sm: threads.max(1) as u32,
+        })
     }
 
     /// `block_dim` thread の block で全 SM を thread 占有上限まで埋める block 数
     /// `sm_count * floor(max_threads_per_sm / block_dim)`。grid をこれ以上に増やしても
-    /// occupancy は頭打ちで、`dense_bias_grad_tiled` では per-cell global atomic contention
-    /// (= gridDim) だけが増える。本 kernel の `block_dim` は常に ~128 以上 (`R * out_dim`、
-    /// `R` は 2 冪、`block_dim <= DENSE_BIAS_GRAD_MAX_OUT`) なので thread 占有が SM あたり
-    /// 常駐 block 数のハード上限より先に効き、その上限の別途クランプは要らない。
-    fn fill_blocks(self, block_dim: u32) -> u32 {
+    /// occupancy は頭打ちになる。caller の `block_dim` は常に ~128 以上なので thread
+    /// 占有が SM あたり常駐 block 数のハード上限より先に効き、その上限の別途クランプは
+    /// 要らない。
+    pub(crate) fn fill_blocks(self, block_dim: u32) -> u32 {
         let per_sm = (self.max_threads_per_sm / block_dim.max(1)).max(1);
         self.sm_count.saturating_mul(per_sm).max(1)
     }
@@ -480,7 +511,7 @@ pub(crate) fn cfg_norm_loss_reduce(n_groups: usize, group_len: usize) -> LaunchC
 /// `buf` の全 byte を 0 にする (stream 上、async)。`DeviceBuffer::zeroed` の
 /// 再 alloc を伴わず既存 buffer を in-place で reset するため (grad / `loss_acc` の
 /// 毎 step reset で `cudaMalloc`/`cudaFree` の stream stall を回避)。
-pub(crate) fn memset_zero<T>(
+pub(crate) fn memset_zero<T: Copy>(
     stream: &CudaStream,
     buf: &DeviceBuffer<T>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -490,9 +521,7 @@ pub(crate) fn memset_zero<T>(
         // 有効 device ptr、`stream` は同 context (`buf` も `stream` も `GpuTrainer` が
         // 同 context から作る)。`cuMemsetD8Async` は overlap を要求しない。0 fill は
         // f32/f64 ともに数値 0.0 を表すバイトパターン (全 0) なので型に依らず正しい。
-        unsafe {
-            cuda_core::memory::memset_d8_async(buf.cu_deviceptr(), 0, bytes, stream.cu_stream())?;
-        }
+        gpu_runtime::memset_d8_async(buf, 0, stream)?;
     }
     Ok(())
 }
@@ -509,14 +538,7 @@ pub(crate) fn memset_minus_one_i32(
         // SAFETY: [`memset_zero`] と同じ前提 — `buf.cu_deviceptr()` は本
         // `DeviceBuffer` が確保した `bytes` byte の有効 device ptr、`stream` は
         // 同 context。0xFF fill が i32 の -1 になる根拠は関数 doc を参照。
-        unsafe {
-            cuda_core::memory::memset_d8_async(
-                buf.cu_deviceptr(),
-                0xFF,
-                bytes,
-                stream.cu_stream(),
-            )?;
-        }
+        gpu_runtime::memset_d8_async(buf, 0xFF, stream)?;
     }
     Ok(())
 }
@@ -554,14 +576,7 @@ pub(crate) fn copy_host_to_device_async_i32(
     // event で slot 再利用を gate し、pageable 経路 (`BatchData` の slice) は
     // 「pageable src は staging へ copy してから return する」という CUDA Driver
     // API の同期挙動 (API synchronization behavior) に依る。
-    unsafe {
-        cuda_core::memory::memcpy_htod_async(
-            buf.cu_deviceptr(),
-            src.as_ptr(),
-            bytes,
-            stream.cu_stream(),
-        )?;
-    }
+    unsafe { gpu_runtime::memcpy_htod_async(buf, src, stream)? };
     Ok(())
 }
 
@@ -582,14 +597,7 @@ pub(crate) fn copy_host_to_device_async_f32(
     }
     // SAFETY: [`copy_host_to_device_async_i32`] と同じ前提 (assert 済み容量 +
     // 同 context + `src` 生存は caller 保証)。
-    unsafe {
-        cuda_core::memory::memcpy_htod_async(
-            buf.cu_deviceptr(),
-            src.as_ptr(),
-            bytes,
-            stream.cu_stream(),
-        )?;
-    }
+    unsafe { gpu_runtime::memcpy_htod_async(buf, src, stream)? };
     Ok(())
 }
 
@@ -638,7 +646,7 @@ unsafe extern "C" {
     fn cublasDestroy_v2(handle: cublasHandle_t) -> cublasStatus_t;
     fn cublasSetStream_v2(
         handle: cublasHandle_t,
-        stream_id: cuda_core::sys::CUstream,
+        stream_id: *mut std::os::raw::c_void,
     ) -> cublasStatus_t;
     fn cublasSetMathMode(handle: cublasHandle_t, mode: cublasMath_t) -> cublasStatus_t;
     fn cublasSgemm_v2(
@@ -692,8 +700,7 @@ impl CublasHandle {
             return Err(format!("cublasCreate_v2 failed: status={status}").into());
         }
         // SAFETY: handle is valid (above), stream.cu_stream() returns the wrapped CUstream。
-        let status =
-            unsafe { cublasSetStream_v2(handle, stream.cu_stream() as cuda_core::sys::CUstream) };
+        let status = unsafe { cublasSetStream_v2(handle, stream.cu_stream().cast()) };
         if status != CUBLAS_STATUS_SUCCESS {
             // SAFETY: handle is valid (cleanup before erroring).
             unsafe {
@@ -916,16 +923,9 @@ impl AsyncLossRing {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut pinned = [std::ptr::null_mut::<f64>(); 2];
         for slot in pinned.iter_mut() {
-            let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
-            // SAFETY: cuMemHostAlloc は page-locked host memory を 8 byte 確保、
-            // failure 時は CUresult != SUCCESS を返す (.result()? で check)。
+            // SAFETY: allocation ownership transfers to this ring and Drop releases it after sync.
+            let p = unsafe { gpu_runtime::alloc_pinned_host(std::mem::size_of::<f64>())? };
             unsafe {
-                cuda_core::sys::cuMemHostAlloc(
-                    &mut p as *mut _,
-                    std::mem::size_of::<f64>(),
-                    cuda_core::sys::CU_MEMHOSTALLOC_PORTABLE,
-                )
-                .result()?;
                 // 初期値 0 (warmup で読まれないが defensive)
                 std::ptr::write(p as *mut f64, 0.0);
             }
@@ -953,11 +953,10 @@ impl AsyncLossRing {
         // loss_acc has len == 1 (= 8 bytes), stream 上 in-order なので async D2H は
         // 直前の memset/atomic 完了後に実行される。
         unsafe {
-            cuda_core::memory::memcpy_dtoh_async(
-                self.pinned[cur],
-                loss_acc.cu_deviceptr(),
-                std::mem::size_of::<f64>(),
-                stream.cu_stream(),
+            gpu_runtime::memcpy_dtoh_async(
+                std::slice::from_raw_parts_mut(self.pinned[cur], 1),
+                loss_acc,
+                stream,
             )?;
         }
         self.events[cur].record(stream)?;
@@ -1016,7 +1015,7 @@ impl Drop for AsyncLossRing {
                 // SAFETY: cuMemHostAlloc で確保した pointer は cuMemFreeHost で解放する。
                 // 上の event sync で in-flight D2H が完了済。
                 unsafe {
-                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                    let _ = gpu_runtime::free_pinned_host((*slot).cast());
                 }
             }
         }
@@ -1041,10 +1040,11 @@ impl Drop for AsyncLossRing {
 /// compute stream に待たせる。
 pub(crate) struct InputUploadRing {
     pub(crate) copy_stream: std::sync::Arc<CudaStream>,
-    // pinned host staging。stm/nstm は `batch * max_active`、bucket/score/wdl は `batch`。
+    // pinned host staging。stm/nstm は `batch * max_active`、nnz/bucket/score/wdl は `batch`。
     // bucket は LayerStack のみ持ち、Simple アーキは bucket-less 入力なので `None`。
     pinned_stm: [*mut i32; 2],
     pinned_nstm: [*mut i32; 2],
+    pinned_nnz: [*mut i32; 2],
     pinned_bucket: Option<[*mut i32; 2]>,
     pinned_score: [*mut f32; 2],
     pinned_wdl: [*mut f32; 2],
@@ -1057,7 +1057,7 @@ pub(crate) struct InputUploadRing {
     step_done: [CudaEvent; 2],
     /// stm/nstm pinned の要素容量 (`batch * max_active`)。
     cap_idx: usize,
-    /// bucket/score/wdl pinned の要素容量 (`batch`)。
+    /// nnz/bucket/score/wdl pinned の要素容量 (`batch`)。
     cap_scalar: usize,
     step: usize,
 }
@@ -1109,6 +1109,7 @@ impl InputUploadRing {
             copy_stream,
             pinned_stm: alloc_pinned_host::<i32>(cap_idx)?,
             pinned_nstm: alloc_pinned_host::<i32>(cap_idx)?,
+            pinned_nnz: alloc_pinned_host::<i32>(cap_scalar)?,
             pinned_bucket,
             pinned_score: alloc_pinned_host::<f32>(cap_scalar)?,
             pinned_wdl: alloc_pinned_host::<f32>(cap_scalar)?,
@@ -1120,7 +1121,7 @@ impl InputUploadRing {
         })
     }
 
-    /// `batch` の入力 5 slice を pinned 経由で `dev_*` (caller が swap で active 化した
+    /// `batch` の入力 6 slice を pinned 経由で `dev_*` (caller が swap で active 化した
     /// device buffer) へ copy stream で async H2D し、`compute_stream` に H2D 完了を
     /// 待たせる。
     ///
@@ -1135,6 +1136,8 @@ impl InputUploadRing {
         h_stm: &[i32],
         dev_nstm: &DeviceBuffer<i32>,
         h_nstm: &[i32],
+        dev_nnz: &DeviceBuffer<i32>,
+        h_nnz: &[i32],
         dev_bucket: &DeviceBuffer<i32>,
         h_bucket: &[i32],
         dev_score: &DeviceBuffer<f32>,
@@ -1150,6 +1153,7 @@ impl InputUploadRing {
         );
         assert!(
             h_bucket.len() <= self.cap_scalar
+                && h_nnz.len() <= self.cap_scalar
                 && h_score.len() <= self.cap_scalar
                 && h_wdl.len() <= self.cap_scalar,
             "input batch (scalar) exceeds pinned capacity {}",
@@ -1178,6 +1182,7 @@ impl InputUploadRing {
         unsafe {
             std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
             std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
+            std::ptr::copy_nonoverlapping(h_nnz.as_ptr(), self.pinned_nnz[slot], h_nnz.len());
             std::ptr::copy_nonoverlapping(h_bucket.as_ptr(), pinned_bucket[slot], h_bucket.len());
             std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
             std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
@@ -1197,6 +1202,11 @@ impl InputUploadRing {
                 cs,
                 dev_nstm,
                 std::slice::from_raw_parts(self.pinned_nstm[slot], h_nstm.len()),
+            )?;
+            copy_host_to_device_async_i32(
+                cs,
+                dev_nnz,
+                std::slice::from_raw_parts(self.pinned_nnz[slot], h_nnz.len()),
             )?;
             copy_host_to_device_async_i32(
                 cs,
@@ -1220,7 +1230,8 @@ impl InputUploadRing {
         Ok(())
     }
 
-    /// Simple アーキ用 upload: bucket buffer を持たない 4 buffer 版 (stm/nstm/score/wdl)。
+    /// Simple アーキ用 upload: bucket buffer を持たない 5 buffer 版
+    /// (stm/nstm/nnz/score/wdl)。
     /// 動作セマンティクスは [`upload`](Self::upload) と同じ — caller が active/back を
     /// `mem::swap` 済の `dev_*` に対し pinned 経由 copy stream で先行 H2D し、compute
     /// stream に H2D 完了を待たせる。
@@ -1232,6 +1243,8 @@ impl InputUploadRing {
         h_stm: &[i32],
         dev_nstm: &DeviceBuffer<i32>,
         h_nstm: &[i32],
+        dev_nnz: &DeviceBuffer<i32>,
+        h_nnz: &[i32],
         dev_score: &DeviceBuffer<f32>,
         h_score: &[f32],
         dev_wdl: &DeviceBuffer<f32>,
@@ -1249,7 +1262,9 @@ impl InputUploadRing {
             self.cap_idx
         );
         assert!(
-            h_score.len() <= self.cap_scalar && h_wdl.len() <= self.cap_scalar,
+            h_nnz.len() <= self.cap_scalar
+                && h_score.len() <= self.cap_scalar
+                && h_wdl.len() <= self.cap_scalar,
             "input batch (scalar) exceeds pinned capacity {}",
             self.cap_scalar
         );
@@ -1263,6 +1278,7 @@ impl InputUploadRing {
         unsafe {
             std::ptr::copy_nonoverlapping(h_stm.as_ptr(), self.pinned_stm[slot], h_stm.len());
             std::ptr::copy_nonoverlapping(h_nstm.as_ptr(), self.pinned_nstm[slot], h_nstm.len());
+            std::ptr::copy_nonoverlapping(h_nnz.as_ptr(), self.pinned_nnz[slot], h_nnz.len());
             std::ptr::copy_nonoverlapping(h_score.as_ptr(), self.pinned_score[slot], h_score.len());
             std::ptr::copy_nonoverlapping(h_wdl.as_ptr(), self.pinned_wdl[slot], h_wdl.len());
         }
@@ -1279,6 +1295,11 @@ impl InputUploadRing {
                 cs,
                 dev_nstm,
                 std::slice::from_raw_parts(self.pinned_nstm[slot], h_nstm.len()),
+            )?;
+            copy_host_to_device_async_i32(
+                cs,
+                dev_nnz,
+                std::slice::from_raw_parts(self.pinned_nnz[slot], h_nnz.len()),
             )?;
             copy_host_to_device_async_f32(
                 cs,
@@ -1324,13 +1345,14 @@ impl Drop for InputUploadRing {
             .pinned_stm
             .iter()
             .chain(self.pinned_nstm.iter())
+            .chain(self.pinned_nnz.iter())
             .chain(bucket_slots.iter())
         {
             if !slot.is_null() {
                 // SAFETY: cuMemHostAlloc で確保した pointer を cuMemFreeHost で解放。
                 // 上の copy stream sync で in-flight H2D は完了済。
                 unsafe {
-                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                    let _ = gpu_runtime::free_pinned_host((*slot).cast());
                 }
             }
         }
@@ -1338,7 +1360,7 @@ impl Drop for InputUploadRing {
             if !slot.is_null() {
                 // SAFETY: 同上。
                 unsafe {
-                    cuda_core::sys::cuMemFreeHost(*slot as *mut std::os::raw::c_void);
+                    let _ = gpu_runtime::free_pinned_host((*slot).cast());
                 }
             }
         }
@@ -1349,17 +1371,8 @@ impl Drop for InputUploadRing {
 pub(crate) fn alloc_pinned_host<T>(n: usize) -> Result<[*mut T; 2], Box<dyn std::error::Error>> {
     let mut out = [std::ptr::null_mut::<T>(); 2];
     for slot in out.iter_mut() {
-        let mut p: *mut std::os::raw::c_void = std::ptr::null_mut();
-        // SAFETY: cuMemHostAlloc は page-locked host memory を `n * size_of::<T>()` byte
-        // 確保、失敗時は CUresult != SUCCESS を返す (.result()? で check)。
-        unsafe {
-            cuda_core::sys::cuMemHostAlloc(
-                &mut p as *mut _,
-                n * std::mem::size_of::<T>(),
-                cuda_core::sys::CU_MEMHOSTALLOC_PORTABLE,
-            )
-            .result()?;
-        }
+        // SAFETY: allocation ownership transfers to the returned slot array.
+        let p = unsafe { gpu_runtime::alloc_pinned_host(n * std::mem::size_of::<T>())? };
         *slot = p as *mut T;
     }
     Ok(out)

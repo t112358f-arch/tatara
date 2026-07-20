@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# cuda-oxide の kernel ビルドツール `cargo-oxide` を、本リポジトリが pin して
-# いる cuda-oxide の git rev に合わせて install するセットアップスクリプト。
+# cuda-oxide の kernel ビルドツール `cargo-oxide` と、その codegen backend
+# cache (`~/.cargo/cuda-oxide/`) を、本リポジトリが pin している cuda-oxide の
+# git rev に揃えるセットアップスクリプト。
 #
 # GPU kernel は cuda-oxide の rustc codegen backend で PTX 化する。その backend
 # を駆動する cargo subcommand `cargo-oxide` は、本リポジトリの依存 (cuda-core 等)
@@ -8,15 +9,17 @@
 # 不要で、upstream が公式サポートする `cargo install --git` を使う。rev は
 # Cargo.lock が固定している cuda-oxide の rev をそのまま使い、library 側と
 # codegen backend 側を同一 rev に揃える (rev ずれは codegen backend の ABI 不一致
-# を招く)。
+# を招く)。CLI 本体だけでなく codegen backend の cache 自体も pin rev に揃える
+# 理由は本文中のコメントを参照。
 #
 # このスクリプトはシステムパッケージ (CUDA / LLVM / clang) を install しない。
 # 不足はチェックして報告するだけなので、導入手順は docs/setup.md を参照。
 #
 # 使い方:
-#   bash scripts/setup-cuda-oxide.sh   # cargo-oxide を pin rev で install + 環境診断
+#   bash scripts/setup-cuda-oxide.sh   # cargo-oxide + backend cache を pin rev に揃えて環境診断
 #
-# cargo-oxide は毎回 pin rev で入れ直すため、cuda-oxide rev を bump した後も
+# 毎回 pin rev に揃え直す (一致していれば no-op) ため、cuda-oxide rev を
+# bump した後や、意味不明な device codegen エラーに遭遇したときは、まず
 # 同じコマンドを再実行すればよい。
 set -euo pipefail
 
@@ -25,14 +28,16 @@ cd "$(dirname "$0")/.."
 CUDA_OXIDE_GIT="https://github.com/NVlabs/cuda-oxide.git"
 
 # pin している cuda-oxide rev を Cargo.lock から読む。rev の単一情報源は root
-# Cargo.toml の [workspace.dependencies] で、Cargo.lock はその解決結果。
+# Cargo.toml の [workspace.dependencies] で、Cargo.lock はその解決結果。short rev
+# は `cargo install --rev` に、full rev (40 桁 SHA) は後段の backend cache 検証に使う。
 rev="$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+' Cargo.lock | sed 's/.*rev=//' || true)"
-if [[ -z "$rev" ]]; then
+full_rev="$(grep -m1 -oE 'cuda-oxide\.git\?rev=[0-9a-f]+#[0-9a-f]+' Cargo.lock | sed -E 's/.*#//' || true)"
+if [[ -z "$rev" || -z "$full_rev" ]]; then
   echo "ERROR: Cargo.lock から cuda-oxide の rev を取得できませんでした。" >&2
   echo "       リポジトリ root で、cuda-oxide を依存に持つ状態で実行してください。" >&2
   exit 1
 fi
-echo "cuda-oxide pinned rev: $rev"
+echo "cuda-oxide pinned rev: $rev ($full_rev)"
 echo
 
 # ホスト前提のチェック (報告のみ、install はしない)。
@@ -72,16 +77,31 @@ if [[ "$missing" -ne 0 ]]; then
   echo
 fi
 
-# cargo-oxide を pin rev で install する。既に別 rev が入っていると codegen
-# backend の ABI がずれるため、毎回 --force で pin rev に入れ直す (cargo-oxide
-# 本体は小さく rebuild は数秒)。skip 判定で別 rev を見逃さないための方針。
 cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
-echo "cargo-oxide を install します: cargo install --git ... --rev $rev"
-cargo install --git "$CUDA_OXIDE_GIT" --rev "$rev" cargo-oxide --force
+oxide="$cargo_bin/cargo-oxide"
+cli_stamp_file="$cargo_bin/.cargo-oxide-pin-stamp"
+current_cli_stamp=""
+if [[ -x "$oxide" && -f "$cli_stamp_file" ]]; then
+  current_cli_hash="$(sha256sum "$oxide" | awk '{print $1}')"
+  current_cli_stamp="$(cat "$cli_stamp_file")"
+fi
+
+# cargo-oxide は CLI binary が backend cache より新しいと cache を無効化する。
+# 同じ rev を --force で再 install して binary の更新時刻だけを進めないよう、
+# pin rev と binary hash の stamp が一致する場合は install を省略する。
+if [[ "$current_cli_stamp" == "$full_rev|${current_cli_hash:-}" ]]; then
+  echo "cargo-oxide CLI は pin rev と一致済み ($rev) — 再 install を skip"
+else
+  echo "cargo-oxide を install します: cargo install --git ... --rev $rev"
+  cargo install --git "$CUDA_OXIDE_GIT" --rev "$rev" cargo-oxide --force
+  if [[ -x "$oxide" ]]; then
+    cli_hash="$(sha256sum "$oxide" | awk '{print $1}')"
+    echo "$full_rev|$cli_hash" > "$cli_stamp_file"
+  fi
+fi
 echo
 
 # install 先 ($cargo_bin/cargo-oxide) が PATH 上で解決されるか確認する。
-oxide="$cargo_bin/cargo-oxide"
 oxide_on_path="$(command -v cargo-oxide || true)"
 if [[ -z "$oxide_on_path" ]]; then
   echo "WARN: cargo-oxide が PATH にありません。次を shell rc に追加してください:"
@@ -93,8 +113,79 @@ elif [[ "$oxide_on_path" != "$oxide" ]]; then
   echo
 fi
 
-# 環境診断。install したばかりの pin rev の cargo-oxide で実行する。初回は
-# codegen backend を自動で取得・ビルドしてキャッシュするため時間がかかる。
+# cargo-oxide 本体 (`cargo install --rev`) と codegen backend の実体は別物。
+# backend は `~/.cargo/cuda-oxide/` に一度だけ (`main` HEAD の unpinned shallow
+# clone で) fetch・build・cache され、以降は存在するかどうかしか見ない —
+# つまり CLI を pin rev で入れ直しても、初回 fetch 時点の main HEAD のままの
+# backend が黙って使われ続けうる。この不一致は host/GPU/LLVM のバージョン差では
+# 出ず、cuda-oxide 自身のこの cache 設計に起因する device codegen の不可解な
+# 失敗として現れる。ここでは cache が指す rev + rustc nightly version (backend
+# .so は正確な nightly ABI に紐づくため) を stamp file に記録し、pin と食い違う
+# ときだけ cache 全体を破棄して pin rev で再取得する。`doctor` が cache 不在を
+# `cargo oxide setup` が提供する backend build 経路を使い、独自の build
+# コマンドは持たない。
+# CUDA_OXIDE_BACKEND は実在ファイルを指すときだけ backend override として有効。
+# cargo-oxide の resolver は不在パスを指す値には警告を出して cache / auto-fetch
+# に fallback するため、そのまま override 扱いすると下の pin 検証を skip した上で
+# cargo-oxide が unpinned cache を黙って使い、この script が防ぎたい version skew を
+# 見逃す。不在パス (typo / 別マシン由来の stale な shell var) は override 無効と
+# みなし、pin 検証を通常どおり走らせる。
+oxide_backend_override=""
+if [[ -n "${CUDA_OXIDE_BACKEND:-}" ]]; then
+  if [[ -e "$CUDA_OXIDE_BACKEND" ]]; then
+    oxide_backend_override="$CUDA_OXIDE_BACKEND"
+    echo "WARN: CUDA_OXIDE_BACKEND=$CUDA_OXIDE_BACKEND が設定されています。"
+    echo "      この env var は下記の pin 検証より優先されるため、以降の"
+    echo "      backend cache 検証は skip されます。"
+    echo
+  else
+    echo "WARN: CUDA_OXIDE_BACKEND=$CUDA_OXIDE_BACKEND が存在しません。cargo-oxide は"
+    echo "      不在パスを無視して cache / auto-fetch に fallback するため、この値は"
+    echo "      override として扱わず backend cache の pin 検証を通常どおり実行します。"
+    echo
+  fi
+fi
+
+backend_cache_dir="${CARGO_HOME:-$HOME/.cargo}/cuda-oxide"
+backend_src_dir="$backend_cache_dir/src"
+backend_so="$backend_cache_dir/librustc_codegen_cuda.so"
+stamp_file="$backend_cache_dir/.pin-stamp"
+expected_stamp="$full_rev|$(rustc --version)"
+
+if [[ -z "$oxide_backend_override" ]]; then
+  current_stamp=""
+  [[ -f "$stamp_file" ]] && current_stamp="$(cat "$stamp_file")"
+  current_source_rev=""
+  if [[ -d "$backend_src_dir" ]]; then
+    current_source_rev="$(git -C "$backend_src_dir" rev-parse HEAD 2>/dev/null || true)"
+  fi
+  if [[ "$current_stamp" == "$expected_stamp" && "$current_source_rev" == "$full_rev" ]]; then
+    echo "cuda-oxide backend cache は pin rev と一致済み ($rev) — 再取得を skip"
+  else
+    echo "cuda-oxide backend cache が pin rev と不一致 (または未取得) — 破棄して"
+    echo "rev $rev で取り直します。"
+    rm -rf "$backend_cache_dir"
+    mkdir -p "$backend_src_dir"
+    git -C "$backend_src_dir" init -q
+    git -C "$backend_src_dir" remote add origin "$CUDA_OXIDE_GIT"
+    if ! git -C "$backend_src_dir" fetch --depth 1 origin "$full_rev" -q \
+        || ! git -C "$backend_src_dir" checkout -q FETCH_HEAD; then
+      echo "ERROR: cuda-oxide rev $full_rev の fetch に失敗しました。ネットワーク/rev を確認してください。" >&2
+      exit 1
+    fi
+  fi
+  echo
+fi
+
+# install した pin rev の source から backend を build する。`doctor` は診断専用で
+# backend を build しないため、cache が無い場合は明示的に `setup` を実行する。
+if [[ -z "$oxide_backend_override" && ! -f "$backend_so" && -x "$oxide" ]]; then
+  echo "cuda-oxide codegen backend を build します:"
+  "$oxide" setup
+  echo
+fi
+
+# 環境診断。install したばかりの pin rev の cargo-oxide で実行する。
 if [[ -x "$oxide" ]]; then
   echo "cargo-oxide doctor:"
   doctor_status=0
@@ -105,6 +196,19 @@ if [[ -x "$oxide" ]]; then
   fi
 else
   echo "WARN: $oxide が見つからないため doctor を skip しました。"
+fi
+
+# backend .so が実際に存在するかどうかで stamp を書く。doctor の他項目
+# (nvcc 等) の成否とは独立 — .so の有無だけが pin 一致の根拠になる。
+if [[ -z "${CUDA_OXIDE_BACKEND:-}" ]]; then
+  if [[ -f "$backend_so" ]]; then
+    echo "$expected_stamp" > "$stamp_file"
+    echo "cuda-oxide backend cache を pin rev ($rev) で確認、stamp を更新しました。"
+  else
+    echo "WARN: $backend_so が見つからないため pin stamp を書けませんでした。"
+    echo "      上記の doctor 出力を確認し、解消後にこのスクリプトを再実行してください。"
+  fi
+  echo
 fi
 
 echo

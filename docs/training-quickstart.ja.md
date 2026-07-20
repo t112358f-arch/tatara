@@ -18,7 +18,7 @@
 | ファイル | 形式 | 用途 | サイズ目安 |
 |---|---|---|---:|
 | 教師データ PSV | `PackedSfenValue` × N (40 bytes 固定 / 局面) | `--data` で渡す | 数百 GB |
-| progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | `--progress-coeff` で渡す。LayerStack の 9 bucket 振り分け用 (simple では不要) | 1.0 MB |
+| progress 係数 | `progress.bin` (f64 LE、玉 81 マス × KP-abs 駒入力 1548 = `1_003_104` bytes 固定) | LayerStack の `progress8kpabs` mode で `--progress-coeff` に渡す。`kingrank9` と simple では不要 | 1.0 MB |
 | (任意) pretrained NNUE | 量子化 `.bin` (`save_quantised` 形式) | `--init-from` で weight 注入 (optimizer は reset) | — |
 
 ## 例 1: HalfKP NNUE を学習 (simple アーキ)
@@ -32,18 +32,29 @@ target/release/nnue-train \
   --feature-set halfkp \
   --superbatches <N> \
   --threads <N> \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple
 ```
+
+`simple` トレーナは `--win-rate-model` が必須。int8 の出力層は plain sigmoid loss
+が収束する centipawn スケールの出力を表現できないため、plain sigmoid 経路は起動時に
+reject される。上記の `--wrm-*` 値は WRM を plain sigmoid へ恒等退化させる設定で、
+`--scale` と各 `--wrm-*-scaling` / `--wrm-nnue2score` は同じ値に揃える (simple は
+書き出す `fv_scale` を `--scale` から算出するため)。
 
 `simple` は既定で `--arch 256x2-32-32` / `--activation crelu`。`--superbatches`
 の決め方と、追加で指定できる option は下記「主な option」を参照。
 
 ## 例 2: LayerStack NNUE を学習
 
-`layerstack` アーキは局面進行度の 9 bucket を使うため、先に bucket 係数
-`progress.bin` を用意する——`progress-kpabs-train` で学習し、`progress-bucket-survey`
-で bucket 分布を確認する。手順は
+`layerstack` アーキには 2 つの bucket mode がある。既定の `progress8kpabs` は
+局面進行度を 2–9 bucket に分けるため、`progress-kpabs-train` で `progress.bin` を
+学習し、`progress-bucket-survey` で分布を確認する。手順は
 [局面進行度 bucket: `progress.bin` の用意](progress-bin.ja.md) を参照。
+`kingrank9` は YaneuraOu KingRank9 と同じく、双方の玉段を手番側視点へ正規化して
+3x3 の固定 9 bucket に分ける。この mode では `progress.bin` は使わない。
 
 ### 学習
 
@@ -54,6 +65,12 @@ target/release/nnue-train \
   --superbatches <N> \
   --threads <N> \
   layerstack --progress-coeff <path/to/progress.bin>
+```
+
+KingRank9 を使う場合は末尾を次のように置き換える:
+
+```bash
+  layerstack --bucket-mode kingrank9 --num-buckets 9
 ```
 
 `layerstack` は既定で `--feature-set halfka-hm-merged` / 9 bucket。FT 出力次元は `--ft-out`(128 の倍数、既定 1536)で変えられる。
@@ -69,12 +86,15 @@ target/release/nnue-train \
 | `--batch-size` | 16384 | 勾配更新 1 回あたりの局面数。GPU throughput と学習特性 (勾配のばらつき・更新回数) の両方に効く学習ハイパーパラメータ |
 | `--feature-set` | halfka-hm-merged | 入力 feature set。`halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` から選ぶ ([README](../README.ja.md) 参照) |
 | `--keep-checkpoints` | 全保持 | raw `.ckpt` (weight + optimizer state) を直近 N 個に保つ。既定の全保持が学習失敗の追跡には無難。ただし `--save-rate 20` で 400 sb 学習すると `.ckpt` 20 本 × 約 1.8 GB (既定 LayerStack アーキ) ≈ 36 GB になるため、ストレージが逼迫する場合は制限する。量子化 `.bin` は常に全保持 |
-| `--win-rate-model` | OFF | WRM (win-rate-model) loss。`net_output ≈ cp/600` で収束し量子化 (`QA=127 / QB=64 / FV_SCALE=28`) と整合する。量子化推論向けの net を学習するなら追加する (未指定なら plain sigmoid-MSE)。loss の調整パラメータは [WRM loss のチューニング](wrm-loss-tuning.ja.md) を参照 |
+| `--win-rate-model` | OFF (layerstack) / 必須 (simple) | WRM (win-rate-model) loss。`net_output ≈ cp / --wrm-nnue2score` で収束する。`layerstack` では任意 (未指定なら plain sigmoid-MSE)。`simple` トレーナは必須で、さらに `--scale = --wrm-nnue2score` が必要 (`--scale` が export の `fv_scale` を決めるため)。上の例は両方を 290 とし、`FV_SCALE=28` になる。loss の調整パラメータは [WRM loss のチューニング](wrm-loss-tuning.ja.md) を参照 |
+| `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99) / `radam` (lookahead なしの rectified Adam, beta1=0.9) / `adamw` (bias correction なしの Adam, beta1=0.9) から選ぶ。raw `.ckpt` からの `--resume` 時は元 run と同じ値を渡す |
 | `--score-drop-abs` | なし | `|score| >=` この値の局面を loss から除外する (詰み近傍の極端な評価値を弾く) |
+| `--score-clamp-abs` | なし | drop を生き残った局面の score を `[-N, N]` に飽和させる (教師の clip 上限違いを単一上限へ正規化する) |
 | `--threads` | 16 | **必ず設定する。** GPU 処理が高速なため CPU データローダーが律速になりやすく、大き目の値を推奨。CPU 物理コア数を目安にし、小さい値 (例: 1) だと pos/s が大幅に低下する。`NNUE_TRAIN_STEP_PROFILE=1` で h2d / fwd / bwd / optimizer の内訳を確認しながら調整する |
 | `--test-tail-positions` | なし | `--data` の末尾 N 局面を同一ファイル内の held-out 検証集合として確保する (下記「held-out validation」参照)。held-out validation を有効化したいときの推奨経路 |
 | `--test-positions` | 10000 | held-out source から毎 superbatch 評価する局面数。`--test-tail-positions` または `--test-data` 指定時のみ有効 |
-| `--num-buckets` (`layerstack`) | 9 | LayerStack の output bucket 数、`[2, 9]` の整数。各局面は `min(N-1, floor(progress * N))` で routing される。低い N は bucket 1 個あたりのサンプル数が増える代わりに局面別特殊化が緩む。既定 9 は既存配布 net と同じ binning |
+| `--bucket-mode` (`layerstack`) | progress8kpabs | `progress8kpabs` は KP-absolute 進行度で routing する。`kingrank9` は YaneuraOu KingRank9 と同じ固定 9 bucket で、`--progress-coeff` との併用はエラー |
+| `--num-buckets` (`layerstack`) | 9 | `progress8kpabs` では `[2, 9]` の整数で、各局面を `min(N-1, floor(progress * N))` へ routing する。`kingrank9` では 9 固定 |
 
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 などは既定のままでよく、変えたいときだけ渡す。
@@ -97,7 +117,7 @@ validation を有効化する。勾配更新に一切使わない局面を毎 su
 
 ## 学習中断・再開
 
-raw `.ckpt` は **weight + Ranger optimizer state (m / v / slow / step) + 現在の
+raw `.ckpt` は **weight + optimizer state (m / v / slow / step) + 現在の
 superbatch 番号** を全部保存する。電源断や GPU エラーで止まっても完全に再開
 できる。学習時と同じ option + アーキ サブコマンドに `--resume` を足す:
 
@@ -106,6 +126,9 @@ target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
   --output checkpoints/<run-name> --net-id <run-name> \
   --feature-set halfkp --superbatches <N> --keep-checkpoints 4 \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   --resume checkpoints/<run-name>/<run-name>-<sb>.ckpt \
   simple
 ```
@@ -154,6 +177,9 @@ target/release/nnue-train --data <PSV> \
   --output /tmp/smoke --net-id smoke \
   --superbatches 1 --batches-per-superbatch 3 \
   --save-rate 1 --threads 4 \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple
 ```
 

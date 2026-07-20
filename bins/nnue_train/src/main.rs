@@ -1,4 +1,10 @@
 #![cfg_attr(feature = "gpu", feature(f16))]
+// Native launch argument encoding borrows writable buffers immutably; the same source needs `mut`
+// for cuda-oxide's typed macro, so those bindings appear unused only in the native-host build.
+#![cfg_attr(
+    feature = "native-cuda-host",
+    allow(dead_code, unused_imports, unused_mut)
+)]
 //! `bins/nnue_train` binary entry point — NNUE trainer。
 //!
 //! 本 file は bin entry point (`fn main`) と module 宣言を持つ。`#[kernel]` device
@@ -19,12 +25,18 @@ use clap::Parser;
 
 mod arch;
 #[cfg(any(feature = "gpu", test))]
+mod bench_pos;
+#[cfg(any(feature = "gpu", test))]
 mod ckpt;
 mod cli;
 #[cfg(feature = "gpu")]
-mod kernel_module;
+mod ft_factorize_host;
 #[cfg(feature = "gpu")]
+mod kernel_module;
+#[cfg(feature = "cuda-oxide")]
 mod kernels;
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+mod native_bench;
 #[cfg(feature = "gpu")]
 mod smoke;
 #[cfg(feature = "gpu")]
@@ -49,7 +61,7 @@ use training::run_training;
 // `cuda_launch!` 呼出側 (trainer / smoke / tests) は `use crate::*;` で `#[kernel]`
 // marker 型 (`__<name>_CudaKernel`) を解決する。`kernels` module の marker を crate
 // root から見えるよう re-export する。
-#[cfg(feature = "gpu")]
+#[cfg(feature = "cuda-oxide")]
 pub(crate) use kernels::*;
 
 #[cfg(feature = "gpu")]
@@ -59,7 +71,24 @@ fn main() -> std::process::ExitCode {
     // 読まない経路 (norm-dump / --test-data 評価) を持つため、--data 不在でも
     // run_training に dispatch する。--data の有無だけで分けると、これらを指定しても
     // smoke test に落ちて何もせず成功扱いになる。
-    let result = if cli.data.is_some()
+    #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+    let result = if let cli::ArchCommand::BenchPos(args) = &cli.arch {
+        bench_pos::run(args)
+    } else if let cli::ArchCommand::NativeBench(args) = &cli.arch {
+        native_bench::run(args, cli.batch_size)
+    } else if cli.data.is_some()
+        || cli.eval_only
+        || cli.threat_ablate.is_some()
+        || cli.threat_norm_dump
+    {
+        run_training(&cli)
+    } else {
+        smoke_test(cli.arch.kind())
+    };
+    #[cfg(not(any(feature = "native-cuda", feature = "native-cuda-host")))]
+    let result = if let cli::ArchCommand::BenchPos(args) = &cli.arch {
+        bench_pos::run(args)
+    } else if cli.data.is_some()
         || cli.eval_only
         || cli.threat_ablate.is_some()
         || cli.threat_norm_dump

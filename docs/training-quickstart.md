@@ -21,7 +21,7 @@ examples:
 | File | Format | Purpose | Approx. size |
 |---|---|---|---:|
 | Training data PSV | `PackedSfenValue` × N (fixed 40 bytes / position) | Passed via `--data` | Hundreds of GB |
-| progress coefficients | `progress.bin` (f64 LE; 81 king squares × 1548 KP-abs piece inputs = fixed `1_003_104` bytes) | Passed via `--progress-coeff`. For LayerStack's 9-bucket assignment (not needed for simple) | 1.0 MB |
+| progress coefficients | `progress.bin` (f64 LE; 81 king squares × 1548 KP-abs piece inputs = fixed `1_003_104` bytes) | Passed via `--progress-coeff` for LayerStack `progress8kpabs` mode. Not used by `kingrank9` or `simple` | 1.0 MB |
 | (optional) pretrained NNUE | quantised `.bin` (`save_quantised` format) | Injects weights via `--init-from` (the optimizer is reset) | — |
 
 ## Example 1: Training a HalfKP NNUE (simple architecture)
@@ -36,8 +36,18 @@ target/release/nnue-train \
   --feature-set halfkp \
   --superbatches <N> \
   --threads <N> \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple
 ```
+
+The `simple` trainer requires `--win-rate-model`: its int8 output layer cannot
+represent the centipawn-scale output that the plain sigmoid loss converges to,
+so the plain-sigmoid path is rejected up front. The `--wrm-*` values above
+degenerate the WRM to a plain sigmoid; keep `--scale` and every
+`--wrm-*-scaling` / `--wrm-nnue2score` on the same value, because the simple
+trainer derives the exported `fv_scale` from `--scale`.
 
 `simple` defaults to `--arch 256x2-32-32` / `--activation crelu`. For how to
 choose `--superbatches` and the additional options you can pass, see "Key
@@ -45,10 +55,13 @@ options" below.
 
 ## Example 2: Training a LayerStack NNUE
 
-The `layerstack` architecture uses the 9 game-progress buckets, so prepare the
-bucket coefficients `progress.bin` first — train it with `progress-kpabs-train`
-and check the bucket split with `progress-bucket-survey`, as described in
-[Game-progress buckets: preparing `progress.bin`](progress-bin.md).
+The `layerstack` architecture supports two bucket modes. The default
+`progress8kpabs` mode uses 2–9 game-progress buckets; prepare `progress.bin`
+with `progress-kpabs-train` and inspect it with `progress-bucket-survey`, as
+described in [Game-progress buckets: preparing `progress.bin`](progress-bin.md).
+`kingrank9` matches YaneuraOu KingRank9: it normalises both king ranks to the
+side-to-move perspective and selects one of a fixed 3x3 grid of 9 buckets. It
+does not use `progress.bin`.
 
 ### Training
 
@@ -59,6 +72,12 @@ target/release/nnue-train \
   --superbatches <N> \
   --threads <N> \
   layerstack --progress-coeff <path/to/progress.bin>
+```
+
+For KingRank9, replace the final line with:
+
+```bash
+  layerstack --bucket-mode kingrank9 --num-buckets 9
 ```
 
 `layerstack` defaults to `--feature-set halfka-hm-merged` / 9 buckets. The FT
@@ -76,12 +95,15 @@ change for real training are:
 | `--batch-size` | 16384 | Number of positions per gradient update. A training hyperparameter that affects both GPU throughput and training dynamics (gradient variance, number of updates) |
 | `--feature-set` | halfka-hm-merged | Input feature set. Choose from `halfkp` / `halfka-split` / `halfka-merged` / `halfka-hm-split` / `halfka-hm-merged` (see the [README](../README.md)) |
 | `--keep-checkpoints` | keep all | Keep the most recent N raw `.ckpt` files (weight + optimizer state). The default of keeping all is the safe choice for tracking training failures. Note that disk usage adds up: with `--save-rate 20` over a 400-superbatch run you accumulate 20 `.ckpt` files × ~1.8 GB (default LayerStack arch) ≈ 36 GB. Limit it if disk space is tight. Quantised `.bin` files are always kept |
-| `--win-rate-model` | OFF | WRM (win-rate-model) loss. Converges to `net_output ≈ cp/600`, consistent with quantisation (`QA=127 / QB=64 / FV_SCALE=28`). Add it if you are training a net for quantised inference (without it, plain sigmoid-MSE). See [Tuning the WRM loss](wrm-loss-tuning.md) for the tuning parameters |
+| `--win-rate-model` | OFF (layerstack) / required (simple) | WRM (win-rate-model) loss. Converges to `net_output ≈ cp / --wrm-nnue2score`. On `layerstack` it is optional (without it, plain sigmoid-MSE). The `simple` trainer requires it and also requires `--scale = --wrm-nnue2score`, because `--scale` determines the exported `fv_scale`; the example above uses 290 for both, producing `FV_SCALE=28`. See [Tuning the WRM loss](wrm-loss-tuning.md) for the tuning parameters |
+| `--optimizer` | ranger | `ranger` (RAdam + lookahead, beta1=0.99), `radam` (rectified Adam without lookahead, beta1=0.9), or `adamw` (Adam without bias correction, beta1=0.9). When resuming from a raw `.ckpt`, pass the same value as the original run |
 | `--score-drop-abs` | none | Exclude positions with `|score| >=` this value from the loss (rejects extreme evaluations near mate) |
+| `--score-clamp-abs` | none | Saturate surviving positions' scores to `[-N, N]` (normalises teacher files whose encode variants clip at different ceilings) |
 | `--threads` | 16 | **Always set this.** Because GPU processing is fast, the CPU dataloader is easily the bottleneck; a larger value is recommended. Use your CPU's physical core count as a starting point — a small value (e.g. 1) will cause a large drop in pos/s. Use `NNUE_TRAIN_STEP_PROFILE=1` to see the h2d / fwd / bwd / optimizer breakdown and tune accordingly |
 | `--test-tail-positions` | none | Reserve the last N positions of `--data` as a held-out validation set in the same file (see "Held-out validation" below). Recommended whenever you want held-out validation |
 | `--test-positions` | 10000 | Number of positions evaluated each superbatch from the held-out source. Used only with `--test-tail-positions` or `--test-data` |
-| `--num-buckets` (`layerstack`) | 9 | LayerStack output bucket count, an integer in `[2, 9]`. Each position is routed to `min(N-1, floor(progress * N))`. Lower values trade per-bucket specialisation for more samples per bucket; the default 9 keeps the binning identical to existing distributed nets |
+| `--bucket-mode` (`layerstack`) | progress8kpabs | `progress8kpabs` routes by the KP-absolute progress estimate. `kingrank9` matches YaneuraOu KingRank9, requires 9 buckets, and rejects `--progress-coeff` |
+| `--num-buckets` (`layerstack`) | 9 | In `progress8kpabs` mode, an integer in `[2, 9]`; positions route to `min(N-1, floor(progress * N))`. In `kingrank9` mode this must be 9 |
 
 `--batches-per-superbatch` (6104) / `--lr` (8.75e-4) / `--save-rate` (20)
 and the like can be left at their defaults; pass them only when you want to
@@ -109,7 +131,7 @@ flags, how to pick the held-out source, and how to read the metrics.
 
 ## Interrupting and resuming training
 
-A raw `.ckpt` saves everything: **weights + Ranger optimizer state
+A raw `.ckpt` saves everything: **weights + optimizer state
 (m / v / slow / step) + the current superbatch number**. Even if it stops on a
 power loss or a GPU error, you can fully resume. Add `--resume` to the same
 options + architecture subcommand used for training:
@@ -119,6 +141,9 @@ target/release/nnue-train \
   --data <path/to/shuffled-psv.bin> \
   --output checkpoints/<run-name> --net-id <run-name> \
   --feature-set halfkp --superbatches <N> --keep-checkpoints 4 \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   --resume checkpoints/<run-name>/<run-name>-<sb>.ckpt \
   simple
 ```
@@ -170,6 +195,9 @@ target/release/nnue-train --data <PSV> \
   --output /tmp/smoke --net-id smoke \
   --superbatches 1 --batches-per-superbatch 3 \
   --save-rate 1 --threads 4 \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple
 ```
 

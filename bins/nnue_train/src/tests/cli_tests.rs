@@ -1,11 +1,25 @@
 //! CLI 構成テスト (clap、GPU 不要)。
 
+use std::path::PathBuf;
+
 use clap::Parser;
 use nnue_format::{ArchKind, SimpleActivation};
 
 use crate::cli::*;
+use crate::training::{
+    per_group_optim_flags, reject_simple_unsupported_flags, require_simple_win_rate_model,
+    validate_bucket_mode, validate_output_format,
+};
 
 use clap::CommandFactory;
+
+/// `nnue-train <global flags...> simple` を parse して `Cli` を返す helper。
+fn simple_cli(argv: &[&str]) -> Cli {
+    let mut full = vec!["nnue-train"];
+    full.extend_from_slice(argv);
+    full.push("simple");
+    Cli::try_parse_from(full).expect("simple cli should parse")
+}
 
 #[test]
 fn cli_definition_is_valid() {
@@ -13,33 +27,136 @@ fn cli_definition_is_valid() {
     Cli::command().debug_assert();
 }
 
-fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
-    let mut full = vec!["nnue-train", "layerstack"];
+/// `--ft-factorize` / `--no-ft-factorize` は global flag。任意 subcommand の後ろに
+/// 付けても global 引数として parse される (層は `simple` でも `layerstack` でも同じ)。
+fn cli_with_factorize(argv: &[&str]) -> Cli {
+    let mut full = vec!["nnue-train", "simple"];
     full.extend_from_slice(argv);
-    match Cli::try_parse_from(full)
-        .expect("layerstack should parse")
-        .arch
-    {
-        ArchCommand::LayerStack(args) => args,
-        other => panic!("unexpected arch: {other:?}"),
+    Cli::try_parse_from(full).expect("cli should parse")
+}
+
+/// simple が reject すべき layerstack 専用 per-group optimizer フラグの期待セット。
+/// production テーブル ([`per_group_optim_flags`]) から独立に固定し、テーブル側の
+/// 追加・脱落を検出する。
+const SIMPLE_REJECTED_PER_GROUP: [&str; 6] = [
+    "--ft-weight-decay",
+    "--dense-weight-decay",
+    "--bias-weight-decay",
+    "--ft-lr-mult",
+    "--dense-lr-mult",
+    "--bias-lr-mult",
+];
+
+#[test]
+fn simple_rejects_layerstack_only_global_flags() {
+    // eval / threat 系は layerstack の eval・threat 経路専用 → simple では reject。
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--eval-only"])).is_err());
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-ablate", "all"])).is_err());
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--threat-norm-dump"])).is_err());
+    // per-group optimizer override 6 種すべて reject (独立の期待リストで固定)。
+    for name in SIMPLE_REJECTED_PER_GROUP {
+        assert!(
+            reject_simple_unsupported_flags(&simple_cli(&[name, "0.1"])).is_err(),
+            "{name} must be rejected on the simple subcommand"
+        );
     }
+    // production テーブルが期待リストと完全一致することも固定する (テーブルからの
+    // 脱落・順序変更・追加を検出)。
+    let table: Vec<&str> = per_group_optim_flags(&simple_cli(&[]))
+        .iter()
+        .map(|(name, _)| *name)
+        .collect();
+    assert_eq!(
+        table, SIMPLE_REJECTED_PER_GROUP,
+        "per_group_optim_flags table drifted from the rejected set"
+    );
+}
+
+#[test]
+fn simple_accepts_consumed_global_flags() {
+    // 既定 simple run は reject されない。
+    assert!(reject_simple_unsupported_flags(&simple_cli(&[])).is_ok());
+    // --norm-loss / precision 系は simple が消費するので reject されない。
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--norm-loss"])).is_ok());
+    assert!(
+        reject_simple_unsupported_flags(&simple_cli(&[
+            "--norm-loss",
+            "--norm-loss-factor",
+            "1e-4"
+        ]))
+        .is_ok()
+    );
+    assert!(reject_simple_unsupported_flags(&simple_cli(&["--ft-fp16", "--all-optim"])).is_ok());
+}
+
+#[test]
+fn simple_rejects_loss_wdl_requires_win_rate_model() {
+    // --win-rate-model 無し = loss_wdl 経路。dense int8 clamp と非整合なので reject。
+    assert!(require_simple_win_rate_model(&simple_cli(&[])).is_err());
+    // WRM の出力 scale と export の scale が不一致なら reject。
+    let err = require_simple_win_rate_model(&simple_cli(&["--win-rate-model"]))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("--scale (290) must equal --wrm-nnue2score (600)"));
+    // 一致する WRM は accept (identity 退化の設定でも受理される)。
+    assert!(
+        require_simple_win_rate_model(&simple_cli(&["--win-rate-model", "--scale", "600"])).is_ok()
+    );
+    assert!(
+        require_simple_win_rate_model(&simple_cli(&[
+            "--win-rate-model",
+            "--scale",
+            "600",
+            "--wrm-in-offset",
+            "0",
+            "--wrm-target-offset",
+            "0",
+            "--wrm-in-scaling",
+            "600",
+            "--wrm-target-scaling",
+            "600",
+            "--wrm-nnue2score",
+            "600",
+        ]))
+        .is_ok()
+    );
+}
+
+/// main は `--eval-only` 等の診断フラグでは `--data` 不在でも `run_training` へ dispatch
+/// する。reject が `data.expect` より前に走らないと clean error が panic に化けるため、
+/// 実経路 (`run_training` → `run_simple_training`) で clean な `Err` になることを固定する。
+#[cfg(feature = "gpu")]
+#[test]
+fn simple_eval_only_without_data_errors_cleanly() {
+    let cli = Cli::try_parse_from(["nnue-train", "--eval-only", "simple"])
+        .expect("--eval-only simple should parse");
+    assert!(
+        crate::training::run_training(&cli).is_err(),
+        "--eval-only on simple without --data must return a clean Err, not panic"
+    );
 }
 
 #[test]
 fn ft_factorize_defaults_on_and_no_flag_disables() {
     // default は ON (flag 無し)。`--ft-factorize` は back-compat の明示 ON。
-    assert!(layerstack_args(&[]).ft_factorize_enabled());
-    assert!(layerstack_args(&["--ft-factorize"]).ft_factorize_enabled());
+    assert!(cli_with_factorize(&[]).ft_factorize_enabled());
+    assert!(cli_with_factorize(&["--ft-factorize"]).ft_factorize_enabled());
     // `--no-ft-factorize` で OFF。
-    assert!(!layerstack_args(&["--no-ft-factorize"]).ft_factorize_enabled());
+    assert!(!cli_with_factorize(&["--no-ft-factorize"]).ft_factorize_enabled());
     // overrides_with: command-line 後勝ち。
-    assert!(!layerstack_args(&["--ft-factorize", "--no-ft-factorize"]).ft_factorize_enabled());
-    assert!(layerstack_args(&["--no-ft-factorize", "--ft-factorize"]).ft_factorize_enabled());
-    // `--psqt` と併用しても clap では衝突しない (実効 OFF は run_training の
-    // auto-suppress が解決する)。
+    assert!(!cli_with_factorize(&["--ft-factorize", "--no-ft-factorize"]).ft_factorize_enabled());
+    assert!(cli_with_factorize(&["--no-ft-factorize", "--ft-factorize"]).ft_factorize_enabled());
+    // layerstack subcommand の後ろに置いても global flag として parse される (back-compat)。
+    assert!(
+        !Cli::try_parse_from(["nnue-train", "layerstack", "--no-ft-factorize"])
+            .expect("layerstack --no-ft-factorize should parse")
+            .ft_factorize_enabled()
+    );
+    // `--psqt` と factorizer は併用可 (PSQT 行も同じ fold を通る)。clap で衝突せず
+    // parse できることだけ確認する (auto-suppress するのは `--init-from` のみ)。
     assert!(
         Cli::try_parse_from(["nnue-train", "layerstack", "--psqt"]).is_ok(),
-        "--psqt alone parses (factorizer auto-suppressed at run time)"
+        "--psqt coexists with the factorizer"
     );
 }
 
@@ -47,6 +164,112 @@ fn ft_factorize_defaults_on_and_no_flag_disables() {
 fn layerstack_subcommand_parses() {
     let cli = Cli::try_parse_from(["nnue-train", "layerstack"]).expect("layerstack subcommand");
     assert_eq!(cli.arch.kind(), ArchKind::LayerStack);
+    assert_eq!(cli.output_format, OutputFormatArg::Tatara);
+}
+
+#[test]
+fn bench_pos_subcommand_uses_tracked_and_local_defaults() {
+    let cli = Cli::try_parse_from([
+        "nnue-train",
+        "bench-pos",
+        "--case",
+        "layerstack-fp32",
+        "--case",
+        "simple-halfkp-fp32",
+    ])
+    .expect("bench-pos subcommand should parse");
+    let ArchCommand::BenchPos(args) = cli.arch else {
+        panic!("expected bench-pos subcommand");
+    };
+    assert_eq!(args.profile, PathBuf::from("bench-pos.toml"));
+    assert_eq!(args.local_config, PathBuf::from("bench-pos.local.toml"));
+    assert_eq!(args.cases, ["layerstack-fp32", "simple-halfkp-fp32"]);
+    assert!(!args.allow_dirty);
+}
+
+#[test]
+#[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+fn native_bench_subcommand_has_fixed_v1_defaults() {
+    let cli = Cli::try_parse_from(["nnue-train", "native-bench"])
+        .expect("native-bench subcommand should parse");
+    let ArchCommand::NativeBench(args) = cli.arch else {
+        panic!("expected native-bench subcommand");
+    };
+    assert_eq!(args.profile, NativeBenchProfileArg::V1);
+    assert_eq!(args.architecture, NativeBenchArchitectureArg::All);
+    assert_eq!(args.precision, NativeBenchPrecisionArg::All);
+    assert_eq!(args.mode, NativeBenchModeArg::NativeOnly);
+    assert_eq!(cli.batch_size, 16_384);
+    assert_eq!(args.warmup_steps, 3);
+    assert_eq!(args.steps, 100);
+    assert_eq!(args.runs, 3);
+    assert_eq!(args.device, 0);
+    assert!(!args.allow_dirty);
+}
+
+#[test]
+fn yaneuraou_output_format_parses_and_simple_rejects_it() {
+    let cli = Cli::try_parse_from(["nnue-train", "--output-format", "yaneuraou", "layerstack"])
+        .expect("YaneuraOu LayerStack output should parse");
+    assert_eq!(cli.output_format, OutputFormatArg::Yaneuraou);
+
+    let simple = simple_cli(&["--output-format", "yaneuraou"]);
+    let error = reject_simple_unsupported_flags(&simple).unwrap_err();
+    assert!(error.to_string().contains("only with the layerstack"));
+
+    validate_output_format(
+        OutputFormatArg::Yaneuraou,
+        nnue_train::dataloader::BucketMode::KingRank9,
+    )
+    .expect("KingRank9 should support YaneuraOu output");
+    let error = validate_output_format(
+        OutputFormatArg::Yaneuraou,
+        nnue_train::dataloader::BucketMode::Progress8KpAbs,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("--bucket-mode kingrank9"));
+}
+
+fn layerstack_args(argv: &[&str]) -> LayerstackArgs {
+    let mut full = vec!["nnue-train", "layerstack"];
+    full.extend_from_slice(argv);
+    match Cli::try_parse_from(full)
+        .expect("layerstack CLI should parse")
+        .arch
+    {
+        ArchCommand::LayerStack(args) => args,
+        ArchCommand::Simple(_) => unreachable!("layerstack subcommand was requested"),
+        ArchCommand::BenchPos(_) => unreachable!("layerstack subcommand was requested"),
+        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+        ArchCommand::NativeBench(_) => unreachable!("layerstack subcommand was requested"),
+    }
+}
+
+#[test]
+fn kingrank9_bucket_mode_validation() {
+    let valid = layerstack_args(&["--bucket-mode", "kingrank9", "--num-buckets", "9"]);
+    assert!(validate_bucket_mode(&valid).is_ok());
+
+    let wrong_count = layerstack_args(&["--bucket-mode", "kingrank9", "--num-buckets", "8"]);
+    let err = validate_bucket_mode(&wrong_count).unwrap_err().to_string();
+    assert!(err.contains("must be 9"), "{err}");
+
+    let progress_coeff = layerstack_args(&[
+        "--bucket-mode",
+        "kingrank9",
+        "--progress-coeff",
+        "progress.bin",
+    ]);
+    let err = validate_bucket_mode(&progress_coeff)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not used"), "{err}");
+
+    let unknown = layerstack_args(&["--bucket-mode", "unknown"]);
+    let err = validate_bucket_mode(&unknown).unwrap_err().to_string();
+    assert!(err.contains("unknown"), "{err}");
+    assert!(err.contains("progress8kpabs"), "{err}");
+    assert!(err.contains("kingrank9"), "{err}");
 }
 
 #[test]
@@ -144,6 +367,21 @@ fn monitor_fp16_clamps_flag_defaults_off_and_parses_global() {
 }
 
 #[test]
+fn monitor_active_features_flag_defaults_off_and_parses_global() {
+    // default は false (新規 opt-in flag、実 active feature 数 histogram の log を gate)。
+    let cli =
+        Cli::try_parse_from(["nnue-train", "simple"]).expect("simple subcommand should parse");
+    assert!(!cli.monitor_active_features);
+    // 指定すれば true、`global = true` なので subcommand 前後どちらでも accept。
+    let cli_pre = Cli::try_parse_from(["nnue-train", "--monitor-active-features", "simple"])
+        .expect("--monitor-active-features before subcommand");
+    assert!(cli_pre.monitor_active_features);
+    let cli_post = Cli::try_parse_from(["nnue-train", "layerstack", "--monitor-active-features"])
+        .expect("--monitor-active-features after subcommand");
+    assert!(cli_post.monitor_active_features);
+}
+
+#[test]
 fn simple_accepts_tf32_flag() {
     // `--tf32` は LayerStack / Simple 両 subcommand で受理される (両方 cuBLAS handle
     // に同 flag を渡す opt-in)。default OFF / 渡せば ON で TF32 TC 有効化。
@@ -152,6 +390,9 @@ fn simple_accepts_tf32_flag() {
     match cli.arch {
         ArchCommand::Simple(args) => assert!(args.tf32),
         ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
+        ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
+        #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+        ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
     }
 }
 
@@ -418,6 +659,9 @@ fn simple_activation_arg_parses_and_maps() {
         let act = match cli.arch {
             ArchCommand::Simple(args) => args.activation,
             ArchCommand::LayerStack(_) => panic!("expected Simple subcommand"),
+            ArchCommand::BenchPos(_) => panic!("expected Simple subcommand"),
+            #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
+            ArchCommand::NativeBench(_) => panic!("expected Simple subcommand"),
         };
         assert_eq!(SimpleActivation::from_canonical_name(&act), Some(want));
     }

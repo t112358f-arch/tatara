@@ -1,8 +1,8 @@
 //! PSV file → feature-set sparse batch dataloader (+ prefetch wrapper)。
 //!
 //! trainer の data 供給路。`PackedSfenValue` を [`FeatureSetSpec`] の indexer で
-//! sparse index 化し、`Batch` (`stm_indices` / `nstm_indices` / `score` / `wdl` /
-//! `per_pos_norm`) にまとめる。superbatch loop driver が GPU buffer 転送前に
+//! sparse index 化し、`Batch` (`stm_indices` / `nstm_indices` / `nnz` / `score` /
+//! `wdl` / `per_pos_norm`) にまとめる。superbatch loop driver が GPU buffer 転送前に
 //! 本 dataloader から `Batch` を pull する。どの feature set を使うかは生成時に
 //! 渡す `FeatureSetSpec` で決まる (runtime 選択)。
 //!
@@ -12,8 +12,10 @@
 //!   本 dataloader は `score` (raw cp) と `wdl` (game result `{0, 0.5, 1}`) を
 //!   別 buffer に保持する (data-layer での blend pre-compute は行わない)
 //! - sparse index は feature set の最大 active 数 (`FeatureSetSpec::max_active`)
-//!   で固定容量を持ち、未使用 slot は `-1` で padding する。`sparse_ft_forward`
-//!   kernel は `-1` を silent skip する規約
+//!   で固定容量を持つ。有効 slot は position ごとの `nnz` で決まり、下流 kernel は
+//!   `nnz` までしか走査しない。実長超の slot の内容は未規定 (`Batch` reuse で前 batch
+//!   の残骸が残りうる) — `-1` / 範囲外 index の防御 skip は残すが、正しさは `nnz`
+//!   打ち切りが担保する
 //! - 並列 prefetch は `std::thread::spawn` + `std::sync::mpsc::sync_channel` の
 //!   minimal wrapper として [`PrefetchedLoader`] (single-thread worker) と
 //!   [`BucketedPrefetchedLoader`] (multi-worker + ring-buffer pool + bucket
@@ -25,14 +27,86 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
-use shogi_features::FeatureSetSpec;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
-use shogi_format::{PackedSfenValue, ShogiBoard};
+use shogi_features::{FeatureSetSpec, kingrank9_bucket_board};
+use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, ShogiBoard};
 
 /// PSV record size in bytes (`shogi_format::PackedSfenValue` is a fixed
 /// 40-byte struct). Used everywhere we compute byte offsets, validate range
 /// alignment, or convert between record counts and file sizes.
 pub const PSV_RECORD_BYTES: u64 = 40;
+
+/// Sequential reader for 38-byte Apery / dlshogi HCPE records.
+pub struct HcpeFileLoader {
+    reader: BufReader<File>,
+    remaining_records: u64,
+}
+
+impl HcpeFileLoader {
+    pub fn new<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+        let file = File::open(path.as_ref())?;
+        let file_size = file.metadata()?.len();
+        let record_bytes = HCPE_RECORD_BYTES as u64;
+        if !file_size.is_multiple_of(record_bytes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "HCPE file size {file_size} is not a multiple of {HCPE_RECORD_BYTES} bytes for {}",
+                    path.as_ref().display()
+                ),
+            ));
+        }
+        Ok(Self {
+            reader: BufReader::with_capacity(1024 * 1024, file),
+            remaining_records: file_size / record_bytes,
+        })
+    }
+
+    pub fn next_board(&mut self) -> io::Result<Option<ShogiBoard>> {
+        if self.remaining_records == 0 {
+            return Ok(None);
+        }
+        let mut record = HuffmanCodedPosAndEval::default();
+        self.reader.read_exact(record.as_bytes_mut())?;
+        self.remaining_records -= 1;
+        record.decode().map(Some)
+    }
+}
+
+/// LayerStack の position bucket 算出方式。
+#[derive(Clone, Copy, Debug, Default)]
+pub enum BucketMode {
+    /// KP-absolute progress 推定値を `num_buckets` 等分する。
+    #[default]
+    Progress8KpAbs,
+    /// 双方の玉段を手番視点に正規化した固定 9 bucket を使う。
+    KingRank9,
+}
+
+impl BucketMode {
+    /// checkpoint / experiment metadata に記録する canonical 名。
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::Progress8KpAbs => "progress8kpabs",
+            Self::KingRank9 => "kingrank9",
+        }
+    }
+
+    /// decode 済み局面の bucket index を返す。
+    #[inline]
+    pub fn bucket_board(self, board: &ShogiBoard, num_buckets: usize) -> u8 {
+        match self {
+            Self::Progress8KpAbs => ShogiProgressKPAbs.bucket_board(board, num_buckets),
+            Self::KingRank9 => kingrank9_bucket_board(board),
+        }
+    }
+}
+
+impl From<ShogiProgressKPAbs> for BucketMode {
+    fn from(_: ShogiProgressKPAbs) -> Self {
+        Self::Progress8KpAbs
+    }
+}
 
 // =============================================================================
 // Batch 構造体 (loss / sparse_ft_forward kernel 入力と整合)
@@ -41,15 +115,17 @@ pub const PSV_RECORD_BYTES: u64 = 40;
 /// 1 batch 分の feature-set sparse + score/wdl/norm。
 ///
 /// - `stm_indices` / `nstm_indices`: shape `[batch_size, max_active]` を flatten
-///   (row-major、`bi * max_active + j` で参照)。`-1` padding で未使用 slot を
-///   埋める (`sparse_ft_forward` kernel の silent-skip semantics と整合)
+///   (row-major、`bi * max_active + j` で参照)。有効 slot は各行の先頭 `nnz[bi]` 個で、
+///   実長超の slot の内容は未規定 (`reset` は clear せず、下流 kernel は `nnz` 打ち切りで
+///   読まない)。`with_capacity` は初期値として `-1` を入れるが依存してはならない
 /// - `score`: raw cp (`PackedSfenValue::score` の i16 を f32 cast)
 /// - `wdl`: game result を `{0.0, 0.5, 1.0}` に正規化 (Loss → 0.0, Draw → 0.5,
 ///   Win → 1.0)
 /// - `per_pos_norm`: batch averaging 用 weight (default 1.0、trainer 側で
 ///   override 可能)
-/// - `n_positions`: 実際に詰めた数 (`< batch_size` の場合、末尾は uninitialised
-///   ではなく `0` / `-1` で保持される)
+/// - `n_positions`: 実際に詰めた数。下流はどの buffer も `n_positions` (index は
+///   `n_positions * max_active`) までしか読まないため、`[n_positions, batch_size)` の
+///   末尾行の内容は未規定
 #[derive(Clone, Debug)]
 pub struct Batch {
     pub batch_size: usize,
@@ -60,6 +136,8 @@ pub struct Batch {
     pub max_active: usize,
     pub stm_indices: Vec<i32>,
     pub nstm_indices: Vec<i32>,
+    /// position ごとの実 active feature 数。stm / nstm は対称に emit されるため共通。
+    pub nnz: Vec<i32>,
     pub score: Vec<f32>,
     pub wdl: Vec<f32>,
     pub per_pos_norm: Vec<f32>,
@@ -77,6 +155,7 @@ impl Batch {
             max_active,
             stm_indices: vec![-1; batch_size * max_active],
             nstm_indices: vec![-1; batch_size * max_active],
+            nnz: vec![0; batch_size],
             score: vec![0.0; batch_size],
             wdl: vec![0.0; batch_size],
             per_pos_norm: vec![1.0; batch_size],
@@ -84,34 +163,28 @@ impl Batch {
         }
     }
 
-    /// 既存 `Batch` を再利用 (alloc 削減)。全 slot を `-1` / `0.0` / `1.0` に
-    /// reset する。`PsvFileLoader::fill_batch` と [`BucketedPrefetchedLoader`] の
-    /// ring-buffer return path (消費済み `Batch` を pool channel 経由で worker に
-    /// 返して `reset()` で再利用) の両方で使われる。
+    /// 既存 `Batch` を再利用 (alloc 削減)。`n_positions` を 0 に戻すだけの O(1) 操作。
+    /// `PsvFileLoader::fill_batch` と [`BucketedPrefetchedLoader`] の ring-buffer return
+    /// path (消費済み `Batch` を pool channel 経由で worker に返して `reset()` で再利用)
+    /// の両方で使われる。
+    ///
+    /// index / score / wdl / norm buffer は clear しない。次の fill で `push_decoded`
+    /// が position `bi < n_positions` の slot `[0, nnz[bi])` と `score[bi]` / `wdl[bi]` /
+    /// `nnz[bi]` を上書きし、下流はどの buffer も `n_positions` (index は `n_positions *
+    /// max_active`) までしか読まない (`BatchData::from_batch_inner` の slice、kernel の
+    /// `b = n_positions` launch、per-slot kernel の `nnz` early-out)。実長超の slot や
+    /// `[n_positions, batch_size)` の行に前 batch の残骸が残るが、上流にも下流にも
+    /// 観測されない。`per_pos_norm` Vec は下流が scalar `1/n_pos` を再計算するため未使用。
     pub fn reset(&mut self) {
-        for v in &mut self.stm_indices {
-            *v = -1;
-        }
-        for v in &mut self.nstm_indices {
-            *v = -1;
-        }
-        for v in &mut self.score {
-            *v = 0.0;
-        }
-        for v in &mut self.wdl {
-            *v = 0.0;
-        }
-        for v in &mut self.per_pos_norm {
-            *v = 1.0;
-        }
         self.n_positions = 0;
     }
 
     /// 1 position を batch に追加。`Ok(true)` 成功、`Ok(false)` は batch 満杯、
     /// `Err` は active feature 数が `max_active` を超過 (下記参照)。`feature_set`
-    /// の indexer で sparse index を slot に fill (残りは `-1` padding)。
+    /// の indexer が実 active index を行の先頭 `nnz[bi]` slot に書き、`nnz[bi]` を
+    /// 記録する (実長超の slot は書かない — 下流は `nnz` までしか読まない契約)。
     ///
-    /// 内部で `pos.decode()` を 1 回呼ぶ。同じ局面で別途 progress8kpabs bucket も
+    /// 内部で `pos.decode()` を 1 回呼ぶ。同じ局面で別途 position bucket も
     /// 要る場合は [`Batch::push_decoded`] を使い、`PackedSfenValue::decode()` を
     /// 1 回だけ呼んで `ShogiBoard` を使い回すこと (decode-once 経路)。
     pub fn push(&mut self, pos: &PackedSfenValue) -> io::Result<bool> {
@@ -121,16 +194,33 @@ impl Batch {
     /// [`Batch::push`] の **decode 済み `ShogiBoard` を直接受ける** 版。
     ///
     /// prefetch worker が 1 局面につき `PackedSfenValue::decode()` を 1 回だけ
-    /// 呼び、その `ShogiBoard` を feature 抽出 (本メソッド) と progress8kpabs
-    /// bucket 計算 ([`ShogiProgressKPAbs::bucket_board`]) の両方で使い回すための
+    /// 呼び、その `ShogiBoard` を feature 抽出 (本メソッド) と bucket 計算の両方で
+    /// 使い回すための
     /// 入口 (decode-once)。`push(&pos)` は `push_decoded(&pos.decode())` と等価。
     ///
     /// active feature 数が `max_active` を超えると `Err(io::Error)` を返す。base
     /// 特徴は合法局面で必ず cap 内だが threat 連結時は `THREAT_MAX_ACTIVE` の
     /// 見積りを edge 数が超え得る。超過を silent skip すると欠落 edge が loss だけ
     /// 見ても気付けないため、利用者に「profile / 実 active 数 / max_active」を含む
-    /// 明示エラーを返して学習を止める (起点 320 不足なら定数を上げて再ビルド)。
+    /// 明示エラーを返して学習を止める (`THREAT_MAX_ACTIVE` 不足なら定数を上げて再ビルド)。
     pub fn push_decoded(&mut self, board: &ShogiBoard) -> io::Result<bool> {
+        self.push_decoded_counting(board, None)
+    }
+
+    /// [`Batch::push_decoded`] と同一だが、成功 push 時に実 active feature 数
+    /// `written` を `active_hist` (長さ `max_active + 1` の呼び出し側 histogram)
+    /// の bin `written` に 1 加算する。`--monitor-active-features` の計装点。
+    ///
+    /// `active_hist` が `None` のときは histogram を一切触らない (計装 off 時の
+    /// ホットパス no-op)。`Some` のときの `active_hist` は `feature_set.max_active()
+    /// + 1` 以上の長さでなければならない (overflow は下の hard-error で弾かれるため
+    /// `written <= max_active` が index の不変条件)。batch 満杯 (`Ok(false)`) や
+    /// overflow (`Err`) では加算しない。
+    pub fn push_decoded_counting(
+        &mut self,
+        board: &ShogiBoard,
+        active_hist: Option<&mut [u64]>,
+    ) -> io::Result<bool> {
         if self.n_positions >= self.batch_size {
             return Ok(false);
         }
@@ -156,6 +246,11 @@ impl Batch {
                 ),
             ));
         }
+        // overflow 済み後なので `written <= max_active`、bin index は必ず範囲内。
+        if let Some(hist) = active_hist {
+            hist[written] += 1;
+        }
+        self.nnz[bi] = written as i32;
 
         // score / wdl / norm
         self.score[bi] = f32::from(board.score);
@@ -198,7 +293,9 @@ impl Batch {
 /// が file size を超えても error。range 外まで読み進めず、`remaining_bytes`
 /// が 1 record 分に満たなくなった時点で EOF として `Ok(None)` を返す。
 pub struct PsvFileLoader {
-    reader: BufReader<File>,
+    /// `Take` が raw read 自体を range 長で打ち切るため、BufReader の先読みが
+    /// `end_offset` を越えて file を読むことはない。
+    reader: BufReader<io::Take<File>>,
     eof: bool,
     path: PathBuf,
     /// 残りどれだけ読めるか (byte)。range 末尾に達したら 1 record 分を切らず
@@ -254,7 +351,7 @@ impl PsvFileLoader {
             file.seek(SeekFrom::Start(start))?;
         }
         Ok(Self {
-            reader: BufReader::new(file),
+            reader: BufReader::with_capacity(1024 * 1024, file.take(end - start)),
             eof: false,
             path: path.to_path_buf(),
             remaining_bytes: end - start,
@@ -411,7 +508,7 @@ pub const MAX_BARREN_PASSES: u32 = 5;
 /// reader。`--score-drop-abs` の近似 skip (`|score| >= t` を捨てる) と空 file の
 /// 無限ループ防止 (`MAX_BARREN_PASSES`) を内包する。bucket 計算は **行わない**
 /// (decode-once 経路: bucket は呼び出し側 prefetch worker が `decode()` した
-/// `ShogiBoard` から `ShogiProgressKPAbs::bucket_board` で求める)。
+/// `ShogiBoard` から選択された [`BucketMode`] で求める)。
 ///
 /// `next()` は常に「使える PSV」を返すか barren-error を返す (epoch は無限に
 /// wrap するので「終わり」は無い)。
@@ -424,6 +521,7 @@ struct PsvEpochReader {
     end_offset: u64,
     loader: PsvFileLoader,
     score_drop_abs: Option<i32>,
+    score_clamp_abs: Option<i16>,
     /// 直近の reopen 以降に実際に返した (= drop されなかった) position 数。
     pushed_this_epoch: u64,
     /// 1 epoch 丸ごと 0 push だった連続回数。
@@ -439,6 +537,7 @@ impl PsvEpochReader {
         start_offset: u64,
         end_offset: u64,
         score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
     ) -> io::Result<Self> {
         let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
         Ok(Self {
@@ -447,6 +546,7 @@ impl PsvEpochReader {
             end_offset,
             loader,
             score_drop_abs,
+            score_clamp_abs,
             pushed_this_epoch: 0,
             barren_passes: 0,
         })
@@ -457,13 +557,21 @@ impl PsvEpochReader {
     fn next(&mut self) -> io::Result<PackedSfenValue> {
         loop {
             match self.loader.next_psv()? {
-                Some(psv) => {
+                Some(mut psv) => {
                     // `--score-drop-abs t` 指定時: `|score| >= t` を skip。
                     // i64 cast で `i16::MIN` の abs overflow を避ける。
                     if let Some(t) = self.score_drop_abs
                         && i64::from(psv.score()).abs() >= i64::from(t)
                     {
                         continue;
+                    }
+                    // `--score-clamp-abs c` 指定時: 生き残った position の score を
+                    // `[-c, c]` に飽和させる。drop 判定の後に適用する (先に clamp
+                    // すると `|score| >= drop` の詰み stamp が clamp されて drop を
+                    // すり抜ける)。c >= 1 は TrainingConfig::validate が保証する
+                    // ため `-c` は overflow しない。
+                    if let Some(c) = self.score_clamp_abs {
+                        psv.set_score(psv.score().clamp(-c, c));
                     }
                     self.pushed_this_epoch += 1;
                     return Ok(psv);
@@ -510,20 +618,19 @@ fn prefetch_depth_for(num_workers: usize) -> usize {
 type BatchSlot = (Batch, Vec<i32>);
 
 /// 共有 reader (`PsvEpochReader`) を `--threads` 本の worker で読み、各 worker が
-/// 「PSV パース + feature sparse 抽出 + progress8kpabs bucket 計算」を
+/// 「PSV パース + feature sparse 抽出 + position bucket 計算」を
 /// `decode()` **1 回** で済ませて main thread に `(Batch, buckets)` を渡す
 /// prefetch loader。
 ///
 /// ## 設計
 ///
 /// - **decode-once**: worker は `psv.decode()` した `ShogiBoard` を
-///   `Batch::push_decoded` (feature 抽出) と `ShogiProgressKPAbs::bucket_board`
-///   (output bucket) の両方に渡す。`pos.decode()` は 1 局面 1 回。
+///   `Batch::push_decoded` (feature 抽出) と [`BucketMode::bucket_board`] の両方に
+///   渡す。`pos.decode()` は 1 局面 1 回。
 /// - **並列パース**: worker は短い critical section (共有 `Mutex<PsvEpochReader>`
 ///   を lock して `batch_size` 件の生 PSV を自前 scratch `Vec` に詰める; I/O は
 ///   逐次・高速) の外で decode + 特徴抽出を並列に行う。`FeatureSetSpec` は
-///   `Copy` の値型、`ShogiProgressKPAbs` は ZST + process-global `OnceLock`
-///   (read-only) なので thread 間共有して問題ない。
+///   `Copy` の値型で、bucket mode も read-only なので thread 間共有できる。
 /// - **ring-buffer return path**: `Batch` / `buckets` の `Vec` は起動時に
 ///   `prefetch_depth + num_workers + 1` 個確保した pool channel から借りて使い、
 ///   main が消費後 [`BucketedPrefetchedLoader::recycle`] で pool に返す → worker
@@ -552,6 +659,12 @@ pub struct BucketedPrefetchedLoader {
     pool_tx: Option<mpsc::SyncSender<BatchSlot>>,
     /// worker が reader から受けた io::Error を main に伝えるための slot。
     err_slot: Arc<Mutex<Option<io::Error>>>,
+    /// `--monitor-active-features` 時のみ `Some`。全 worker が共有する実 active
+    /// feature 数の histogram (長さ `feature_set.max_active() + 1`、bin `k` =
+    /// 実 active 数がちょうど `k` だった position 数の累積)。worker は自身の
+    /// batch-local histogram を batch 単位でここに flush する (1 position ごとの
+    /// lock を避ける)。`None` なら計装なし。
+    active_hist: Option<Arc<Mutex<Vec<u64>>>>,
     /// worker thread handle (`Drop` で join する)。
     handles: Vec<thread::JoinHandle<()>>,
 }
@@ -560,12 +673,13 @@ impl BucketedPrefetchedLoader {
     /// `path` の PSV を `num_workers` 本の worker で読み込む。各 batch は
     /// `batch_size` 件の有効 position を持つ (epoch wrap するので末尾 partial は
     /// 出ない)。`score_drop_abs` が `Some(t)` なら `|score| >= t` を skip。
-    /// `progress` は output bucket を計算する [`ShogiProgressKPAbs`] (ZST; 重みは
-    /// process-global `OnceLock` なので呼び出し前に `load_from_bin` 済であること、
-    /// 未ロードなら全 bucket 4)。`feature_set` は sparse index 化に使う feature
-    /// set spec で、全 worker が共有する (`Copy`、read-only)。
-    /// `num_buckets` は worker が `progress.bucket_board(board, num_buckets)` を
-    /// 呼ぶときの bucket 数。`compute_bucket = false` (Simple アーキ) では bucket
+    /// `score_clamp_abs` が `Some(c)` なら drop を生き残った position の score を
+    /// `[-c, c]` に飽和させる (`--score-clamp-abs`)。
+    /// `bucket_mode` は output bucket の算出方式。`Progress8KpAbs` の重みは
+    /// process-global なので呼び出し前に `ShogiProgressKPAbs::load_from_bin` 済で
+    /// あること、未ロードなら全 bucket 4。`KingRank9` は外部重みを参照しない。
+    /// `feature_set` は sparse index 化に使う feature set spec で、全 worker が共有する。
+    /// `num_buckets` は progress mode の bucket 数。`compute_bucket = false` (Simple アーキ) では bucket
     /// 計算自体が skip されるが、worker 側 assertion (`num_buckets >= 1`) は常に
     /// 評価する。
     /// `train_end_offset` は training stream の上限 byte offset (`[0, train_end_offset)`
@@ -574,23 +688,30 @@ impl BucketedPrefetchedLoader {
     /// `file_size - N * PSV_RECORD_BYTES` を渡し、training が tail に踏み込まない
     /// ようにするのが主用途。`train_end_offset` は [`PSV_RECORD_BYTES`] の倍数で
     /// なければならず、違反は `PsvFileLoader::new_range` 側で error になる。
+    /// `monitor_active` が `true` のとき、各 position の実 active feature 数を
+    /// histogram (`feature_set.max_active() + 1` bins) に集計し [`Self::active_histogram_snapshot`]
+    /// で参照できるようにする (`--monitor-active-features`)。`false` では histogram
+    /// を確保せず worker のホットパスに計装コードを一切通さない。
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         path: &Path,
         batch_size: usize,
         score_drop_abs: Option<i32>,
+        score_clamp_abs: Option<i16>,
         num_workers: usize,
-        progress: ShogiProgressKPAbs,
+        bucket_mode: impl Into<BucketMode>,
         feature_set: FeatureSetSpec,
         compute_bucket: bool,
         num_buckets: usize,
         train_end_offset: u64,
+        monitor_active: bool,
     ) -> io::Result<Self> {
         assert!(
             num_buckets >= 1,
             "BucketedPrefetchedLoader requires num_buckets >= 1"
         );
         assert!(batch_size >= 1, "batch_size must be >= 1");
+        let bucket_mode = bucket_mode.into();
         let num_workers = num_workers.max(1);
         let prefetch_depth = prefetch_depth_for(num_workers);
         // pool は「同時に out できる最大数」を満たす容量にして recycle が絶対に
@@ -603,8 +724,17 @@ impl BucketedPrefetchedLoader {
             0,
             train_end_offset,
             score_drop_abs,
+            score_clamp_abs,
         )?));
         let err_slot: Arc<Mutex<Option<io::Error>>> = Arc::new(Mutex::new(None));
+        let active_hist: Option<Arc<Mutex<Vec<u64>>>> = if monitor_active {
+            Some(Arc::new(Mutex::new(vec![
+                0u64;
+                feature_set.max_active() + 1
+            ])))
+        } else {
+            None
+        };
 
         let (result_tx, result_rx) = mpsc::sync_channel::<BatchSlot>(prefetch_depth);
         let (pool_tx, pool_rx) = mpsc::sync_channel::<BatchSlot>(n_slots);
@@ -625,9 +755,16 @@ impl BucketedPrefetchedLoader {
             let err_slot = Arc::clone(&err_slot);
             let pool_rx = Arc::clone(&pool_rx);
             let result_tx = result_tx.clone();
+            let active_hist = active_hist.clone();
             let handle = thread::spawn(move || {
                 // 各 worker 専有の生 PSV scratch (iteration をまたいで reuse)。
                 let mut scratch: Vec<PackedSfenValue> = Vec::with_capacity(batch_size);
+                // batch-local な active-feature histogram (計装 on のときだけ確保)。
+                // batch 末に共有 `active_hist` へ一括加算 → 1 position ごとの lock を
+                // 避ける。
+                let mut local_hist: Option<Vec<u64>> = active_hist
+                    .as_ref()
+                    .map(|_| vec![0u64; feature_set.max_active() + 1]);
                 loop {
                     // 空の batch slot を pool から借りる。
                     let (mut batch, mut buckets) = {
@@ -668,14 +805,13 @@ impl BucketedPrefetchedLoader {
                     }
 
                     // decode-once: ShogiBoard を feature 抽出 + (compute_bucket=true
-                    // のとき) progress bucket の両方に使う。`compute_bucket=false`
-                    // (Simple アーキ) では `progress.bucket_board` の per-position 推論
-                    // (~30-40 KP-abs weight load + exp + clamp) を skip し worker CPU を
+                    // のとき) position bucket の両方に使う。`compute_bucket=false`
+                    // (Simple アーキ) では bucket mode ごとの per-position 計算を skip し worker CPU を
                     // 軽くする。Simple backend は `bucket_idx` を参照しない契約。
                     let mut overflow: Option<io::Error> = None;
                     for psv in &scratch {
                         let board = psv.decode();
-                        match batch.push_decoded(&board) {
+                        match batch.push_decoded_counting(&board, local_hist.as_deref_mut()) {
                             Ok(pushed) => {
                                 debug_assert!(
                                     pushed,
@@ -692,7 +828,7 @@ impl BucketedPrefetchedLoader {
                             }
                         }
                         if compute_bucket {
-                            buckets.push(i32::from(progress.bucket_board(&board, num_buckets)));
+                            buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
                         }
                     }
                     if let Some(e) = overflow {
@@ -704,6 +840,20 @@ impl BucketedPrefetchedLoader {
                     }
                     debug_assert_eq!(batch.n_positions, batch_size);
                     debug_assert!(!compute_bucket || buckets.len() == batch_size);
+
+                    // batch-local histogram を共有 accumulator に flush して 0 に戻す
+                    // (batch 単位の lock)。`active_hist` / `local_hist` は同時に
+                    // `Some` / `None`。
+                    if let (Some(shared), Some(local)) = (active_hist.as_ref(), local_hist.as_mut())
+                    {
+                        let mut g = shared.lock().expect("active_hist mutex poisoned");
+                        for (dst, src) in g.iter_mut().zip(local.iter()) {
+                            *dst += *src;
+                        }
+                        for v in local.iter_mut() {
+                            *v = 0;
+                        }
+                    }
 
                     // main へ。受信側が落ちていたら (loader drop) 終了。
                     if result_tx.send((batch, buckets)).is_err() {
@@ -721,8 +871,20 @@ impl BucketedPrefetchedLoader {
             result_rx: Some(result_rx),
             pool_tx: Some(pool_tx),
             err_slot,
+            active_hist,
             handles,
         })
+    }
+
+    /// `--monitor-active-features` の histogram の現時点 snapshot を返す
+    /// (`spawn` で `monitor_active = false` なら `None`)。返す `Vec<u64>` は
+    /// 長さ `feature_set.max_active() + 1` で、bin `k` = 実 active 数がちょうど
+    /// `k` だった position 数の累積 (全 worker 合算)。lock 中に clone するので
+    /// 呼び出しは superbatch 末など低頻度に留めること。
+    pub fn active_histogram_snapshot(&self) -> Option<Vec<u64>> {
+        self.active_hist
+            .as_ref()
+            .map(|h| h.lock().expect("active_hist mutex poisoned").clone())
     }
 
     /// 次の `(Batch, per-position bucket)` を取得。返り値:
@@ -824,6 +986,57 @@ mod tests {
             .parent()
             .unwrap()
             .join("shogi-format/tests/data/sample.psv")
+    }
+
+    #[test]
+    #[ignore = "requires matching external HCPE and PSV files"]
+    fn hcpe_matches_psv_crosscheck() {
+        let hcpe_path = std::env::var_os("TATARA_HCPE_CROSSCHECK")
+            .map(PathBuf::from)
+            .expect("set TATARA_HCPE_CROSSCHECK");
+        let psv_path = std::env::var_os("TATARA_PSV_CROSSCHECK")
+            .map(PathBuf::from)
+            .expect("set TATARA_PSV_CROSSCHECK");
+        let mut hcpe = HcpeFileLoader::new(hcpe_path).expect("open HCPE");
+        let mut psv = PsvFileLoader::new(psv_path).expect("open PSV");
+        let mut positions = 0_u64;
+
+        loop {
+            let hcpe_board = hcpe.next_board().expect("decode HCPE");
+            let psv_board = psv.next_psv().expect("decode PSV").map(|p| p.decode());
+            match (hcpe_board, psv_board) {
+                (Some(h), Some(p)) => {
+                    assert_eq!(h.board, p.board, "board mismatch at record {positions}");
+                    assert_eq!(
+                        h.black_hand.counts, p.black_hand.counts,
+                        "black hand mismatch at record {positions}"
+                    );
+                    assert_eq!(
+                        h.white_hand.counts, p.white_hand.counts,
+                        "white hand mismatch at record {positions}"
+                    );
+                    assert_eq!(
+                        h.side_to_move, p.side_to_move,
+                        "side-to-move mismatch at record {positions}"
+                    );
+                    assert_eq!(
+                        h.black_king_sq, p.black_king_sq,
+                        "black king mismatch at record {positions}"
+                    );
+                    assert_eq!(
+                        h.white_king_sq, p.white_king_sq,
+                        "white king mismatch at record {positions}"
+                    );
+                    assert_eq!(h.score, p.score, "score mismatch at record {positions}");
+                    assert_eq!(h.result, p.result, "result mismatch at record {positions}");
+                    positions += 1;
+                }
+                (None, None) => break,
+                _ => panic!("record count mismatch after {positions} positions"),
+            }
+        }
+        assert!(positions > 0, "cross-check files are empty");
+        eprintln!("cross-checked {positions} HCPE/PSV positions");
     }
 
     #[test]
@@ -1029,7 +1242,9 @@ mod tests {
         // sample.psv の 100 records しかない → 100 で打ち切り。
         assert_eq!(n, 100);
         assert_eq!(batch.n_positions, 100);
-        // 残り 150-100=50 slot は padding のまま (-1 / 0.0 / 1.0)。
+        // 末尾 50 行は fill が touch しない。fresh batch なので `with_capacity` の初期値
+        // (-1 / 0.0) のまま (`reset` は buffer を clear しないが、初回 fill では
+        // with_capacity 初期化がそのまま残る)。下流はこの領域を読まない。
         for j in 100 * test_spec().max_active()..150 * test_spec().max_active() {
             assert_eq!(batch.stm_indices[j], -1);
         }
@@ -1056,15 +1271,185 @@ mod tests {
     }
 
     #[test]
-    fn batch_reset_zeros_state() {
-        let mut batch = Batch::with_capacity(4, test_spec());
+    fn push_decoded_counting_aggregates_active_counts() {
+        let spec = test_spec();
         let mut loader = PsvFileLoader::new(sample_psv_path()).unwrap();
-        loader.fill_batch(&mut batch).unwrap();
-        assert_eq!(batch.n_positions, 4);
+        let mut batch = Batch::with_capacity(8, spec);
+        let mut hist = vec![0u64; spec.max_active() + 1];
+
+        let mut pushed = 0u64;
+        for _ in 0..8 {
+            let psv = loader.next_psv().unwrap().expect("record");
+            let board = psv.decode();
+            let bi = batch.n_positions;
+            assert!(
+                batch
+                    .push_decoded_counting(&board, Some(&mut hist))
+                    .unwrap()
+            );
+            let row = &batch.stm_indices[bi * spec.max_active()..(bi + 1) * spec.max_active()];
+            let written = row.iter().take_while(|&&idx| idx >= 0).count();
+            assert_eq!(batch.nnz[bi], written as i32);
+            pushed += 1;
+        }
+        // histogram の総和は push した position 数と一致する。
+        assert_eq!(hist.iter().sum::<u64>(), pushed);
+        // すべての実 active 数は `max_active` の bin 域に収まる (padding index には
+        // 入らない): non-zero の最大 bin が max_active 以下であることで確認。
+        let max_bin = hist.iter().rposition(|&c| c > 0).expect("some active");
+        assert!(max_bin <= spec.max_active());
+
+        // batch 満杯後の push (`Ok(false)`) は histogram を増やさない。
+        let extra = loader.next_psv().unwrap().expect("record").decode();
+        assert!(
+            !batch
+                .push_decoded_counting(&extra, Some(&mut hist))
+                .unwrap()
+        );
+        assert_eq!(
+            hist.iter().sum::<u64>(),
+            pushed,
+            "batch 満杯時の push は histogram に加算しない"
+        );
+    }
+
+    #[test]
+    fn bucketed_loader_active_histogram_gated_by_flag() {
+        let progress = ShogiProgressKPAbs;
+        let path = sample_psv_path();
+        let end = full_range_end(&path);
+
+        // 計装 off: snapshot は None (histogram を確保しない = 集計しない)。
+        let mut off = BucketedPrefetchedLoader::spawn(
+            &path,
+            8,
+            None,
+            None,
+            1,
+            progress,
+            test_spec(),
+            true,
+            9,
+            end,
+            false,
+        )
+        .unwrap();
+        let (batch, buckets) = off.next_batch().unwrap().expect("a batch");
+        off.recycle((batch, buckets));
+        assert!(
+            off.active_histogram_snapshot().is_none(),
+            "flag off では histogram を確保・集計しない"
+        );
+        drop(off);
+
+        // 計装 on: snapshot は Some、長さ = max_active + 1、総和は消費した
+        // position 数以上 (worker が先読みで余分に埋め得るため厳密一致は保証
+        // しない)。全 active 数は max_active bin 域に収まる。
+        let mut on = BucketedPrefetchedLoader::spawn(
+            &path,
+            8,
+            None,
+            None,
+            1,
+            progress,
+            test_spec(),
+            true,
+            9,
+            end,
+            true,
+        )
+        .unwrap();
+        let mut consumed = 0u64;
+        for _ in 0..5 {
+            let (batch, buckets) = on.next_batch().unwrap().expect("a batch");
+            consumed += batch.n_positions as u64;
+            on.recycle((batch, buckets));
+        }
+        let hist = on.active_histogram_snapshot().expect("histogram present");
+        assert_eq!(hist.len(), test_spec().max_active() + 1);
+        let total: u64 = hist.iter().sum();
+        assert!(
+            total >= consumed,
+            "histogram total {total} は消費 position 数 {consumed} 以上"
+        );
+        assert!(total > 0, "on では position が集計される");
+    }
+
+    /// `reset` は `n_positions` を 0 に戻すだけの O(1) 操作で、index / score buffer を
+    /// clear しない。再 fill 後、`nnz` 打ち切りで読む有効領域は前 batch の残骸に汚染
+    /// されない (下流 kernel の per-slot early-out と同じ不変条件を host 側で検証する)。
+    #[test]
+    fn reset_is_o1_and_refill_ignores_stale_residue() {
+        let spec = test_spec();
+        let max_active = spec.max_active();
+        // batch_size > sample.psv の record 数 (100) にして、`[n_positions, batch_size)`
+        // の残骸 row が必ず存在する状態を作る (実長超 slot の有無に依存しない)。
+        let cap = 150;
+        let mut batch = Batch::with_capacity(cap, spec);
+
+        // 1 回目の fill (100 record で打ち切り)。各 row の有効 index を記録しておく。
+        PsvFileLoader::new(sample_psv_path())
+            .unwrap()
+            .fill_batch(&mut batch)
+            .unwrap();
+        let n_pos = batch.n_positions;
+        assert_eq!(n_pos, 100);
+        let valid_snapshot: Vec<Vec<i32>> = (0..n_pos)
+            .map(|bi| {
+                let base = bi * max_active;
+                batch.stm_indices[base..base + batch.nnz[bi] as usize].to_vec()
+            })
+            .collect();
+
+        // 「前 batch の残骸」を模した範囲内 index を実長超 slot (row 内 tail) と
+        // `[n_pos, cap)` の未使用 row に書き込む (`idx >= 0` 防御 skip を素通りする値)。
+        for bi in 0..n_pos {
+            for ni in batch.nnz[bi] as usize..max_active {
+                batch.stm_indices[bi * max_active + ni] = 7;
+                batch.nstm_indices[bi * max_active + ni] = 7;
+            }
+        }
+        for j in n_pos * max_active..cap * max_active {
+            batch.stm_indices[j] = 7;
+        }
+        batch.score[cap - 1] = 12_345.0;
+
+        // reset は index / score を clear しない (残骸が残ることで O(1) 化を確認)。
         batch.reset();
         assert_eq!(batch.n_positions, 0);
-        assert!(batch.stm_indices.iter().all(|&i| i == -1));
-        assert!(batch.score.iter().all(|&s| s == 0.0));
+        assert_eq!(
+            batch.stm_indices[n_pos * max_active],
+            7,
+            "reset は index buffer を clear しない (残骸 row が残る)"
+        );
+        assert_eq!(
+            batch.score[cap - 1],
+            12_345.0,
+            "reset は score buffer を clear しない"
+        );
+
+        // 2 回目の fill。同一ファイル先頭からなので各 row は同じ局面で埋まる。
+        PsvFileLoader::new(sample_psv_path())
+            .unwrap()
+            .fill_batch(&mut batch)
+            .unwrap();
+        assert_eq!(batch.n_positions, n_pos);
+
+        // 下流が読む領域 (`nnz` 打ち切り / `n_pos` 行) は 1 回目と bit 一致し、
+        // 残骸 (7) を含まない。tail / `[n_pos, cap)` の 7 は下流に観測されない。
+        for (bi, expected) in valid_snapshot.iter().enumerate() {
+            let base = bi * max_active;
+            let n = batch.nnz[bi] as usize;
+            assert_eq!(
+                &batch.stm_indices[base..base + n],
+                expected.as_slice(),
+                "position {bi} の有効 slot は新データのみ (残骸は nnz 打ち切りで除外)"
+            );
+            assert!(
+                batch.stm_indices[base..base + n].iter().all(|&i| i >= 0),
+                "position {bi} の有効 slot に padding/残骸が混入していない"
+            );
+        }
     }
 
     #[test]
@@ -1104,12 +1489,14 @@ mod tests {
             &path,
             16,
             None,
+            None,
             num_workers,
             progress,
             test_spec(),
             true,
             9,
             end,
+            false,
         )
         .unwrap();
         // epoch wrap するので何 batch でも取れる。30 batch ぶん検査して recycle で
@@ -1142,6 +1529,45 @@ mod tests {
     }
 
     #[test]
+    fn bucketed_loader_dispatches_kingrank9_without_progress_weights() {
+        let path = sample_psv_path();
+        let end = full_range_end(&path);
+        let mut expected_reader = PsvFileLoader::new(&path).expect("open sample PSV");
+        let mut expected = Vec::new();
+        for _ in 0..16 {
+            let board = expected_reader
+                .next_psv()
+                .expect("read sample PSV")
+                .expect("sample record")
+                .decode();
+            expected.push(i32::from(kingrank9_bucket_board(&board)));
+        }
+
+        let mut loader = BucketedPrefetchedLoader::spawn(
+            &path,
+            16,
+            None,
+            None,
+            1,
+            BucketMode::KingRank9,
+            test_spec(),
+            true,
+            9,
+            end,
+            false,
+        )
+        .expect("spawn KingRank9 loader");
+        let (batch, buckets) = loader
+            .next_batch()
+            .expect("load batch")
+            .expect("full batch");
+        assert_eq!(batch.n_positions, 16);
+        assert_eq!(buckets, expected);
+        assert!(buckets.iter().all(|&bucket| (0..9).contains(&bucket)));
+        loader.recycle((batch, buckets));
+    }
+
+    #[test]
     fn bucketed_loader_single_worker() {
         run_bucketed_smoke(1);
     }
@@ -1156,9 +1582,20 @@ mod tests {
         let progress = ShogiProgressKPAbs;
         let path = sample_psv_path();
         let end = full_range_end(&path);
-        let mut loader =
-            BucketedPrefetchedLoader::spawn(&path, 8, None, 0, progress, test_spec(), true, 9, end)
-                .unwrap();
+        let mut loader = BucketedPrefetchedLoader::spawn(
+            &path,
+            8,
+            None,
+            None,
+            0,
+            progress,
+            test_spec(),
+            true,
+            9,
+            end,
+            false,
+        )
+        .unwrap();
         let (batch, buckets) = loader.next_batch().unwrap().expect("a batch");
         assert_eq!(batch.n_positions, 8);
         assert_eq!(buckets.len(), 8);
@@ -1180,12 +1617,14 @@ mod tests {
             &path,
             8,
             Some(32000),
+            None,
             2,
             progress,
             test_spec(),
             true,
             9,
             end,
+            false,
         )
         .unwrap();
         let (batch, _buckets) = ok_loader.next_batch().unwrap().expect("a batch");
@@ -1200,12 +1639,14 @@ mod tests {
             &path,
             100,
             Some(1),
+            None,
             1,
             progress,
             test_spec(),
             true,
             9,
             end,
+            false,
         )
         .unwrap();
         let _ = drop_loader.next_batch();
@@ -1223,12 +1664,14 @@ mod tests {
             &path,
             8,
             None,
+            None,
             1,
             progress,
             test_spec(),
             true,
             9,
             2800,
+            false,
         )
         .unwrap();
         for _ in 0..30 {
@@ -1247,12 +1690,38 @@ mod tests {
         // 末尾 30 records (offset 2800..4000) の範囲を epoch reader で読む。
         // 100 record 分 next() しても barren error にならず (= range 内 wrap が
         // 効いている)、各 record が必ず内容を返すことを確認する。
-        let mut reader = PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None).unwrap();
+        let mut reader =
+            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None).unwrap();
         for i in 0..100 {
             let _psv = reader
                 .next()
                 .unwrap_or_else(|e| panic!("wrap should keep returning records (i={i}): {e}"));
         }
+    }
+
+    #[test]
+    fn psv_epoch_reader_clamps_after_drop() {
+        // score だけ既知の synthetic PSV (盤面 bytes は reader レベルでは decode
+        // されないので zero 埋めで良い)。drop 32000 → 詰み stamp ±32000 は clamp
+        // されずに drop され、生き残りは ±100 に飽和されることを確認する。
+        let scores: [i16; 7] = [0, 50, -50, 200, -200, 32000, -32000];
+        let mut bytes = Vec::with_capacity(scores.len() * 40);
+        for s in scores {
+            let mut rec = [0u8; 40];
+            rec[32..34].copy_from_slice(&s.to_le_bytes());
+            bytes.extend_from_slice(&rec);
+        }
+        let tmp = std::env::temp_dir().join(format!(
+            "nnue-train-clamp-after-drop-{}.psv",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, &bytes).expect("write synthetic psv");
+
+        let mut reader =
+            PsvEpochReader::new_range(&tmp, 0, bytes.len() as u64, Some(32000), Some(100)).unwrap();
+        let got: Vec<i16> = (0..5).map(|_| reader.next().unwrap().score()).collect();
+        std::fs::remove_file(&tmp).ok();
+        assert_eq!(got, vec![0, 50, -50, 100, -100]);
     }
 
     #[test]
@@ -1263,9 +1732,20 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&tmp, b"").expect("write empty psv");
-        let mut loader =
-            BucketedPrefetchedLoader::spawn(&tmp, 8, None, 1, progress, test_spec(), true, 9, 0)
-                .unwrap();
+        let mut loader = BucketedPrefetchedLoader::spawn(
+            &tmp,
+            8,
+            None,
+            None,
+            1,
+            progress,
+            test_spec(),
+            true,
+            9,
+            0,
+            false,
+        )
+        .unwrap();
         let err = loader
             .next_batch()
             .expect_err("empty file → barren error, not None and not hang");

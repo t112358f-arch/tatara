@@ -2,17 +2,29 @@
 
 # tatara
 
+![tatara — Rust で鍛える将棋 NNUE](docs/tatara-hero.jpg)
+
 **将棋 NNUE 評価関数を高速に学習する Rust 製トレーナー。**
 
-tatara は将棋の NNUE (Efficiently Updatable Neural Network) 評価関数を GPU で
-学習するツール。host から device まで **Rust 一言語**で書かれ、GPU kernel は
-[cuda-oxide](https://github.com/NVlabs/cuda-oxide)(NVIDIA Labs の Rust → PTX
-rustc backend)で build-time に PTX 化する — C / C++ / CUDA C++ を一切介さない。
+tatara は将棋の NNUE (Efficiently Updatable Neural Network) 評価関数を NVIDIA
+GPU で学習するツール。trainer、data pipeline、CUDA Driver API runtime は
+Rust で書かれ、native GPU backend は hand-fuse した CUDA C++ kernel を NVCC で
+fat binary に compile して実行ファイルへ埋め込む。
 
-GPU kernel を hand-fuse することで **極めて高速** — 上流の CUDA C++ trainer
-[bullet-shogi](https://github.com/SH11235/bullet-shogi) を上回る throughput を出す。
+[cuda-oxide](https://github.com/NVlabs/cuda-oxide) の Rust → PTX backend も Cargo の
+既定 feature および native backend の数値・性能 reference として保守している。
+`native-cuda-host` build は cuda-oxide を使わず、NVCC で build した kernel と
+portable Rust host runtime だけを使う。`native-cuda` feature は数値 parity と
+benchmark 比較のため両方の device backend を有効化するが、build されるのは
+NVCC fat binary のみ — cuda-oxide 側の PTX は事前に
+`bash scripts/build-kernels.sh` で生成しておく
+([docs/native-cuda-benchmark.md](docs/native-cuda-benchmark.md) 参照)。
 
-**vs bullet-shogi (RTX 3080 Ti 実測)**: LayerStack は bit-identical な既定経路でも
+GPU kernel を hand-fuse することで **極めて高速** — 実測した cuda-oxide backend は
+上流の CUDA C++ trainer [bullet-shogi](https://github.com/SH11235/bullet-shogi)
+を上回る throughput を出し、native backend も同じ fused training 設計を使う。
+
+**cuda-oxide vs bullet-shogi (RTX 3080 Ti 実測)**: LayerStack は bit-identical な既定経路でも
 **+37%**、opt-in の FP16 モードを積むと最大 **~2.1×**。Simple (HalfKP
 `512x2-8-64`) は既定経路で約 **+20%**、`--all-optim`(FP16/TF32) で約 **+55%**。
 
@@ -34,16 +46,24 @@ cargo run --release --bin nnue-train -- \
   --feature-set halfka-hm-merged --batch-size 65536 --superbatches 8 [--all-optim] \
   layerstack --ft-out {1536|768} --l1 {16|8} --l2 32
 
-# HalfKP (simple, progress 不要)
+# HalfKP (simple, progress 不要; simple トレーナは --win-rate-model 必須)
 cargo run --release --bin nnue-train -- \
   --data /path/to/teacher.psv \
   --feature-set halfkp --batch-size 65536 --superbatches 8 [--all-optim] \
+  --scale 290 --win-rate-model \
+  --wrm-in-offset 0 --wrm-target-offset 0 \
+  --wrm-in-scaling 290 --wrm-target-scaling 290 --wrm-nnue2score 290 \
   simple --arch 256x2-32-32
 ```
 
+simple トレーナは win-rate-model loss のみ対応 (int8 出力層が plain sigmoid loss の
+収束する centipawn スケール出力を表現できない)。上記の `--wrm-*` は WRM を plain
+sigmoid へ恒等退化させる設定で、`--scale` と各 `--wrm-*-scaling` / `--wrm-nnue2score`
+は同じ値に揃える (`--scale` が書き出す `fv_scale` も決めるため)。
+
 *tatara(踏鞴)、砂鉄（raw material）から玉鋼を精錬する日本の伝統的なたたら炉 — raw data から net を鍛え上げる。*
 
-> **NVIDIA only** — cuda-oxide が PTX 生成専用なため ROCm / AMD は対象外。
+> **NVIDIA only** — どちらの GPU backend も NVIDIA CUDA を対象とし、ROCm / AMD は対象外。
 > AMD GPU で類似の NNUE 学習を行いたい場合は CUDA / HIP 両 backend を持つ
 > 上流の [bullet-shogi](https://github.com/SH11235/bullet-shogi) を参照。
 
@@ -84,17 +104,15 @@ cargo run --release --bin nnue-train -- \
 
 ### 環境要件
 
-- **OS** — Linux 一級サポート、Windows は WSL2 経由、macOS は GPU ビルド非対応
-- **NVIDIA GPU** (Ampere 以降 / sm_80+ を公式サポート、Turing / sm_75 も
-  `CUDA_OXIDE_TARGET=sm_75` 環境変数で単純な kernel は動作)
+- **OS** — Linux 一級サポート、Windows は WSL2 経由に加え
+  `native-cuda-host` で native Windows を実験的にサポート、macOS は GPU ビルド非対応
+- **NVIDIA GPU** (backend 別の対応表は `docs/setup.ja.md` 参照)
 - **CUDA Toolkit 12.x** (12.9 で動作確認)
-- **LLVM 21+** (`llc-21` が floor、`llc-22` が atomics syncscope の完全性に
-  必要なので推奨)
-- **Rust nightly** (`rust-toolchain.toml` で cuda-oxide upstream の channel
-  に追従、rustc internal ABI に依存するため channel を勝手に変えない)
+- `native-cuda-host` は **NVCC**、既定の cuda-oxide backend は **LLVM 21+** と
+  `cargo-oxide`
+- **Rust nightly** (`rust-toolchain.toml` で固定)
 
-GPU kernel をビルドする `cargo-oxide` のセットアップは
-`bash scripts/setup-cuda-oxide.sh`。詳細なインストール手順・OS 別の案内・
+native CUDA C++ の build command、cuda-oxide のセットアップ、OS 別の詳細手順、
 サポート GPU マトリクスは [docs/setup.ja.md](docs/setup.ja.md) を参照。
 
 ### ビルドと学習
@@ -104,7 +122,7 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
 
 ## ドキュメント
 
-- [Setup guide](docs/setup.ja.md) — OS 別の案内、CUDA / LLVM / `cargo-oxide` の
+- [Setup guide](docs/setup.ja.md) — OS 別の案内、native CUDA / cuda-oxide の build
   セットアップ、サポート GPU マトリクス、CUDA toolkit root 解決
 - [Training quickstart](docs/training-quickstart.ja.md) — アーキ別の学習例 + 主要
   CLI option + resume / checkpoint 運用
@@ -120,6 +138,8 @@ kernel のビルドと smoke test は [docs/setup.ja.md](docs/setup.ja.md)、学
   が何を担うか
 - [Arch string](docs/arch-string.md) — 量子化 `.bin` header に埋め込むアーキ
   記述文字列の組み立てと load 時照合 (日本語のみ)
+- [YaneuraOu 用 LayerStack net 変換](docs/net-to-yaneuraou.md) —
+  `net_to_yo` の使い方、対応アーキ、binary layout
 
 ## 学習した net の使い方
 
@@ -127,6 +147,8 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 エンジンでロードする前提の format。`.bin` header と SCReLU / Pairwise 活性化は
 本プロジェクト固有なので、YaneuraOu など他の将棋エンジンでそのまま読めるとは
 限らず、アーキテクチャによっては推論部の追加実装をしないとロードできない。
+対応する 1536-16-32 LayerStack は
+[`net_to_yo`](docs/net-to-yaneuraou.md) で変換できる。
 学習済みの参考 net は
 [GitHub Releases](https://github.com/SH11235/tatara/releases) に添付している。
 自分で net を学習する場合の環境構築は [docs/setup.ja.md](docs/setup.ja.md) を参照。
@@ -139,6 +161,7 @@ tatara が出力する量子化 `.bin` は [rshogi](https://github.com/SH11235/r
 | **FT** | Feature Transformer — NNUE の入力 sparse → dense 層 |
 | **L1f** | LayerStack アーキの bucket 非依存 (全 bucket 共有) L1 dense 層。出力は per-bucket L1 の出力に加算される |
 | **PSV** | PackedSfenValue — bullet-shogi 由来の学習データ format (1 局面 + score + WDL) |
+| **HCPE** | HuffmanCodedPosAndEval — Apery / dlshogi の 38-byte 局面・score・指し手・対局結果 format |
 | **KP / KP-abs** | King-Piece relative feature と絶対値版 (progress / 入玉判定用) |
 | **bucket** | per-output-bucket 重み分離 (game phase / progress で分岐) |
 | **PSQT** | Piece-Square Table — 駒種×マスごとの線形評価テーブル。LayerStack の `--psqt` で per-bucket PSQT 出力を network 出力に加算し、dense 経路は非マテリアル構造の学習に専念できる |

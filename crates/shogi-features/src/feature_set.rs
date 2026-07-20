@@ -20,6 +20,7 @@ use shogi_format::bona_piece::{E_KING, F_KING, FE_HAND_END, FE_OLD_END};
 use shogi_format::types::{Color, HAND_PIECE_TYPES, Square};
 use shogi_format::{BonaPiece, PackedSfenValue, ShogiBoard};
 
+use crate::effect_bucket::{EffectBucketAttackCounts, EffectBucketConfig};
 use crate::threat::{THREAT_MAX_ACTIVE, ThreatIndexer};
 use crate::threat_exclusion::ThreatProfile;
 
@@ -32,7 +33,7 @@ use crate::threat_exclusion::ThreatProfile;
 pub(crate) enum KingEncoding {
     /// 玉を特徴に含めない (HalfKP)。玉位置は bucket index にのみ効く。
     NoKing,
-    /// 自玉・敵玉が別々の piece plane を占有する (HalfKA)。
+    /// 自玉・敵玉が別々の piece-input ordinal を占有する (HalfKA)。
     SplitPlane,
     /// 両玉を 1 plane へ畳む。敵玉の BonaPiece を 81 引いて自玉 plane に重ねる。
     MergedPlane,
@@ -114,7 +115,9 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKP,
                 arch_feature_name: "HalfKP",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                effect_bucket_config: None,
             },
             FeatureSet::HalfKaSplit => FeatureSetSpec {
                 feature_set: self,
@@ -126,7 +129,9 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_SPLIT,
                 arch_feature_name: "HalfKaSplit",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                effect_bucket_config: None,
             },
             FeatureSet::HalfKaMerged => FeatureSetSpec {
                 feature_set: self,
@@ -138,7 +143,9 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_MERGED,
                 arch_feature_name: "HalfKaMerged",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                effect_bucket_config: None,
             },
             FeatureSet::HalfKaHmSplit => FeatureSetSpec {
                 feature_set: self,
@@ -150,7 +157,9 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_HM_SPLIT,
                 arch_feature_name: "HalfKaHmSplit",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                effect_bucket_config: None,
             },
             FeatureSet::HalfKaHmMerged => FeatureSetSpec {
                 feature_set: self,
@@ -162,7 +171,9 @@ impl FeatureSet {
                 feature_hash: FEATURE_HASH_HALFKA_HM_MERGED,
                 arch_feature_name: "HalfKaHmMerged",
                 ft_factorize: false,
+                ft_factorize_mode: FtFactorizeMode::Base,
                 threat_profile: None,
+                effect_bucket_config: None,
             },
         }
     }
@@ -222,7 +233,21 @@ const fn threat_profile_hash(profile: ThreatProfile) -> u32 {
         ThreatProfile::SameClass => fnv1a32("threat-same-class"),
         ThreatProfile::SameClassMajorPawn => fnv1a32("threat-same-class-major-pawn"),
         ThreatProfile::StepAttacker => fnv1a32("threat-step-attacker"),
+        ThreatProfile::FullSymDedup => fnv1a32("threat-full-symdedup"),
         ThreatProfile::CrossSide => fnv1a32("threat-cross-side"),
+    }
+}
+
+/// effect bucket config ごとの feature hash 定数。`feature_hash() = base ^ この値` で
+/// 合成する。config は row の意味を変えるため load 時に hash / arch token の
+/// 両方で取り違えを弾く。
+const fn effect_bucket_config_hash(config: EffectBucketConfig) -> u32 {
+    match (config.nb, config.king_bucketed) {
+        (4, false) => fnv1a32("effect-bucket-2x2-kingfixed"),
+        (4, true) => fnv1a32("effect-bucket-2x2-kingbucketed"),
+        (9, false) => fnv1a32("effect-bucket-3x3-kingfixed"),
+        (9, true) => fnv1a32("effect-bucket-3x3-kingbucketed"),
+        _ => panic!("unsupported effect bucket config"),
     }
 }
 
@@ -246,22 +271,37 @@ pub struct FeatureSetSpec {
     max_active: usize,
     feature_hash: u32,
     arch_feature_name: &'static str,
-    /// FT factorizer (学習時のみの仮想特徴) が有効か。有効時は実特徴
-    /// `kb * piece_inputs + p` ごとに king-bucket 非依存の仮想 P plane
-    /// (`piece_inputs` 行) を FT weight の後ろに持ち、export 時に実行へ
-    /// 畳み込む。仮想行の forward 寄与と勾配は trainer が dense kernel
-    /// (実行との畳み込み / king-bucket 方向の縮約) で配線するため、特徴
+    /// FT factorizer (学習時のみの仮想特徴) が有効か。有効時は実特徴が共有する
+    /// virtual piece-input rows と virtual threat-pair rows を FT weight の後ろに持ち、
+    /// export 時に実行へ畳み込む。
+    /// 仮想行の forward 寄与と勾配は trainer が dense kernel
+    /// (実行との畳み込み / 同じ仮想行に対応する実行勾配の縮約) で配線するため、特徴
     /// emit と active 数 (`max_active`) は factorizer 非依存のまま。次元で
     /// 変わるのは weight 行数 (`train_ft_in`) だけ。export 後の artifact
     /// (次元 / hash / arch 名) も base と同一。
     ft_factorize: bool,
+    ft_factorize_mode: FtFactorizeMode,
     /// Threat sparse 特徴を base に連結する profile。`None` で base と
     /// bit-identical。`Some(profile)` のとき base の `ft_in` 直後に
     /// `threat_dims(profile)` 行を連結し、`max_active` / `feature_hash` も
     /// 変える (factorizer の次元不変 modifier とは別カテゴリ = base 次元の拡張)。
-    /// factorizer とは併用可 (fold/reduce/coalesce が base row 限定で threat 行を
-    /// 跨がない)。PSQT との併用のみ CLI が hard-error にする。
+    /// factorizer とは併用可 (fold/reduce/coalesce が threat pair ごとの仮想行を
+    /// 追加で配線する)。PSQT との併用のみ CLI が hard-error にする。
     threat_profile: Option<ThreatProfile>,
+    /// effect bucket で base index 全体を書き換える config。`None` で base と
+    /// bit-identical。threat とは同時に使わない。
+    effect_bucket_config: Option<EffectBucketConfig>,
+}
+
+/// FT factorizer の仮想行と実特徴の対応。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FtFactorizeMode {
+    /// Base feature index `kb * piece_inputs + p` は `virtual[p]` を参照する。
+    Base,
+    /// effect bucket index `(kb * piece_inputs + p) * NB + bucket` は `virtual[p]` を参照する。
+    PoolEffectBuckets,
+    /// effect bucket index `(kb * piece_inputs + p) * NB + bucket` は `virtual[p, bucket]` を参照する。
+    PerEffectBucket,
 }
 
 impl FeatureSetSpec {
@@ -291,6 +331,11 @@ impl FeatureSetSpec {
         self.threat_profile
     }
 
+    /// effect bucket config (無効時 `None`)。
+    pub const fn effect_bucket_config(&self) -> Option<EffectBucketConfig> {
+        self.effect_bucket_config
+    }
+
     /// 連結 threat 次元数 (threat 無効時 0)。
     pub const fn threat_dims(&self) -> usize {
         match self.threat_profile {
@@ -299,18 +344,25 @@ impl FeatureSetSpec {
         }
     }
 
-    /// 総入力次元 `ft_in`。base (`base_ft_in`) に threat 連結分を加える。
-    /// threat 無効時は base と同値。
+    /// 総入力次元 `ft_in`。effect bucket は base index を bucket 数倍に展開し、threat は
+    /// base の直後に sparse row を連結する。
     pub const fn ft_in(&self) -> usize {
-        self.base_ft_in() + self.threat_dims()
+        match self.effect_bucket_config {
+            Some(cfg) => {
+                debug_assert!(self.threat_profile.is_none());
+                self.base_ft_in() * cfg.nb
+            }
+            None => self.base_ft_in() + self.threat_dims(),
+        }
     }
 
     /// 1 局面で同時に active になる最大特徴数。threat 有効時は両視点の threat
     /// edge 上限 (`THREAT_MAX_ACTIVE`) を base に加える。
     pub const fn max_active(&self) -> usize {
-        match self.threat_profile {
-            Some(_) => self.max_active + THREAT_MAX_ACTIVE,
-            None => self.max_active,
+        match (self.effect_bucket_config, self.threat_profile) {
+            (Some(_), _) => self.max_active,
+            (None, Some(_)) => self.max_active + THREAT_MAX_ACTIVE,
+            (None, None) => self.max_active,
         }
     }
 
@@ -321,8 +373,27 @@ impl FeatureSetSpec {
     /// 同一形であることを型レベルで表す。学習側の weight buffer / checkpoint
     /// だけが `train_ft_in` を参照する。
     pub const fn with_ft_factorize(self) -> Self {
+        let mode = match self.effect_bucket_config {
+            Some(_) => FtFactorizeMode::PoolEffectBuckets,
+            None => FtFactorizeMode::Base,
+        };
+        self.with_ft_factorize_mode(mode)
+    }
+
+    /// FT factorizer を指定 mode で有効にした spec を返す。
+    pub const fn with_ft_factorize_mode(self, mode: FtFactorizeMode) -> Self {
+        match (self.effect_bucket_config, mode) {
+            (Some(_), FtFactorizeMode::Base) => {
+                panic!("effect bucket feature sets need an effect bucket factorizer mode")
+            }
+            (None, FtFactorizeMode::PoolEffectBuckets | FtFactorizeMode::PerEffectBucket) => {
+                panic!("effect bucket factorizer modes require an effect bucket feature set")
+            }
+            _ => {}
+        }
         FeatureSetSpec {
             ft_factorize: true,
+            ft_factorize_mode: mode,
             ..self
         }
     }
@@ -332,11 +403,31 @@ impl FeatureSetSpec {
     /// `ft_factorize` とは違い base 次元を拡張する: `ft_in` / `max_active` /
     /// `feature_hash` がすべて変わる。base offset (`base_ft_in`) は不変で、
     /// threat index の emit はその直後に連結される。`ft_factorize` とは併用可
-    /// (fold/reduce/coalesce が base row 限定で threat 行を跨がない)。PSQT との
+    /// (fold/reduce/coalesce が threat pair ごとの仮想行を追加で配線する)。PSQT との
     /// 併用のみ呼び出し側 (CLI) が hard-error にする (base 限定 PSQT が未検証のため)。
     pub fn with_threat_profile(self, profile: ThreatProfile) -> Self {
+        if self.effect_bucket_config.is_some() {
+            panic!("effect bucket feature sets cannot use threat profiles");
+        }
         FeatureSetSpec {
             threat_profile: Some(profile),
+            ..self
+        }
+    }
+
+    /// effect bucket feature set を有効にした spec を返す。
+    pub fn with_effect_bucket_config(self, config: EffectBucketConfig) -> Self {
+        if self.threat_profile.is_some() {
+            panic!("effect bucket feature sets cannot use threat profiles");
+        }
+        let ft_factorize_mode = if self.ft_factorize {
+            FtFactorizeMode::PoolEffectBuckets
+        } else {
+            self.ft_factorize_mode
+        };
+        FeatureSetSpec {
+            effect_bucket_config: Some(config),
+            ft_factorize_mode,
             ..self
         }
     }
@@ -346,13 +437,67 @@ impl FeatureSetSpec {
         self.ft_factorize
     }
 
-    /// 学習時の FT weight 行数。factorizer 有効時は仮想 P plane (`piece_inputs`
-    /// 行) が base の後ろに連結される。無効時は `ft_in` と同値。sparse index の
+    /// FT factorizer の共有 mode。
+    pub const fn ft_factorize_mode(&self) -> FtFactorizeMode {
+        self.ft_factorize_mode
+    }
+
+    /// FT factorizer の仮想行数。
+    pub const fn ft_factorize_virtual_rows(&self) -> usize {
+        if !self.ft_factorize {
+            return 0;
+        }
+        let base_rows = match (self.ft_factorize_mode, self.effect_bucket_config) {
+            (FtFactorizeMode::Base, _) | (FtFactorizeMode::PoolEffectBuckets, _) => {
+                self.piece_inputs
+            }
+            (FtFactorizeMode::PerEffectBucket, Some(cfg)) => self.piece_inputs * cfg.nb,
+            (FtFactorizeMode::PerEffectBucket, None) => {
+                panic!("effect bucket per-effect-bucket factorizer needs effect bucket config")
+            }
+        };
+        base_rows + self.threat_factorize_pair_count()
+    }
+
+    /// Threat profile に残る pair 数。virtual threat-pair rows の行数に使う。
+    pub const fn threat_factorize_pair_count(&self) -> usize {
+        match self.threat_profile {
+            Some(ThreatProfile::Full) | Some(ThreatProfile::FullSymDedup) => 324,
+            Some(ThreatProfile::SameClass) => 288,
+            Some(ThreatProfile::SameClassMajorPawn) => 272,
+            Some(ThreatProfile::StepAttacker) => 144,
+            Some(ThreatProfile::CrossSide) => 144,
+            None => 0,
+        }
+    }
+
+    /// Threat within-pair factorizer 用の pair prefix table。
+    ///
+    /// 返り値は threat block 内 offset の prefix table で、pair ordinal `p` の範囲は
+    /// `[starts[p], starts[p + 1])`。factorizer 無効または threat 無効なら空。
+    pub fn threat_factorize_pair_starts(&self) -> Vec<usize> {
+        let Some(profile) = self.threat_profile else {
+            return Vec::new();
+        };
+        if !self.ft_factorize {
+            return Vec::new();
+        }
+        let mut starts = Vec::with_capacity(self.threat_factorize_pair_count() + 1);
+        starts.push(0);
+        crate::threat::for_each_threat_pair_range(profile, |_, _, _, _, base, width| {
+            debug_assert_eq!(starts.last().copied(), Some(base));
+            starts.push(base + width);
+        });
+        starts
+    }
+
+    /// 学習時の FT weight 行数。factorizer 有効時は mode ごとの virtual piece-input rows
+    /// と virtual threat-pair rows が実行の後ろに連結される。無効時は `ft_in` と同値。sparse index の
     /// 範囲と active 数は factorizer に依らず base (`ft_in` / `max_active`) の
     /// まま — 仮想行は trainer の dense kernel 経由でのみ読み書きされる。
     pub const fn train_ft_in(&self) -> usize {
         if self.ft_factorize {
-            self.ft_in() + self.piece_inputs
+            self.ft_in() + self.ft_factorize_virtual_rows()
         } else {
             self.ft_in()
         }
@@ -363,9 +508,10 @@ impl FeatureSetSpec {
     /// と bit-identical)。全 base × 全 profile の合成 hash が pairwise distinct で
     /// あることは test (`threat_profile_hashes_keep_all_specs_distinct`) で固定。
     pub const fn feature_hash(&self) -> u32 {
-        match self.threat_profile {
-            Some(p) => self.feature_hash ^ threat_profile_hash(p),
-            None => self.feature_hash,
+        match (self.effect_bucket_config, self.threat_profile) {
+            (Some(cfg), _) => self.feature_hash ^ effect_bucket_config_hash(cfg),
+            (None, Some(p)) => self.feature_hash ^ threat_profile_hash(p),
+            (None, None) => self.feature_hash,
         }
     }
 
@@ -410,6 +556,11 @@ impl FeatureSetSpec {
     /// emit は FT factorizer に依存しない (仮想行は trainer の dense kernel が
     /// 配線するため sparse index 列には現れない)。
     pub fn map_features_board<F: FnMut(usize, usize)>(&self, board: &ShogiBoard, mut f: F) {
+        if let Some(config) = self.effect_bucket_config {
+            self.map_effect_bucket_features_board_both(board, config, f);
+            return;
+        }
+
         let stm = board.side_to_move;
         let nstm = stm.opponent();
 
@@ -508,6 +659,19 @@ impl FeatureSetSpec {
         nstm_out: &mut [i32],
     ) -> usize {
         debug_assert_eq!(stm_out.len(), nstm_out.len());
+
+        if let Some(config) = self.effect_bucket_config {
+            let cap = stm_out.len();
+            let mut count = 0usize;
+            self.map_effect_bucket_features_board_both(board, config, |stm, nstm| {
+                if count < cap {
+                    stm_out[count] = stm as i32;
+                    nstm_out[count] = nstm as i32;
+                }
+                count += 1;
+            });
+            return count;
+        }
 
         let stm = board.side_to_move;
         let nstm = stm.opponent();
@@ -680,7 +844,127 @@ impl FeatureSetSpec {
         ctx.king_bucket * self.piece_inputs + self.pack_bonapiece(bp, ctx.mirror_files)
     }
 
-    /// BonaPiece を piece plane 内のインデックスへ写す。
+    fn effect_bucket_index(
+        &self,
+        ctx: &PerspectiveCtx,
+        counts: &EffectBucketAttackCounts,
+        config: EffectBucketConfig,
+        bp: BonaPiece,
+        board_piece: Option<(Color, Square)>,
+    ) -> usize {
+        let packed = self.pack_bonapiece(bp, ctx.mirror_files);
+        let base = ctx.king_bucket * self.piece_inputs + packed;
+        let bucket = if crate::effect_bucket::packed_is_bucketed(packed, config.king_bucketed) {
+            let (color, sq) =
+                board_piece.expect("bucketed effect bucket feature must have a board square");
+            crate::effect_bucket::effect_bucket(
+                counts.get(color.opponent(), sq),
+                counts.get(color, sq),
+                config.nb,
+            )
+        } else {
+            0
+        };
+        crate::effect_bucket::effect_bucket_index(base, bucket, config.nb)
+    }
+
+    fn map_effect_bucket_features_board_both<F: FnMut(usize, usize)>(
+        &self,
+        board: &ShogiBoard,
+        config: EffectBucketConfig,
+        mut f: F,
+    ) {
+        let stm = board.side_to_move;
+        let nstm = stm.opponent();
+
+        let stm_king = board.king_square(stm);
+        let nstm_king = board.king_square(nstm);
+        if !stm_king.is_valid() || !nstm_king.is_valid() {
+            return;
+        }
+
+        let stm_ctx = self.perspective_ctx(stm_king, stm);
+        let nstm_ctx = self.perspective_ctx(nstm_king, nstm);
+        let counts = crate::effect_bucket::effect_bucket_attacker_counts(board);
+
+        board.for_each_board_piece(|piece, sq| {
+            let stm_bp = BonaPiece::from_piece_square(piece, sq, stm);
+            let nstm_bp = BonaPiece::from_piece_square(piece, sq, nstm);
+            f(
+                self.effect_bucket_index(
+                    &stm_ctx,
+                    &counts,
+                    config,
+                    stm_bp,
+                    Some((piece.color, sq)),
+                ),
+                self.effect_bucket_index(
+                    &nstm_ctx,
+                    &counts,
+                    config,
+                    nstm_bp,
+                    Some((piece.color, sq)),
+                ),
+            );
+        });
+
+        if self.emits_king_feature() {
+            let stm_friend = king_bonapiece(stm_king, stm, true);
+            let nstm_friend = king_bonapiece(nstm_king, nstm, true);
+            f(
+                self.effect_bucket_index(
+                    &stm_ctx,
+                    &counts,
+                    config,
+                    stm_friend,
+                    Some((stm, stm_king)),
+                ),
+                self.effect_bucket_index(
+                    &nstm_ctx,
+                    &counts,
+                    config,
+                    nstm_friend,
+                    Some((nstm, nstm_king)),
+                ),
+            );
+
+            let stm_enemy = king_bonapiece(nstm_king, stm, false);
+            let nstm_enemy = king_bonapiece(stm_king, nstm, false);
+            f(
+                self.effect_bucket_index(
+                    &stm_ctx,
+                    &counts,
+                    config,
+                    stm_enemy,
+                    Some((nstm, nstm_king)),
+                ),
+                self.effect_bucket_index(
+                    &nstm_ctx,
+                    &counts,
+                    config,
+                    nstm_enemy,
+                    Some((stm, stm_king)),
+                ),
+            );
+        }
+
+        for owner in [Color::Black, Color::White] {
+            for &pt in &HAND_PIECE_TYPES {
+                for i in 1..=board.hand(owner).count(pt) {
+                    let stm_bp = BonaPiece::from_hand_piece(stm, owner, pt, i);
+                    if stm_bp != BonaPiece::ZERO {
+                        let nstm_bp = BonaPiece::from_hand_piece(nstm, owner, pt, i);
+                        f(
+                            self.effect_bucket_index(&stm_ctx, &counts, config, stm_bp, None),
+                            self.effect_bucket_index(&nstm_ctx, &counts, config, nstm_bp, None),
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// BonaPiece を piece-input ordinal 内のインデックスへ写す。
     ///
     /// 1. `mirror_files` のとき盤上駒・玉のマスを筋反転する (手駒は対象外)。
     /// 2. 軸 1 が `MergedPlane` のとき敵玉 (`>= E_KING`) を 81 引いて自玉 plane に
@@ -859,7 +1143,7 @@ mod tests {
             assert_eq!(fact.max_active(), base.max_active());
             assert_eq!(fact.feature_hash(), base.feature_hash());
             assert_eq!(fact.arch_feature_name(), base.arch_feature_name());
-            // train_ft_in は OFF では base と同値、ON で仮想 P plane を連結。
+            // train_ft_in は OFF では base と同値、ON でpiece-input 仮想行 を連結。
             assert_eq!(base.train_ft_in(), base.ft_in());
             assert_eq!(fact.train_ft_in(), base.ft_in() + base.piece_inputs());
             // modifier は PartialEq で弁別される (Batch / trainer / weight の
@@ -919,8 +1203,8 @@ mod tests {
     #[test]
     fn arch_feature_name_uses_pascal_case() {
         // arch_str に embed される keyword は PascalCase 表記で固定する。
-        // 推論側 (rshogi) parser は両綴りを受理するが、emit 側は単一の
-        // canonical 形を残す。
+        // net を load する側の parser は両綴りを受理し得るが、emit 側は
+        // 単一の canonical 形を残す。
         let expected = [
             (FeatureSet::HalfKp, "HalfKP"),
             (FeatureSet::HalfKaSplit, "HalfKaSplit"),
@@ -935,12 +1219,20 @@ mod tests {
 
     // ---- Threat 連結 ----
 
-    const ALL_PROFILES: [ThreatProfile; 5] = [
+    const ALL_PROFILES: [ThreatProfile; 6] = [
         ThreatProfile::Full,
         ThreatProfile::SameClass,
         ThreatProfile::SameClassMajorPawn,
         ThreatProfile::StepAttacker,
+        ThreatProfile::FullSymDedup,
         ThreatProfile::CrossSide,
+    ];
+
+    const ALL_EFFECT_BUCKET_CONFIGS: [EffectBucketConfig; 4] = [
+        EffectBucketConfig::KINGFIXED_2X2,
+        EffectBucketConfig::KINGBUCKETED_2X2,
+        EffectBucketConfig::KINGFIXED_3X3,
+        EffectBucketConfig::KINGBUCKETED_3X3,
     ];
 
     #[test]
@@ -961,6 +1253,8 @@ mod tests {
             (ThreatProfile::SameClass, 192_640),
             (ThreatProfile::SameClassMajorPawn, 173_568),
             (ThreatProfile::StepAttacker, 33_408),
+            // FullSymDedup は index 空間が Full と同一 (dims 216_720)。
+            (ThreatProfile::FullSymDedup, 216_720),
             (ThreatProfile::CrossSide, 96_320),
         ];
         for fs in FeatureSet::ALL {
@@ -979,9 +1273,43 @@ mod tests {
     }
 
     #[test]
+    fn threat_factorized_pair_prefix_matches_profile_dimensions() {
+        for fs in FeatureSet::ALL {
+            for profile in ALL_PROFILES {
+                let spec = fs.spec().with_threat_profile(profile).with_ft_factorize();
+                let starts = spec.threat_factorize_pair_starts();
+                assert_eq!(
+                    starts.len(),
+                    spec.threat_factorize_pair_count() + 1,
+                    "{} {profile} pair prefix length",
+                    fs.canonical_name()
+                );
+                assert_eq!(
+                    starts.last().copied(),
+                    Some(spec.threat_dims()),
+                    "{} {profile} pair prefix terminal dim",
+                    fs.canonical_name()
+                );
+                assert!(
+                    starts.windows(2).all(|w| w[0] < w[1]),
+                    "{} {profile} pair prefix must be strictly increasing",
+                    fs.canonical_name()
+                );
+                assert_eq!(
+                    spec.train_ft_in(),
+                    spec.ft_in() + spec.piece_inputs() + spec.threat_factorize_pair_count(),
+                    "{} {profile} train_ft_in",
+                    fs.canonical_name()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn threat_profile_hashes_keep_all_specs_distinct() {
-        // 全 base(5) × {off + 5 profile} = 30 通りの合成 feature_hash が pairwise
-        // distinct (profile compaction で row の意味が変わるため load 時に弾ける)。
+        // 全 base(5) × {off + 6 profile} = 35 通りの合成 feature_hash が pairwise
+        // distinct (profile compaction / dedup で row の意味が変わるため load 時に
+        // 弾ける。FullSymDedup は dims が Full と同一なので特に hash で判別する)。
         let mut seen = Vec::new();
         for fs in FeatureSet::ALL {
             let base = fs.spec();
@@ -1001,7 +1329,7 @@ mod tests {
         let n = seen.len();
         seen.sort_unstable();
         seen.dedup();
-        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (30 通り)");
+        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (35 通り)");
     }
 
     #[test]
@@ -1096,6 +1424,132 @@ mod tests {
         let total = spec.extract_active_features(&board, &mut s2, &mut n2);
         assert_eq!(total, true_total, "戻り値が cap で truncate されている");
         assert!(total > small_cap, "overflow (cap 越え) を検出できる戻り値");
+    }
+
+    #[test]
+    fn effect_bucket_getters_multiply_base_dims() {
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            for cfg in ALL_EFFECT_BUCKET_CONFIGS {
+                let spec = base.with_effect_bucket_config(cfg);
+                assert_eq!(spec.effect_bucket_config(), Some(cfg));
+                assert_eq!(spec.base_ft_in(), base.base_ft_in());
+                assert_eq!(spec.ft_in(), base.base_ft_in() * cfg.nb);
+                assert_eq!(spec.max_active(), base.max_active());
+                assert_eq!(spec.train_ft_in(), spec.ft_in());
+                let fact = spec.with_ft_factorize();
+                assert_eq!(fact.ft_factorize_mode(), FtFactorizeMode::PoolEffectBuckets);
+                assert_eq!(fact.train_ft_in(), spec.ft_in() + spec.piece_inputs());
+                let fact_bucket = spec.with_ft_factorize_mode(FtFactorizeMode::PerEffectBucket);
+                assert_eq!(
+                    fact_bucket.train_ft_in(),
+                    spec.ft_in() + spec.piece_inputs() * cfg.nb
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effect_bucket_config_hashes_keep_all_specs_distinct() {
+        let mut seen = Vec::new();
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            seen.push(base.feature_hash());
+            for cfg in ALL_EFFECT_BUCKET_CONFIGS {
+                let h = base.with_effect_bucket_config(cfg).feature_hash();
+                assert_ne!(h, base.feature_hash(), "{}", base.canonical_name());
+                seen.push(h);
+            }
+        }
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "合成 feature_hash に衝突がある (25 通り)");
+    }
+
+    #[test]
+    #[should_panic(expected = "effect bucket feature sets cannot use threat profiles")]
+    fn with_effect_bucket_config_rejects_threat() {
+        FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_threat_profile(ThreatProfile::CrossSide)
+            .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2);
+    }
+
+    #[test]
+    fn with_effect_bucket_config_keeps_factorize_enabled() {
+        let spec = FeatureSet::HalfKaHmMerged
+            .spec()
+            .with_ft_factorize()
+            .with_effect_bucket_config(EffectBucketConfig::KINGFIXED_2X2);
+        assert!(spec.ft_factorize());
+        assert_eq!(spec.ft_factorize_mode(), FtFactorizeMode::PoolEffectBuckets);
+    }
+
+    #[test]
+    fn effect_bucket_emit_matches_closure_and_uses_effect_bucket_range() {
+        use std::path::PathBuf;
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../shogi-format/tests/data/sample.psv");
+        let Ok(bytes) = std::fs::read(&path) else {
+            return;
+        };
+        assert_eq!(bytes.len() % 40, 0);
+        // SAFETY: `PackedSfenValue` は `#[repr(C)]` で `[u8; 40]` 1 個のみの POD
+        // (size_of test で 40 byte 確認済、align 1)、`bytes.len() % 40 == 0` を
+        // 直前で assert。`bytes` の所有 lifetime 内に閉じる slice。
+        let records: &[PackedSfenValue] = unsafe {
+            std::slice::from_raw_parts(bytes.as_ptr() as *const PackedSfenValue, bytes.len() / 40)
+        };
+
+        let cfg = EffectBucketConfig::KINGFIXED_2X2;
+        for fs in FeatureSet::ALL {
+            let base = fs.spec();
+            let spec = base.with_effect_bucket_config(cfg);
+            for (i, psv) in records.iter().take(20).enumerate() {
+                let board = psv.decode();
+                let mut base_pairs = Vec::new();
+                base.map_features_board(&board, |s, n| base_pairs.push((s, n)));
+                let mut effect_bucket_pairs = Vec::new();
+                spec.map_features_board(&board, |s, n| effect_bucket_pairs.push((s, n)));
+                assert_eq!(
+                    effect_bucket_pairs.len(),
+                    base_pairs.len(),
+                    "{} record {i}",
+                    fs.canonical_name()
+                );
+                for (&(effect_bucket_s, effect_bucket_n), &(base_s, base_n)) in
+                    effect_bucket_pairs.iter().zip(&base_pairs)
+                {
+                    assert_eq!(
+                        effect_bucket_s / cfg.nb,
+                        base_s,
+                        "{} record {i}",
+                        fs.canonical_name()
+                    );
+                    assert_eq!(
+                        effect_bucket_n / cfg.nb,
+                        base_n,
+                        "{} record {i}",
+                        fs.canonical_name()
+                    );
+                    assert!(effect_bucket_s < spec.ft_in() && effect_bucket_n < spec.ft_in());
+                }
+
+                let mut stm_buf = vec![0i32; spec.max_active()];
+                let mut nstm_buf = vec![0i32; spec.max_active()];
+                let cnt = spec.extract_active_features(&board, &mut stm_buf, &mut nstm_buf);
+                let direct: Vec<(usize, usize)> = (0..cnt)
+                    .map(|k| (stm_buf[k] as usize, nstm_buf[k] as usize))
+                    .collect();
+                assert_eq!(
+                    direct,
+                    effect_bucket_pairs,
+                    "{} record {i}",
+                    fs.canonical_name()
+                );
+            }
+        }
     }
 
     fn startpos_for_overflow() -> ShogiBoard {

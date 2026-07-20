@@ -41,6 +41,16 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
 
+/// Maximum supported bucket count without changing the per-bucket weight
+/// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels
+/// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
+/// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
+/// restructure (register fan-out → `blockIdx.z` grid axis).
+/// kernel の容量仕様だが、CLI validation (test 含む) が非 GPU build でも参照するため
+/// gpu module の外に置く。参照元と同じ cfg で非 GPU の bin 単体 build では消える。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
+
 #[cfg(feature = "gpu")]
 mod gpu {
     use nnue_train::trainer::LossKind;
@@ -49,13 +59,6 @@ mod gpu {
     /// `l1_effective = l1_out - L1_SKIP` main dims plus this single skip dim, which
     /// is added straight onto the network output.
     pub(crate) const L1_SKIP: usize = 1;
-
-    /// Maximum supported bucket count without changing the per-bucket weight
-    /// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels
-    /// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
-    /// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
-    /// restructure (register fan-out → `blockIdx.z` grid axis).
-    pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
 
     // FT post-activation と l1_sqr の固定スケール (qa=127 量子化由来、`127.0/128.0`)。
     pub(crate) const FT_POST_SCALE: f32 = 127.0 / 128.0;
@@ -81,7 +84,7 @@ mod gpu {
     /// batch=65536 のとき実 scale は `2^14 * 2^16 = 2^30` で power-of-2 (scale 自体は無誤差)。
     pub(crate) const FT_DFT_FP16_BASE_SCALE: f32 = (1_u32 << 14) as f32;
 
-    /// `--fp16-opt-state` で `ft_w` の Ranger 1st moment (`m`) を `f16` 格納するときの
+    /// `--fp16-opt-state` で `ft_w` の 1st moment (`m`) を `f16` 格納するときの
     /// scale。`m` を `f16` へ書く前に掛け、読み戻し時に割る ([`radam_step_f16state`])。
     ///
     /// `m` は batch 正規化された勾配の EMA で、実測 (1000 step 時点の `ft_w` checkpoint)
@@ -91,7 +94,7 @@ mod gpu {
     /// (学習初期の勾配増大に ~24× の余裕)。scale は power-of-2 で scale 自体は無誤差。
     pub(crate) const FT_OPT_M_SCALE: f32 = (1_u32 << 28) as f32;
 
-    /// `--fp16-opt-state` で `ft_w` の Ranger 2nd moment (`v`) を `f16` 格納するときの
+    /// `--fp16-opt-state` で `ft_w` の 2nd moment (`v`) を `f16` 格納するときの
     /// scale。`v` を `f16` へ書く前に掛け、読み戻し時に割る ([`radam_step_f16state`])。
     ///
     /// `v` は勾配二乗の EMA で `m` よりさらに小さく、実測で中央値 ~2e-15・最大 ~2e-9。
@@ -105,6 +108,9 @@ mod gpu {
     // を single source of truth として参照する。
     pub(crate) const RANGER_DEFAULTS: nnue_train::optimizer::RangerParams =
         nnue_train::optimizer::RangerParams::DEFAULT;
+    /// ranger の beta1。本番経路は `OptimizerKind::beta1()` が種別ごとに解決する
+    /// ため、この const は ranger 既定値で kernel を叩く同等性テスト専用。
+    #[cfg(test)]
     pub(crate) const BETA1: f32 = RANGER_DEFAULTS.beta1;
     pub(crate) const BETA2: f32 = RANGER_DEFAULTS.beta2;
     pub(crate) const EPS: f32 = RANGER_DEFAULTS.eps;
