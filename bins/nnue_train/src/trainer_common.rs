@@ -23,7 +23,23 @@ impl SaveQuantisedExport for nnue_format::LayerStackWeights {
         match output_format {
             nnue_train::trainer::OutputFormat::Tatara => self.save_quantised(writer, fv_scale),
             nnue_train::trainer::OutputFormat::Yaneuraou => {
-                nnue_format::save_yaneuraou(writer, self)
+                // router で学習中なら process-global に重みが乗っている
+                // ( `RouterKPAbs::try_snapshot()` が `Some`)。kingrank9 など他
+                // bucket mode ではこの global が一度も初期化されないため常に
+                // `None` になり、従来通り router 無しの export になる。
+                let router = shogi_features::router_kpabs::RouterKPAbs::try_snapshot();
+                if router.is_none() {
+                    // ここに来るのは通常 kingrank9 export (想定内、静かに続行)。
+                    // ただし呼び出し順序の事故 (router のはずが global 未初期化)
+                    // を早期発見できるよう、stderr にだけ note を出しておく。
+                    eprintln!(
+                        "[train] note: exporting yaneuraou without an embedded router \
+                         block (RouterKPAbs global not initialized in this process — expected \
+                         for kingrank9, but if you intended router this net will fall \
+                         back to kingrank9 in the engine)"
+                    );
+                }
+                nnue_format::save_yaneuraou(writer, self, router.as_ref())
             }
         }
     }

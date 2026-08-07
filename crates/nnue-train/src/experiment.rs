@@ -267,6 +267,28 @@ pub struct HistoryEntry {
     pub test_accuracy: Option<f64>,
 }
 
+/// `router` の superbatch ごとの学習診断 (`--bucket-mode router`
+/// でのみ記録される)。`nnue-lab` ExperimentJsonV1 schema には無い tatara 固有
+/// の拡張フィールド (`ExperimentDoc::router_history`) — `nnue-lab` 側で
+/// passthrough 対象外の場合は取り込み時に無視される想定。
+#[derive(Debug, Clone, Serialize)]
+pub struct RouterHistoryEntry {
+    pub superbatch: usize,
+    /// oracle ラベルとの 9-class cross entropy (batch 平均、その sb 最後の
+    /// oracle refresh 時点のスナップショット)。
+    pub ce_loss: f64,
+    /// 負荷分散補助損失 (`N * Σ_i f_i * P_i`、最小値 1.0 で完全均等)。
+    pub balance_loss: f64,
+    /// その時点で router 自身の argmax が各バケットに落ちた比率 (`f_i`、合計 1.0)。
+    pub usage: Vec<f64>,
+    /// 減衰後、その sb で実際に使った router の learning rate
+    /// (`--router-lr-gamma` 適用後の値)。
+    pub lr: f64,
+    /// 減衰後、その sb で実際に使った負荷分散係数
+    /// (`--router-balance-weight-gamma` / `--router-balance-weight-min` 適用後の値)。
+    pub balance_weight: f64,
+}
+
 /// experiment.json として serialise される本体。フィールドは `nnue-lab`
 /// ExperimentJsonV1 の key 名と一致させる。
 #[derive(Debug, Clone, Serialize)]
@@ -292,6 +314,11 @@ pub struct ExperimentDoc {
     pub data: DataInfo,
     pub results: Results,
     pub history: Vec<HistoryEntry>,
+    /// `--bucket-mode router` のときだけ埋まる。他 bucket mode では常に
+    /// 空 (`Vec::new()`)。superbatch ごとの router 学習診断 (詳細は
+    /// [`RouterHistoryEntry`])。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub router_history: Vec<RouterHistoryEntry>,
     /// run が書き出した checkpoint ファイル名の生成記録 (informational)。
     pub checkpoints: Vec<String>,
 }
@@ -347,6 +374,7 @@ impl ExperimentDoc {
                 interrupted: false,
             },
             history: Vec::new(),
+            router_history: Vec::new(),
             checkpoints: Vec::new(),
         }
     }
@@ -465,6 +493,38 @@ impl ExperimentLogger {
     /// checkpoint ファイル名を `checkpoints` の生成記録に追加する。
     pub fn note_checkpoint(&mut self, file_name: impl Into<String>) {
         self.doc.checkpoints.push(file_name.into());
+    }
+
+    /// `--bucket-mode router` の superbatch ごとの router 学習診断を
+    /// `router_history` に追記する (`record_superbatch` と対になる、呼び出し側
+    /// が同じ sb で両方呼ぶ)。非有限値 (発散シグナル) は `record_superbatch` の
+    /// `mean_loss` と同様、JSON に出せないため `0.0` に落として warning を出す。
+    pub fn record_router(&mut self, entry: RouterHistoryEntry) {
+        let sanitize = |name: &str, v: f64| -> f64 {
+            if v.is_finite() {
+                v
+            } else {
+                eprintln!(
+                    "[train] warning: superbatch {} router {name} is non-finite ({v}); \
+                     recording 0.0 in experiment.json",
+                    entry.superbatch,
+                );
+                0.0
+            }
+        };
+        let mut usage = entry.usage;
+        for (i, u) in usage.iter_mut().enumerate() {
+            *u = sanitize(&format!("usage[{i}]"), *u);
+        }
+        self.doc.router_history.push(RouterHistoryEntry {
+            superbatch: entry.superbatch,
+            ce_loss: sanitize("ce_loss", entry.ce_loss),
+            balance_loss: sanitize("balance_loss", entry.balance_loss),
+            usage,
+            lr: sanitize("lr", entry.lr),
+            balance_weight: sanitize("balance_weight", entry.balance_weight),
+        });
+        self.touch();
     }
 
     /// run の正常終了を記録する (`status = "completed"`)。

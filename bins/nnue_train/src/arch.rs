@@ -41,15 +41,20 @@ pub(crate) const DEFAULT_L2_OUT: usize = 32;
 /// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
 
-/// Maximum supported bucket count without changing the per-bucket weight
-/// backward kernels (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`). The kernels
-/// hold a fixed 9-register accumulator (`a0..a8`); values up to 9 are silent
-/// skipped via the runtime `num_buckets` arg, but larger N would need a kernel
-/// restructure (register fan-out → `blockIdx.z` grid axis).
+/// Sanity ceiling for `--num-buckets`, **not** a kernel-imposed hard limit.
+/// The per-bucket weight backward kernels
+/// (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`) used to hold a fixed
+/// `num_buckets <= 9` register accumulator; both were rewritten to
+/// accumulate via direct per-row `atomicAdd` instead (see
+/// `crates/cuda-native-runtime/kernels/native_kernels.cu`), so they now
+/// support any `num_buckets` with no compile-time cap. This constant only
+/// exists to reject obviously-wrong CLI input (e.g. a typo'd `--num-buckets`)
+/// before it turns into a huge, slow, accidental allocation; raise it freely
+/// if you legitimately need more buckets than this.
 /// kernel の容量仕様だが、CLI validation (test 含む) が非 GPU build でも参照するため
 /// gpu module の外に置く。参照元と同じ cfg で非 GPU の bin 単体 build では消える。
 #[cfg(any(feature = "gpu", test))]
-pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 9;
+pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 256;
 
 #[cfg(feature = "gpu")]
 mod gpu {

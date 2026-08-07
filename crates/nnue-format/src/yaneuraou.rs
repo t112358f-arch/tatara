@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 
 use shogi_features::FeatureSet;
+use shogi_features::router_kpabs::RouterKPAbsWeights;
 
 use crate::LayerStackWeights;
 use crate::layerstack_weights::{QA, QB, write_leb128_tensor_i16};
@@ -11,6 +12,12 @@ const YO_VERSION: u32 = 0x7af3_2f16;
 const YO_TOP_HASH: u32 = 0x3c20_3b32;
 const YO_FT_HASH: u32 = 0x5f13_4ab8;
 const YO_NETWORK_HASH: u32 = 0x6333_718a;
+/// `router` の trailing weight block を示す magic。全 `YANEURAOU_LAYER_STACKS`
+/// network を書き終えた**直後**にだけ現れうる (kingrank9 export では出現しない)。
+/// エンジン側 (`evaluate_nnue.cpp`) は network 群を読み終えた後、EOF を要求する前に
+/// この 4 byte を peek し、一致すれば router block を読み、不一致なら読み戻して
+/// 既存の EOF 検査に進む — 後方互換 (router 無しの既存ファイルはそのまま読める)。
+pub const YO_ROUTER9KPABS_HASH: u32 = 0x526f_3944; // "Ro9D" (Router9kpabs Data) 由来
 
 /// YaneuraOu SFNN が要求する KingRank9 LayerStack 数。
 pub const YANEURAOU_LAYER_STACKS: usize = 9;
@@ -57,8 +64,16 @@ const YO_FEATURES: [YoFeature; 5] = [
 /// feature set と各層次元は weights の shape から決定する。YaneuraOu SFNN が
 /// 表現できない拡張 feature、PSQT、KingRank9 以外の bucket 数は reject する。
 /// bucket routing mode 自体は weights に含まれないため、caller は学習 config 等から
-/// KingRank9 であることを確認してから呼ぶ必要がある。
-pub fn save_yaneuraou<W: Write>(writer: &mut W, weights: &LayerStackWeights) -> io::Result<()> {
+/// KingRank9 (または router) であることを確認してから呼ぶ必要がある。
+///
+/// `router` が `Some` のとき、全 `YANEURAOU_LAYER_STACKS` network を書いた直後に
+/// `router` の重み ([`YO_ROUTER9KPABS_HASH`] + `RouterKPAbsWeights::write_to`)
+/// を追記する。`None` (kingrank9 export 等) では従来通り network 群で終わる。
+pub fn save_yaneuraou<W: Write>(
+    writer: &mut W,
+    weights: &LayerStackWeights,
+    router: Option<&RouterKPAbsWeights>,
+) -> io::Result<()> {
     let arch = architecture(weights)?;
     validate_weights(&arch, weights)?;
 
@@ -109,6 +124,11 @@ pub fn save_yaneuraou<W: Write>(writer: &mut W, weights: &LayerStackWeights) -> 
             l2_out,
             1,
         )?;
+    }
+
+    if let Some(router) = router {
+        write_u32(writer, YO_ROUTER9KPABS_HASH)?;
+        router.write_to(writer)?;
     }
     Ok(())
 }
@@ -373,7 +393,7 @@ mod tests {
     #[test]
     fn rejects_non_kingrank9_shape() {
         let weights = LayerStackWeights::zeroed(FeatureSet::HalfKaHmMerged.spec(), 128, 16, 32, 8);
-        let error = save_yaneuraou(&mut Vec::new(), &weights).unwrap_err();
+        let error = save_yaneuraou(&mut Vec::new(), &weights, None).unwrap_err();
         assert!(error.to_string().contains("KingRank9"), "{error}");
     }
 
@@ -398,7 +418,7 @@ mod tests {
         weights.l3_w[5] = -0.125;
 
         let mut direct = Vec::new();
-        save_yaneuraou(&mut direct, &weights).unwrap();
+        save_yaneuraou(&mut direct, &weights, None).unwrap();
 
         let mut tatara = Vec::new();
         weights.save_quantised(&mut tatara, Some(28)).unwrap();
@@ -412,7 +432,7 @@ mod tests {
         )
         .unwrap();
         let mut post_hoc = Vec::new();
-        save_yaneuraou(&mut post_hoc, &reloaded).unwrap();
+        save_yaneuraou(&mut post_hoc, &reloaded, None).unwrap();
 
         assert_eq!(direct, post_hoc);
     }

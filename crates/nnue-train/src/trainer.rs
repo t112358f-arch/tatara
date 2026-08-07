@@ -56,9 +56,10 @@ use std::time::Instant;
 use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+use shogi_features::router_kpabs::{RouterAdamState, RouterKPAbs};
 
 use crate::dataloader::{Batch, BucketMode, BucketedPrefetchedLoader, PSV_RECORD_BYTES};
-use crate::experiment::ExperimentLogger;
+use crate::experiment::{ExperimentLogger, RouterHistoryEntry};
 use crate::schedule::{LrScheduler, WdlScheduler};
 
 // =============================================================================
@@ -382,6 +383,59 @@ pub enum OutputFormat {
 
 /// 1 回の [`run`] に渡す training hyper-parameter 一式。
 ///
+/// `BucketMode::Router` 用の hard-EM router 学習パラメータ
+/// (`bins/nnue_train --router-*` CLI 由来)。
+///
+/// `run()` は `bucket_mode` が `Router` のときだけこれを参照する。
+/// `router_kpabs::RouterKPAbs` は呼び出し前に `init_random` / `init_with_weights`
+/// 済であること (`run()` はランダム初期化しない — resume との対称性のため
+/// 初期化は呼び出し側の責務)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RouterTrainingConfig {
+    /// router Adam の learning rate (`--router-lr`)。`RouterKPAbsWeights` は
+    /// `progress.bin` と同じ f64 精度で持つため、この学習率も f64。
+    pub lr: f64,
+    /// router weight (`RouterKPAbsWeights::w`、bias は無い) への L2 weight
+    /// decay (`--router-weight-decay`)。
+    pub weight_decay: f64,
+    /// 負荷分散補助損失の係数 `λ` (`--router-balance-weight`)。Switch
+    /// Transformer (Fedus et al. 2021) と同じ形の補助損失
+    /// (`L_balance = N · Σ_i f_i · P_i`) を cross entropy に足して router を
+    /// 学習する。`0.0` で無効化 (cross entropy のみ、expert collapse の
+    /// リスクあり)。詳細は [`shogi_features::router_kpabs::RouterKPAbsWeights::train_oracle_batch`]
+    /// のドキュメントを参照。
+    pub balance_weight: f64,
+    /// hard-EM oracle refresh を何 batch ごとに行うか (`--router-refresh-interval`)。
+    /// `1` で毎 batch (評価関数と "一緒に" 学習する度合いが最大、その分 forward
+    /// を batch あたり 9 回余計に (bucket 数分) 実行するので低速)。`N > 1` で
+    /// `batch_idx % N == 0` の batch でのみ oracle sweep + router 更新を行い、
+    /// それ以外の batch は直前の router 出力をそのまま bucket 割当に使う
+    /// (dataloader は毎 batch 独立に `RouterKPAbs::bucket_board` を呼ぶため、
+    /// router 更新頻度を落としても bucket 割当自体は常に最新の重みを使う)。
+    pub refresh_interval: usize,
+    /// `lr` の superbatch ごとの減衰率 (`--router-lr-gamma`)。1 superbatch
+    /// 終える度に `lr *= lr_gamma` する (`1.0` で減衰無し、従来動作)。
+    pub lr_gamma: f64,
+    /// `balance_weight` の superbatch ごとの減衰率 (`--router-balance-weight-gamma`)。
+    /// 1 superbatch 終える度に `balance_weight *= balance_weight_gamma` する
+    /// (`1.0` で減衰無し)。学習序盤は expert collapse を防ぐために強めに、
+    /// 終盤は cross entropy (oracle 予測精度) を優先させたい場合に `< 1.0` を
+    /// 指定する。
+    pub balance_weight_gamma: f64,
+    /// `balance_weight` の下限 (`--router-balance-weight-min`)。減衰させても
+    /// これを下回らない (`balance_weight_gamma < 1.0` で完全に 0 まで落として
+    /// しまうのを防ぐ安全弁)。
+    pub balance_weight_min: f64,
+    /// hard-EM / soft-EM / Top-K Hard Routing の切替 (`--top-k`)。E step で
+    /// 求めた N 個 (N = `TrainingConfig::num_buckets`) の bucket 誤差のうち、
+    /// 誤差が小さい方から `top_k` 個だけを `softmax(-err)` で重み付けした分布を
+    /// router の教師信号にする (`shogi_features::router_kpabs::oracle_targets_from_errors`)。
+    /// `1` (既定) で従来の hard-EM (one-hot)、`num_buckets` で古典的な soft-EM
+    /// (Jacobs & Jordan 1991 の responsibility)、その中間で Top-K Hard Routing。
+    /// `[1, num_buckets]` の範囲でなければならない (`run()` が検証する)。
+    pub top_k: usize,
+}
+
 /// LayerStack (bucket-aware) / Simple (bucket-less) どちらの backend で学習する
 /// にも要る subset。bucket 数 N は [`TrainingConfig::num_buckets`] で持つ (既定 9、
 /// LayerStack `--num-buckets` 由来)。learning rate / WDL schedule は別に
@@ -467,6 +521,10 @@ pub struct TrainingConfig {
     /// histogram に対して計算する。`false` では histogram を確保せず worker の
     /// ホットパスに計装コードを通さない (feature-set 非依存、threat off でも動く)。
     pub monitor_active_features: bool,
+    /// `bucket_mode == Router` のときの hard-EM router 学習設定。`Some`
+    /// でなければならない (`run()` が bucket_mode を見て検証する)。他の
+    /// bucket mode では無視される (`None` を渡すのが自然)。
+    pub router: Option<RouterTrainingConfig>,
 }
 
 impl TrainingConfig {
@@ -649,6 +707,17 @@ where
     M: Copy + Into<BucketMode>,
 {
     cfg.validate()?;
+    let resolved_bucket_mode: BucketMode = (*bucket_mode).into();
+    if resolved_bucket_mode == BucketMode::Router && cfg.router.is_none() {
+        return Err(io::Error::other(
+            "TrainingConfig::router must be Some(..) when bucket_mode is Router",
+        ));
+    }
+    if resolved_bucket_mode != BucketMode::Router && cfg.router.is_some() {
+        return Err(io::Error::other(
+            "TrainingConfig::router must be None unless bucket_mode is Router",
+        ));
+    }
 
     // data file の byte サイズを取って PSV alignment を確認。
     // `--test-tail-positions` の split 計算がここで PSV record 境界に揃うか
@@ -782,7 +851,29 @@ where
     // 直前 batch を `prev_pending` に保持し、次 `train_step` が queue 済 H2D を消化
     // した時点で recycle する (次 step の event sync が直前 batch の full pipeline
     // 完了を保証する)。同期 backend では実害なしだが、async backend を含めて統一形。
-    let mut prev_pending: Option<(Batch, Vec<i32>)> = None;
+    let mut prev_pending: Option<(Batch, Vec<i32>, Vec<Vec<u32>>)> = None;
+
+    // `Router` の hard-EM router 学習 state。他 bucket mode では未使用
+    // (`router_adam = None`)。`RouterKPAbs` の重み自体は process-global なので
+    // 呼び出し前に `init_random` / `init_with_weights` / `load_full` 済であること
+    // (`run()` 自身はランダム初期化しない)。
+    let mut router_adam: Option<RouterAdamState> = if resolved_bucket_mode == BucketMode::Router {
+        Some(RouterAdamState::zeros(cfg.num_buckets))
+    } else {
+        None
+    };
+    // `RouterTrainingConfig::lr` / `balance_weight` の実効値。1 superbatch 終える
+    // 度に `*_gamma` を掛けて減衰させる (`--router-lr-gamma` /
+    // `--router-balance-weight-gamma`)。`balance_weight` は
+    // `--router-balance-weight-min` を下回らないよう毎回 clamp する。
+    // `cfg.router` が `None` (router 以外) のときは未使用。
+    let mut current_router_lr: f64 = cfg.router.map(|rc| rc.lr).unwrap_or(0.0);
+    let mut current_router_balance_weight: f64 = cfg.router.map(|rc| rc.balance_weight).unwrap_or(0.0);
+    // sb 内で直近に観測した router 学習の診断情報 (負荷分散 loss / bucket 使用率
+    // など)。sb 末の `[router]` ログ用。`refresh_interval > 1` の場合、更新され
+    // なかった batch では前回の値がそのまま残る (= その sb 最後の refresh 時点の
+    // スナップショット)。
+    let mut last_router_stats: Option<shogi_features::router_kpabs::RouterTrainStats> = None;
 
     // sb 内 batch 進捗 print の頻度 (env var で可変、`0` で disable)。stderr が
     // TTY なら `\r` で同 line を上書き、それ以外 (pipe / `tee` ファイル等) なら
@@ -812,12 +903,62 @@ where
             let lr = lr_scheduler.lr(batch_idx, sb);
             let wdl = wdl_scheduler.blend(batch_idx, sb, cfg.end_superbatch);
 
-            let (batch, buckets) = loader.next_batch()?.ok_or_else(|| {
+            let (batch, buckets, router_indices) = loader.next_batch()?.ok_or_else(|| {
                 io::Error::other(
                     "dataloader stopped supplying batches unexpectedly (workers exited without an error)",
                 )
             })?;
             let n_pos = batch.n_positions;
+
+            // router hard-EM/soft-EM/Top-K Hard Routing: bucket_mode 自体
+            // (`bucket_mode.bucket_board` 経由で dataloader が既に割り当てた
+            // `buckets`) は毎 batch 常に最新の router 出力を使う。ここでは
+            // さらに router 自身を **この batch の現在の eval net に対する
+            // oracle ターゲット分布** で更新する (`--router-refresh-interval`
+            // 間隔)。N 通り (N = `cfg.num_buckets`) の固定 bucket で
+            // forward-only (`validate_step`、backward/optimizer step なし) を
+            // 回して各 position・各 bucket の誤差を求め、
+            // `oracle_targets_from_errors` (`--top-k` 依存、詳細は
+            // `router_kpabs` モジュール doc) で教師分布を作り、router の
+            // (soft-label) N-class cross entropy を 1 step 分 backprop する
+            // (`RouterKPAbs::train_oracle_batch`、CPU 側・GPU kernel 変更不要)。
+            if let (Some(rc), Some(adam)) = (cfg.router, router_adam.as_mut())
+                && batch_idx % rc.refresh_interval.max(1) == 0
+            {
+                let pred_scale = oracle_pred_scale(cfg.loss);
+                let target_scale = oracle_target_scale(cfg.loss);
+                // `errs[k][i]` = bucket k に固定して forward したときの position
+                // i の誤差。Top-K/soft-EM ターゲットを作るには N 個すべての
+                // bucket の誤差が要る (hard-EM の argmin だけでは足りない)。
+                let mut errs: Vec<Vec<f64>> = Vec::with_capacity(cfg.num_buckets);
+                for k in 0..cfg.num_buckets {
+                    let k_buckets = vec![k as i32; n_pos];
+                    let out = backend.validate_step(&batch, &k_buckets, wdl, cfg.loss)?;
+                    let mut err_k = Vec::with_capacity(n_pos);
+                    for i in 0..n_pos {
+                        let pred = sigmoid(out.net_output[i] * pred_scale);
+                        let target =
+                            wdl * batch.wdl[i] + (1.0 - wdl) * sigmoid(batch.score[i] * target_scale);
+                        err_k.push(((pred - target) * (pred - target)) as f64);
+                    }
+                    errs.push(err_k);
+                }
+                let oracle_targets: Vec<Vec<f64>> = (0..n_pos)
+                    .map(|i| {
+                        let errs_i: Vec<f64> = (0..cfg.num_buckets).map(|k| errs[k][i]).collect();
+                        shogi_features::router_kpabs::oracle_targets_from_errors(&errs_i, rc.top_k)
+                    })
+                    .collect();
+                let stats = RouterKPAbs::train_oracle_batch(
+                    &router_indices[..n_pos],
+                    &oracle_targets,
+                    adam,
+                    current_router_lr,
+                    rc.weight_decay,
+                    current_router_balance_weight,
+                );
+                last_router_stats = Some(stats);
+            }
 
             let loss = backend.train_step(&batch, &buckets, lr, wdl, cfg.loss)?;
             // 直前 batch を recycle: その H2D は今 `train_step` 呼出内の event sync で
@@ -825,7 +966,7 @@ where
             if let Some(prev) = prev_pending.take() {
                 loader.recycle(prev);
             }
-            prev_pending = Some((batch, buckets));
+            prev_pending = Some((batch, buckets, router_indices));
             sb_loss += loss;
             sb_positions += n_pos as u64;
 
@@ -930,6 +1071,27 @@ where
             val_str,
         );
 
+        if let Some(stats) = last_router_stats.as_ref() {
+            // 負荷分散 loss (`N * Σ f_i * P_i`、min=1.0 で完全均等、max=N で
+            // 1 bucket に完全集中) と、直近 refresh 時点での bucket 使用率
+            // (router 自身の argmax の分布) を出す。1 bucket に偏り続けている
+            // 場合は `--router-balance-weight` を上げる目安になる。
+            let usage_str = stats
+                .bucket_usage
+                .iter()
+                .map(|u| format!("{:.2}", u))
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "[router] sb={} ce_loss={:.4} balance_loss={:.4} (min=1.0,max={}) usage=[{}]",
+                sb,
+                stats.cross_entropy_loss,
+                stats.balance_loss,
+                stats.bucket_usage.len(),
+                usage_str,
+            );
+        }
+
         if cfg.monitor_fp16_clamps {
             // dft FP16 書き込みで `±65504` cap が当たった要素数 (累積) と処理要素数
             // (累積) を device から読み、当 sb の delta + ratio を出す。`--ft-fp16-out`
@@ -984,6 +1146,23 @@ where
             if let Some(keep) = cfg.keep_raw_checkpoints {
                 prune_old_raw_checkpoints(&cfg.output_dir, &cfg.net_id, keep);
             }
+
+            // router: 重み + Adam optimizer state を sidecar file に保存する
+            // (main net の raw checkpoint とは別ファイル、`--router-resume` で
+            // 読み戻せる)。
+            if let Some(adam) = router_adam.as_ref() {
+                let router_path = cfg
+                    .output_dir
+                    .join(format!("{}-{}.router.ckpt", cfg.net_id, sb));
+                if let Err(e) = RouterKPAbs::save_full(&router_path, adam) {
+                    eprintln!(
+                        "[train] warning: failed to save router checkpoint {}: {e}",
+                        router_path.display()
+                    );
+                } else {
+                    println!("[train] router checkpoint saved: {}", router_path.display());
+                }
+            }
         }
 
         // superbatch の処理 (checkpoint 保存を含む) をすべて終えてから
@@ -998,11 +1177,34 @@ where
                 validation.map(|r| r.mean_loss),
                 validation.map(|r| r.accuracy),
             );
+            if let Some(stats) = last_router_stats.as_ref() {
+                // `current_router_lr` / `current_router_balance_weight` は
+                // まさにこの sb で使った (decay 前の) 値 — この下の decay 適用は
+                // 次 sb 向けなので、記録は decay 前の現在値で行う。
+                log.record_router(RouterHistoryEntry {
+                    superbatch: sb,
+                    ce_loss: stats.cross_entropy_loss,
+                    balance_loss: stats.balance_loss,
+                    usage: stats.bucket_usage.clone(),
+                    lr: current_router_lr,
+                    balance_weight: current_router_balance_weight,
+                });
+            }
             if saved {
                 log.note_checkpoint(format!("{}-{}.bin", cfg.net_id, sb));
                 log.note_checkpoint(format!("{}-{}.ckpt", cfg.net_id, sb));
             }
             write_experiment_log(log);
+        }
+
+        // router: 1 superbatch 終える度に lr / balance_weight を減衰させる
+        // (`--router-lr-gamma` / `--router-balance-weight-gamma`)。
+        // `balance_weight` は `--router-balance-weight-min` を下限に clamp する
+        // (`balance_weight_gamma < 1.0` で完全に 0 まで落ちてしまうのを防ぐ)。
+        if let Some(rc) = cfg.router {
+            current_router_lr *= rc.lr_gamma;
+            current_router_balance_weight =
+                (current_router_balance_weight * rc.balance_weight_gamma).max(rc.balance_weight_min);
         }
     }
 
@@ -1110,6 +1312,30 @@ fn prune_old_raw_checkpoints(output_dir: &Path, net_id: &str, keep: usize) {
 }
 
 /// 秒数を `1h23m45s` / `12m05s` / `42s` 形式に整形する (`??` if not finite)。
+/// `router` hard-EM oracle sweep 用のスケール抽出。loss kernel が実際に
+/// 使う変換 (`Sigmoid` の `scale`、`Wrm` の `in_scaling`/`target_scaling`) を
+/// 流用して `net_output` / `score` を `[0, 1]` の勝率らしき値に写像し、9 通りの
+/// bucket 間で誤差を比較可能にする。学習本体の loss とビット一致させる必要は
+/// なく、**bucket の相対順位が概ね合っていれば十分**な router 教師信号として
+/// 使うだけ (`Wrm` の完全な in_offset/target_offset シフトは簡略化のため省略)。
+fn oracle_pred_scale(loss: LossKind) -> f32 {
+    match loss {
+        LossKind::Sigmoid { scale } => scale,
+        LossKind::Wrm { in_scaling, .. } => 1.0 / in_scaling.max(1e-6),
+    }
+}
+
+fn oracle_target_scale(loss: LossKind) -> f32 {
+    match loss {
+        LossKind::Sigmoid { scale } => scale,
+        LossKind::Wrm { target_scaling, .. } => 1.0 / target_scaling.max(1e-6),
+    }
+}
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
 fn format_hms(secs: f64) -> String {
     if !secs.is_finite() || secs < 0.0 {
         return "??".to_string();
@@ -1296,6 +1522,7 @@ mod tests {
             num_buckets: 9,
             monitor_fp16_clamps: false,
             monitor_active_features: false,
+            router: None,
         }
     }
 

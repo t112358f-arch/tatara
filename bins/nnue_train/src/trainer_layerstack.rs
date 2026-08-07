@@ -33,7 +33,9 @@ struct StepContext<'a> {
     /// tf32 per-bucket cuBLAS 経路が使う `segs[g] = (sorted 開始行, real row 数)`。
     /// forward / backward で同一値を使うため step 頭で一度だけ算出する
     /// ([`GpuTrainer::l1_bucket_segments`])。non-tf32 経路では参照されない。
-    bucket_segments: [(u32, u32); MAX_SUPPORTED_NUM_BUCKETS],
+    /// 長さは常に `self.num_buckets` (以前は `MAX_SUPPORTED_NUM_BUCKETS` 固定長
+    /// 配列だったが、GPU kernel 側の bucket 数上限が撤廃されたのに合わせて Vec 化)。
+    bucket_segments: Vec<(u32, u32)>,
 }
 
 pub(crate) struct StepOptions<'a> {
@@ -1676,15 +1678,15 @@ impl GpuTrainer {
     /// `bucket_offsets_dev` と bit 一致し、GPU 同期を必要としない。返り値 `segs[g] = (row0, count)`
     /// で `combined_sorted` / `dl1_total_sorted` 上の bucket g の real row は `[row0, row0+count)`。
     /// `count == 0` の bucket は空 (呼び出し側で skip)。
-    fn l1_bucket_segments(&self, batch: &BatchData) -> [(u32, u32); MAX_SUPPORTED_NUM_BUCKETS] {
+    fn l1_bucket_segments(&self, batch: &BatchData) -> Vec<(u32, u32)> {
         let nb = self.num_buckets;
-        let mut counts = [0_u32; MAX_SUPPORTED_NUM_BUCKETS];
+        let mut counts = vec![0_u32; nb];
         for &bk in batch.bucket_idx.iter() {
             if bk >= 0 && (bk as usize) < nb {
                 counts[bk as usize] += 1;
             }
         }
-        let mut segs = [(0_u32, 0_u32); MAX_SUPPORTED_NUM_BUCKETS];
+        let mut segs = vec![(0_u32, 0_u32); nb];
         let mut acc: u32 = 0;
         for (g, &m) in counts.iter().enumerate().take(nb) {
             let rem = acc % 16;
@@ -1802,7 +1804,7 @@ impl GpuTrainer {
             l2_out,
             n_out_tiles,
             padded_b: _,
-            bucket_segments,
+            ref bucket_segments,
             ..
         } = *context;
         let prof_t0 = &mut *context.prof_t0;
@@ -2047,11 +2049,10 @@ impl GpuTrainer {
         // 数値同等性: fwd_L1 は per-row independent (k 加算順保持) のため baseline と bit-exact、
         // sort stability に依らない。
         let padded_b = padded_sort_batch(b, self.num_buckets);
-        debug_assert!(
-            ft_out.is_multiple_of(16)
-                && self.num_buckets <= MAX_SUPPORTED_NUM_BUCKETS
-                && b.is_multiple_of(16)
-        );
+        // `num_buckets` は constructor (`GpuTrainer::new`) で既に検証済 (このパス
+        // 自体は L1 の sorted/segment 方式で、以前 L2/L3 backward kernel が
+        // 持っていた register accumulator の bucket 数上限とは無関係)。
+        debug_assert!(ft_out.is_multiple_of(16) && b.is_multiple_of(16));
 
         // a) histogram + 16-aligned scan + scatter。aligned offset で各 bucket が 16-row
         // 境界に整列し、bucket 末端 / 次 bucket 開始間に padding 行ができる。padding 行は
@@ -2599,7 +2600,7 @@ impl GpuTrainer {
             l2_out,
             n_out_tiles,
             padded_b,
-            bucket_segments,
+            ref bucket_segments,
             ..
         } = *context;
         let prof_t0 = &mut *context.prof_t0;
@@ -2726,15 +2727,17 @@ impl GpuTrainer {
                 ]
             }
         }?;
-        // L3 weight bwd: in_dim=l2_out, out_dim=1, num_buckets<=9。
+        // L3 weight bwd: in_dim=l2_out, out_dim=1。
         // 列 (= l2_out) あたり R lane で batch reduction を並列化する
-        // `dense_mm_bwd_weight_bucket_tiled_l3`。`buc >= num_buckets` は flush も accumulate も
-        // されない silent skip で動く。R = l2_out を掛けて 256 を超えない最大 2 冪 (kernel の
-        // PARTIAL = 9 plane × 256 上限、tree reduction が畳めるよう 2 冪)。block_dim = R*l2_out
-        // で 1 列あたり R thread (= 複数 warp/block) にして warp/block と batch 並列度を上げ、grid は
-        // grid-stride で全 SM を埋める数にする (kernel は任意 grid で正しく、grid は occupancy/
-        // atomic 数の調整のみ)。`--l2 <= 256` を CLI が保証するので block_dim は 256 上限内。
-        debug_assert!(self.num_buckets <= MAX_SUPPORTED_NUM_BUCKETS);
+        // `dense_mm_bwd_weight_bucket_tiled_l3`。以前は register accumulator が
+        // `num_buckets<=9` を要求していたが、kernel を行ごとの直接 atomicAdd に
+        // 書き換えたため `num_buckets` に上限は無い (`buc >= num_buckets` は
+        // skip されるだけ)。R = l2_out を掛けて 256 を超えない最大 2 冪
+        // (tree reduction が畳めるよう 2 冪)。block_dim = R*l2_out で 1 列あたり
+        // R thread (= 複数 warp/block) にして warp/block と batch 並列度を上げ、
+        // grid は grid-stride で全 SM を埋める数にする (kernel は任意 grid で
+        // 正しく、grid は occupancy/atomic 数の調整のみ)。`--l2 <= 256` を CLI
+        // が保証するので block_dim は 256 上限内。
         let mut l3_lanes = 1_usize;
         while l3_lanes * 2 * l2_out <= 256 {
             l3_lanes *= 2;
@@ -2816,8 +2819,11 @@ impl GpuTrainer {
                 ]
             }
         }?;
-        // L2 weight backward: split-K + 9 bucket register accumulator。weight cell 空間
-        // (per-bucket l2_out × l2_in) を grid_x、batch split-K を grid_y に分け、block_dim は
+        // L2 weight backward: split-K + 行ごとの直接 atomicAdd (以前は 9 bucket
+        // register accumulator だったが、kernel を書き換えて num_buckets に
+        // 上限が無いようにした、詳細は native_kernels.cu 側のコメント参照)。
+        // weight cell 空間 (per-bucket l2_out × l2_in) を grid_x、batch
+        // split-K を grid_y に分け、block_dim は
         // 256 固定で launch する (`block_dim = l2_out * l2_in` だと l2_in 次第で 1024 thread を
         // 超えるため)。grid_y (= batch split 数) は per-thread の直列 batch reduction を短くし
         // SM を埋めるため大きめに取る (weight cell 数が少ない形状では split が少ないと走る warp が
@@ -3103,11 +3109,10 @@ impl GpuTrainer {
         // -- Backward 4 reverse: L1 per-bucket dense grad (weight → input、sorted layout)。
         //    dl1_total を bucket_perm_dev で gather → dl1_total_sorted (weight/input/bias 共通)。
         //    combined_sorted / bucket_offsets_dev / bucket_idx_sorted_dev は fwd_L1 で構築済。
-        debug_assert!(
-            ft_out.is_multiple_of(16)
-                && self.num_buckets <= MAX_SUPPORTED_NUM_BUCKETS
-                && b.is_multiple_of(16)
-        );
+        // `num_buckets` は constructor (`GpuTrainer::new`) で既に検証済 (このパス
+        // 自体は L1 の sorted/segment 方式で、以前 L2/L3 backward kernel が
+        // 持っていた register accumulator の bucket 数上限とは無関係)。
+        debug_assert!(ft_out.is_multiple_of(16) && b.is_multiple_of(16));
         unsafe {
             // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
             // stream の完了を待つ同期点まで生存する device allocation。

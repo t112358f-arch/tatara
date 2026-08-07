@@ -13,6 +13,7 @@ pub mod halfka_hm;
 pub mod kingrank9;
 pub mod progress_kpabs;
 pub mod psqt_material;
+pub mod router_kpabs;
 mod simd;
 pub mod threat;
 pub mod threat_exclusion;

@@ -1786,16 +1786,19 @@ fn dense_mm_bwd_weight_bucket_matches_cpu() -> Result<(), Box<dyn std::error::Er
 fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::error::Error>> {
     // L2 weight backward: out_dim は L2 出力次元 (`--l2`、可変)、in_dim = l2_in
     // (= 2*(l1_out-1)、`--l1` 依存)。既定 out_dim 32 と非既定 {16, 64, 256} を
-    // 各種 in_dim・非 16 倍数 out_dim と組み合わせて検証する。
+    // 各種 in_dim・非 16 倍数 out_dim と組み合わせて検証する。最後の 1 件は
+    // 旧 `kMaxSupportedNumBuckets = 9` の register-array 上限を超える
+    // `num_buckets = 16` で、kernel を行ごとの直接 atomicAdd に書き換えた
+    // (native_kernels.cu) ことの回帰テストを兼ねる。
     let (_ctx, module, stream) = open_module()?;
-    for &(batch, in_dim, out_dim) in &[
-        (16_usize, 30_usize, 32_usize), // 既定形状
-        (64, 46, 16),
-        (256, 62, 64),
-        (1024, 14, 256),
-        (32, 96, 30), // 非 16 倍数の out_dim
+    for &(batch, in_dim, out_dim, nb) in &[
+        (16_usize, 30_usize, 32_usize, DEFAULT_NUM_BUCKETS), // 既定形状
+        (64, 46, 16, DEFAULT_NUM_BUCKETS),
+        (256, 62, 64, DEFAULT_NUM_BUCKETS),
+        (1024, 14, 256, DEFAULT_NUM_BUCKETS),
+        (32, 96, 30, DEFAULT_NUM_BUCKETS), // 非 16 倍数の out_dim
+        (64, 30, 32, 16),                  // num_buckets > 旧 9 上限
     ] {
-        let nb = DEFAULT_NUM_BUCKETS;
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1836,7 +1839,7 @@ fn dense_mm_bwd_weight_bucket_tiled_l2_matches_cpu() -> Result<(), Box<dyn std::
         }?;
         stream.synchronize()?;
         assert_close_rel(
-            &format!("dense_mm_bwd_weight_bucket_tiled_l2 b={batch}"),
+            &format!("dense_mm_bwd_weight_bucket_tiled_l2 b={batch} nb={nb}"),
             &dw_dev.to_host_vec(&stream)?,
             &dw_cpu,
             TOL,
@@ -1859,7 +1862,10 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
         (32, 30), // 非 16 倍数の in_dim
     ] {
         let out_dim = 1_usize;
-        let nb = DEFAULT_NUM_BUCKETS;
+        for &nb in &[DEFAULT_NUM_BUCKETS, 16] {
+            // 2 件目 (`nb = 16`) は旧 `kMaxSupportedNumBuckets = 9` の
+            // register-array 上限を超える値。native_kernels.cu を行ごとの直接
+            // atomicAdd に書き換えたことの回帰テストを兼ねる。
         let x: Vec<f32> = (0..batch * in_dim).map(|i| i as f32 * 0.01 - 1.0).collect();
         let dy: Vec<f32> = (0..batch * out_dim)
             .map(|i| i as f32 * 0.013 - 0.4)
@@ -1906,11 +1912,12 @@ fn dense_mm_bwd_weight_bucket_tiled_l3_matches_cpu() -> Result<(), Box<dyn std::
         }?;
         stream.synchronize()?;
         assert_close_rel(
-            &format!("dense_mm_bwd_weight_bucket_tiled_l3 b={batch}"),
+            &format!("dense_mm_bwd_weight_bucket_tiled_l3 b={batch} nb={nb}"),
             &dw_dev.to_host_vec(&stream)?,
             &dw_cpu,
             TOL,
         );
+        }
     }
     Ok(())
 }
@@ -2979,17 +2986,21 @@ fn simple_act_grad_to_fp16_crelu_clamp_counter_counts_overflows()
 }
 
 // =============================================================================
-// `--num-buckets` 可変 N (N ≤ MAX_SUPPORTED_NUM_BUCKETS = 9) を GPU/CPU で
-// exercise する parametrised test。既存テストは既定 N=9 で動かしているが、
-// kernel は `num_buckets` を runtime 引数で受けるため N ≤ 9 で同じ correctness
-// 不変条件 (`bucket_idx >= num_buckets` を silent skip、CPU と bit-equal) が
-// 成立する。本セクションでは `N ∈ {2, 4, 8, 9}` の主要 N で fwd / bwd_input /
-// bwd_weight / bias_grad を回し、host plumbing 経由で kernel が runtime N を
-// 正しく受け取れていることを確認する。
+// `--num-buckets` 可変 N を GPU/CPU で exercise する parametrised test。既存
+// テストは既定 N=9 で動かしているが、kernel は `num_buckets` を runtime 引数で
+// 受け取り、per-bucket 勾配は行ごとの直接 atomicAdd で蓄積する (固定長
+// register array による上限は無い、詳細は native_kernels.cu 参照) ため、任意の
+// N で同じ correctness 不変条件 (`bucket_idx >= num_buckets` を silent skip、
+// CPU と bit-equal) が成立するはず。本セクションでは `N ∈ {2, 4, 8, 9, 16}` の
+// 主要 N で fwd / bwd_input / bwd_weight / bias_grad を回し、host plumbing
+// 経由で kernel が runtime N を正しく受け取れていることを確認する。`16` は
+// 旧 `kMaxSupportedNumBuckets = 9` の上限を超える値で、まさにその撤廃を
+// 検証するために含めている。
 // =============================================================================
 
-/// `--num-buckets` で実験的に使う想定の N 値。
-const NUM_BUCKETS_PARAM_VALUES: [usize; 4] = [2, 4, 8, 9];
+/// `--num-buckets` で実験的に使う想定の N 値。`16` は旧 register-array 上限
+/// (9) を超える値 (native_kernels.cu の bucket 数撤廃を検証するため)。
+const NUM_BUCKETS_PARAM_VALUES: [usize; 5] = [2, 4, 8, 9, 16];
 
 #[test]
 fn dense_mm_fwd_bucket_matches_cpu_for_each_num_buckets() -> Result<(), Box<dyn std::error::Error>>

@@ -6,6 +6,7 @@ use clap::Parser;
 use nnue_format::layerstack_weights::{LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION};
 use nnue_format::{LayerStackWeights, YANEURAOU_LAYER_STACKS, save_yaneuraou};
 use shogi_features::FeatureSet;
+use shogi_features::router_kpabs::RouterKPAbsWeights;
 
 /// LayerStack バケット数。YaneuraOu SFNN は KingRank9 (3x3) 固定で、変換対象も
 /// これに揃える。
@@ -36,8 +37,21 @@ struct Args {
     output: PathBuf,
     /// Assert that the input was trained with `--bucket-mode kingrank9`.
     /// Quantised `.bin` files do not record their bucket routing mode.
+    /// Mutually exclusive with `--router` (router implies its own,
+    /// stronger assertion: the supplied router weights *are* the routing
+    /// network, no separate confirmation needed).
     #[arg(long)]
     assume_kingrank9: bool,
+    /// Embed a `router` bucket-selection network into the output.
+    /// Accepts either a `RouterKPAbs::save_to_bin` weights-only file or a
+    /// `{net_id}-{sb}.router.ckpt` sidecar (weights + Adam state; the trailing
+    /// optimizer bytes are simply ignored). This is required for tatara nets
+    /// trained with `--bucket-mode router`: the quantised `.bin` itself
+    /// never stores router weights (only `--output-format yaneuraou` embeds
+    /// them automatically at train time), so router runs must carry
+    /// their `*.router.ckpt` sidecar forward through `net_to_yo` explicitly.
+    #[arg(long)]
+    router: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,7 +59,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.input == args.output {
         return Err("input and output must be different paths".into());
     }
-    require_kingrank9_assertion(args.assume_kingrank9)?;
+    if args.assume_kingrank9 && args.router.is_some() {
+        return Err("--assume-kingrank9 and --router are mutually exclusive (pick one bucket routing mode)".into());
+    }
+    require_routing_assertion(args.assume_kingrank9, args.router.is_some())?;
+    let router = args
+        .router
+        .as_ref()
+        .map(|p| -> io::Result<RouterKPAbsWeights> {
+            let mut f = File::open(p)?;
+            RouterKPAbsWeights::read_from(&mut f)
+        })
+        .transpose()
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!("failed to load --router {}: {e}", args.router.as_ref().unwrap().display()).into()
+        })?;
 
     let detect_input = File::open(&args.input)?;
     let arch = detect_arch(&mut BufReader::new(detect_input))?;
@@ -64,15 +92,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let output = File::create(&args.output)?;
     let mut writer = BufWriter::new(output);
-    save_yaneuraou(&mut writer, &weights)?;
+    save_yaneuraou(&mut writer, &weights, router.as_ref())?;
     writer.flush()?;
     Ok(())
 }
 
-fn require_kingrank9_assertion(assume_kingrank9: bool) -> io::Result<()> {
-    if !assume_kingrank9 {
+fn require_routing_assertion(assume_kingrank9: bool, has_router: bool) -> io::Result<()> {
+    if !assume_kingrank9 && !has_router {
         return invalid_input(
-            "tatara .bin files do not record bucket routing; pass --assume-kingrank9 only after confirming the net was trained with --bucket-mode kingrank9",
+            "tatara .bin files do not record bucket routing; pass --assume-kingrank9 only after confirming the net was trained with --bucket-mode kingrank9, or pass --router <path> for a net trained with --bucket-mode router",
         );
     }
     Ok(())
@@ -392,10 +420,11 @@ mod tests {
 
     #[test]
     fn kingrank9_requires_an_explicit_assertion() {
-        let error = require_kingrank9_assertion(false).unwrap_err();
+        let error = require_routing_assertion(false, false).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert!(error.to_string().contains("--assume-kingrank9"));
-        require_kingrank9_assertion(true).unwrap();
+        require_routing_assertion(true, false).unwrap();
+        require_routing_assertion(false, true).unwrap();
     }
 
     /// zeroed weights から合成した tatara `.bin` を返す。
@@ -436,7 +465,7 @@ mod tests {
         reject_trailing_data(&mut load_reader).expect("no trailing data");
 
         let mut out = Vec::new();
-        save_yaneuraou(&mut out, &weights).expect("save_yaneuraou");
+        save_yaneuraou(&mut out, &weights, None).expect("save_yaneuraou");
         out
     }
 

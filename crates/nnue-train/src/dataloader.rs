@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
+use shogi_features::router_kpabs::RouterKPAbs;
 use shogi_features::{FeatureSetSpec, kingrank9_bucket_board};
 use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, ShogiBoard};
 
@@ -74,13 +75,18 @@ impl HcpeFileLoader {
 }
 
 /// LayerStack の position bucket 算出方式。
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BucketMode {
     /// KP-absolute progress 推定値を `num_buckets` 等分する。
     #[default]
     Progress8KpAbs,
     /// 双方の玉段を手番視点に正規化した固定 9 bucket を使う。
     KingRank9,
+    /// `router_kpabs::RouterKPAbs` — ランダム初期化から評価関数と一緒に学習する
+    /// N-way 多クラス分類バケット選択ネットワーク (N は任意、`--num-buckets`
+    /// で指定した値、`RouterKPAbs::bucket_board` は呼び出し時の `num_buckets`
+    /// とロード済み router の bucket 数が食い違うと panic する)。
+    Router,
 }
 
 impl BucketMode {
@@ -89,15 +95,23 @@ impl BucketMode {
         match self {
             Self::Progress8KpAbs => "progress8kpabs",
             Self::KingRank9 => "kingrank9",
+            Self::Router => "router",
         }
     }
 
     /// decode 済み局面の bucket index を返す。
+    ///
+    /// `Router` は process-global (`RouterKPAbs::init_random` /
+    /// `init_with_weights` 済) の重みを参照する。呼び出し前に未初期化だと
+    /// `RouterKPAbs::state()` が panic する (`ShogiProgressKPAbs` が未ロード時に
+    /// bucket 4 へ静かに fallback するのとは対照的 — router の重みは学習対象の
+    /// state そのものなので、未初期化のまま黙って進めるのは事故の元)。
     #[inline]
     pub fn bucket_board(self, board: &ShogiBoard, num_buckets: usize) -> u8 {
         match self {
             Self::Progress8KpAbs => ShogiProgressKPAbs.bucket_board(board, num_buckets),
             Self::KingRank9 => kingrank9_bucket_board(board),
+            Self::Router => RouterKPAbs.bucket_board(board, num_buckets),
         }
     }
 }
@@ -613,9 +627,17 @@ fn prefetch_depth_for(num_workers: usize) -> usize {
     (2 * num_workers).max(2)
 }
 
-/// 1 個の prefetch worker が消費 / 生成する単位。`(buffers, buckets)` を ring で
-/// 回す。`buffers` は `reset()` 再利用、`buckets` は `clear()` 再利用。
-type BatchSlot = (Batch, Vec<i32>);
+/// 1 個の prefetch worker が消費 / 生成する単位。`(buffers, buckets,
+/// router_indices)` を ring で回す。`buffers` は `reset()` 再利用、`buckets` /
+/// `router_indices` は `clear()` 再利用。
+///
+/// `router_indices[i]` は position `i` の KP-absolute active index 列
+/// (`router_kpabs::RouterKPAbs::active_indices_board` 出力)。`bucket_mode ==
+/// Router` のときだけ埋める (それ以外のモードでは常に空 `Vec`) — router の
+/// hard-EM oracle 学習 (`trainer::run` 内) がこの後で `bucket_board` と同じ
+/// board から再度 forward するのに使う。`Batch` 自体は HalfKA_hm 系の sparse
+/// index しか持たないため、KP-absolute 側の index は別途持ち回る必要がある。
+type BatchSlot = (Batch, Vec<i32>, Vec<Vec<u32>>);
 
 /// 共有 reader (`PsvEpochReader`) を `--threads` 本の worker で読み、各 worker が
 /// 「PSV パース + feature sparse 抽出 + position bucket 計算」を
@@ -742,6 +764,11 @@ impl BucketedPrefetchedLoader {
             let slot = (
                 Batch::with_capacity(batch_size, feature_set),
                 Vec::with_capacity(batch_size),
+                Vec::with_capacity(if bucket_mode == BucketMode::Router {
+                    batch_size
+                } else {
+                    0
+                }),
             );
             pool_tx
                 .send(slot)
@@ -767,7 +794,7 @@ impl BucketedPrefetchedLoader {
                     .map(|_| vec![0u64; feature_set.max_active() + 1]);
                 loop {
                     // 空の batch slot を pool から借りる。
-                    let (mut batch, mut buckets) = {
+                    let (mut batch, mut buckets, mut router_indices) = {
                         let rx = pool_rx.lock().expect("pool_rx mutex poisoned");
                         match rx.recv() {
                             Ok(slot) => slot,
@@ -776,6 +803,7 @@ impl BucketedPrefetchedLoader {
                     };
                     batch.reset();
                     buckets.clear();
+                    router_indices.clear();
 
                     // 短い critical section: 共有 reader から batch_size 件を
                     // scratch に詰める (I/O のみ、decode はしない)。
@@ -829,6 +857,9 @@ impl BucketedPrefetchedLoader {
                         }
                         if compute_bucket {
                             buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
+                            if bucket_mode == BucketMode::Router {
+                                router_indices.push(RouterKPAbs::active_indices_board(&board));
+                            }
                         }
                     }
                     if let Some(e) = overflow {
@@ -840,6 +871,11 @@ impl BucketedPrefetchedLoader {
                     }
                     debug_assert_eq!(batch.n_positions, batch_size);
                     debug_assert!(!compute_bucket || buckets.len() == batch_size);
+                    debug_assert!(
+                        bucket_mode != BucketMode::Router
+                            || !compute_bucket
+                            || router_indices.len() == batch_size
+                    );
 
                     // batch-local histogram を共有 accumulator に flush して 0 に戻す
                     // (batch 単位の lock)。`active_hist` / `local_hist` は同時に
@@ -856,7 +892,7 @@ impl BucketedPrefetchedLoader {
                     }
 
                     // main へ。受信側が落ちていたら (loader drop) 終了。
-                    if result_tx.send((batch, buckets)).is_err() {
+                    if result_tx.send((batch, buckets, router_indices)).is_err() {
                         break;
                     }
                 }
@@ -1334,8 +1370,8 @@ mod tests {
             false,
         )
         .unwrap();
-        let (batch, buckets) = off.next_batch().unwrap().expect("a batch");
-        off.recycle((batch, buckets));
+        let (batch, buckets, router_indices) = off.next_batch().unwrap().expect("a batch");
+        off.recycle((batch, buckets, router_indices));
         assert!(
             off.active_histogram_snapshot().is_none(),
             "flag off では histogram を確保・集計しない"
@@ -1361,9 +1397,9 @@ mod tests {
         .unwrap();
         let mut consumed = 0u64;
         for _ in 0..5 {
-            let (batch, buckets) = on.next_batch().unwrap().expect("a batch");
+            let (batch, buckets, router_indices) = on.next_batch().unwrap().expect("a batch");
             consumed += batch.n_positions as u64;
-            on.recycle((batch, buckets));
+            on.recycle((batch, buckets, router_indices));
         }
         let hist = on.active_histogram_snapshot().expect("histogram present");
         assert_eq!(hist.len(), test_spec().max_active() + 1);
@@ -1502,7 +1538,7 @@ mod tests {
         // epoch wrap するので何 batch でも取れる。30 batch ぶん検査して recycle で
         // 回す。
         for _ in 0..30 {
-            let (batch, buckets) = loader
+            let (batch, buckets, router_indices) = loader
                 .next_batch()
                 .unwrap()
                 .expect("epoch wraps, should never be None");
@@ -1523,7 +1559,7 @@ mod tests {
             }
             let active = batch.stm_indices.iter().filter(|&&i| i >= 0).count();
             assert!(active > 0, "実局面なので active features > 0");
-            loader.recycle((batch, buckets));
+            loader.recycle((batch, buckets, router_indices));
         }
         drop(loader); // worker は channel close で抜ける (hang しない)。
     }
@@ -1557,14 +1593,14 @@ mod tests {
             false,
         )
         .expect("spawn KingRank9 loader");
-        let (batch, buckets) = loader
+        let (batch, buckets, router_indices) = loader
             .next_batch()
             .expect("load batch")
             .expect("full batch");
         assert_eq!(batch.n_positions, 16);
         assert_eq!(buckets, expected);
         assert!(buckets.iter().all(|&bucket| (0..9).contains(&bucket)));
-        loader.recycle((batch, buckets));
+        loader.recycle((batch, buckets, router_indices));
     }
 
     #[test]
@@ -1596,7 +1632,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let (batch, buckets) = loader.next_batch().unwrap().expect("a batch");
+        let (batch, buckets, router_indices) = loader.next_batch().unwrap().expect("a batch");
         assert_eq!(batch.n_positions, 8);
         assert_eq!(buckets.len(), 8);
     }
@@ -1675,13 +1711,13 @@ mod tests {
         )
         .unwrap();
         for _ in 0..30 {
-            let (batch, buckets) = loader
+            let (batch, buckets, router_indices) = loader
                 .next_batch()
                 .unwrap()
                 .expect("epoch wraps within capped range");
             assert_eq!(batch.n_positions, 8);
             assert_eq!(buckets.len(), 8);
-            loader.recycle((batch, buckets));
+            loader.recycle((batch, buckets, router_indices));
         }
     }
 

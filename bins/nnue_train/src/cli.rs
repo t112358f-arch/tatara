@@ -772,9 +772,88 @@ pub(crate) struct LayerstackArgs {
     pub(crate) progress_coeff: Option<PathBuf>,
 
     /// Bucket assignment: `progress8kpabs` uses the KP-absolute progress model;
-    /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets.
+    /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets;
+    /// `router` trains a `progress8kpabs`-shaped linear KP-absolute model
+    /// (random init, no hidden layer) with `--num-buckets` outputs jointly
+    /// with the eval net, treating the outputs as a softmax multi-class
+    /// bucket-selection network (MoE-style router; equivalent to N
+    /// progress8kpabs-sized linear models sharing the same sparse input,
+    /// N = `--num-buckets`, same [2, 9] range as progress8kpabs).
     #[arg(long, default_value = "progress8kpabs")]
     pub(crate) bucket_mode: String,
+
+    /// `router` only: Adam learning rate for the router's own hard-EM
+    /// training step (independent of the main `--lr` schedule). Ignored for
+    /// other bucket modes.
+    #[arg(long, default_value_t = 0.01)]
+    pub(crate) router_lr: f32,
+
+    /// `router` only: multiplicative decay applied to `--router-lr`
+    /// once per superbatch (`lr *= router_lr_gamma`). `1.0` disables decay
+    /// (constant lr, matching the earlier behavior). Ignored for other
+    /// bucket modes.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) router_lr_gamma: f32,
+
+    /// `router` only: L2 weight decay applied to the router's weight
+    /// table (`RouterKPAbsWeights::w`; there is no bias term) during its Adam
+    /// step. Ignored for other bucket modes.
+    #[arg(long, default_value_t = 1.0e-5)]
+    pub(crate) router_weight_decay: f32,
+
+    /// `router` only: coefficient `λ` for the Switch-Transformer-style
+    /// load-balancing auxiliary loss (`L_balance = N * Σ_i f_i * P_i`, added to
+    /// the router's cross-entropy loss) that discourages the router from
+    /// collapsing onto a small subset of the `--num-buckets` buckets. `0.0`
+    /// disables it (cross-entropy only, matching the earlier behavior).
+    /// Ignored for other bucket modes.
+    #[arg(long, default_value_t = 0.01)]
+    pub(crate) router_balance_weight: f32,
+
+    /// `router` only: multiplicative decay applied to
+    /// `--router-balance-weight` once per superbatch
+    /// (`balance_weight = (balance_weight * gamma).max(router_balance_weight_min)`).
+    /// `1.0` disables decay. Typical use: start strong to avoid early expert
+    /// collapse, then taper off so cross-entropy (oracle accuracy) dominates
+    /// once the router has stabilized. Ignored for other bucket modes.
+    #[arg(long, default_value_t = 1.0)]
+    pub(crate) router_balance_weight_gamma: f32,
+
+    /// `router` only: floor for `--router-balance-weight` after
+    /// `--router-balance-weight-gamma` decay; the balance term never drops
+    /// below this value. Ignored for other bucket modes.
+    #[arg(long, default_value_t = 0.0)]
+    pub(crate) router_balance_weight_min: f32,
+
+    /// `router` only: run the hard-EM oracle sweep (`--num-buckets` extra
+    /// forward passes per refreshed batch, one per candidate bucket) and
+    /// update the router every N batches. `1` refreshes every batch (closest
+    /// to training "jointly" with the eval net, but slowest); larger N trades
+    /// router freshness for throughput. Ignored for other bucket modes.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) router_refresh_interval: usize,
+
+    /// `router` only: hard-EM (`1`, default) / soft-EM (`--num-buckets`) /
+    /// Top-K Hard Routing (in between) switch. Of the `--num-buckets` E-step
+    /// candidate buckets, only the `top_k` with the smallest error are kept
+    /// and weighted by `softmax(-error)` to form the router's soft training
+    /// target (`1` reduces to the previous one-hot hard-EM oracle;
+    /// `--num-buckets` gives the classic Jacobs & Jordan 1991 soft-EM
+    /// responsibility over every bucket). Inference in YaneuraOu always picks
+    /// a single bucket via argmax regardless of this setting — Top-K/soft
+    /// routing only slows down search with no benefit there, so it stays a
+    /// training-only technique. Must be in `[1, --num-buckets]`. Ignored for
+    /// other bucket modes.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) top_k: usize,
+
+    /// `router` only: resume the router's weights + Adam optimizer state
+    /// from a `{net_id}-{sb}.router.ckpt` sidecar file written by a previous
+    /// `router` run (independent of `--resume`, which only restores the
+    /// main eval net). Omit to start the router from a fresh random
+    /// initialization even when `--resume` is also given.
+    #[arg(long)]
+    pub(crate) router_resume: Option<PathBuf>,
 
     /// Output dimension of the FT (feature transformer) per perspective. Must be
     /// a positive multiple of 128. The default value keeps the network

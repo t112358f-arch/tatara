@@ -1,12 +1,13 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-// LayerStack bucket 数の上限。per-bucket accumulator を register array で持つ kernel が
-// この値で配列を確保する。各アクセスは `min(num_buckets, kMaxSupportedNumBuckets)` で
-// clamp するので範囲外 index (UB) にはならないが、host 側 `arch::MAX_SUPPORTED_NUM_BUCKETS`
-// がこの値を超えると上位 bucket の勾配が黙って落ちる。両定数の一致を
-// `native_bucket_capacity_matches_host` test で固定する。
-constexpr unsigned int kMaxSupportedNumBuckets = 9;
+// LayerStack bucket 数の上限は撤廃した。以前は per-bucket accumulator を
+// register array (固定長 `kMaxSupportedNumBuckets`) で持つ kernel
+// (`dense_mm_bwd_weight_bucket_tiled_l2`/`_l3`) があり、`num_buckets` が
+// この値を超えると上位 bucket の勾配が黙って落ちる問題があった。両 kernel を
+// 行ごとの直接 atomicAdd に書き換え、`num_buckets` に一切依存しない形にした
+// (トレードオフ: atomicAdd の回数が増えるため、bucket 数が少ない典型ケースでは
+// 以前よりやや遅くなりうる)。
 
 extern "C" __global__ void native_vec_add(
     const float* lhs,
@@ -2574,19 +2575,27 @@ extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l2(
     const unsigned int rows_per_split = (batch + gridDim.y - 1U) / gridDim.y;
     const unsigned int first_row = blockIdx.y * rows_per_split;
     const unsigned int last_row = min(first_row + rows_per_split, batch);
-    float accumulators[kMaxSupportedNumBuckets] = {};
-    const unsigned int bucket_limit = min(num_buckets, kMaxSupportedNumBuckets);
+    // NOTE: 以前はここで `float accumulators[kMaxSupportedNumBuckets]` という
+    // per-thread register 配列に bucket ごとの部分和を溜めてから
+    // `bucket_limit` (= `min(num_buckets, kMaxSupportedNumBuckets)`) 個分だけ
+    // atomicAdd していた。register 配列はコンパイル時サイズが必要なため
+    // `num_buckets` に上限を課さざるを得ず (`kMaxSupportedNumBuckets` を超える
+    // bucket の勾配は silent に drop されていた)、任意の `num_buckets` に
+    // 対応できなかった。ここでは register accumulation をやめ、行ごとに直接
+    // atomicAdd する (`num_buckets` に一切依存しない、正しさは常に成り立つ)。
+    // トレードオフ: atomicAdd の回数が「(この thread が担当する行数)」個に
+    // 増える (以前は「実際に出現した bucket 数」個、最大 bucket_limit 個)。
+    // bucket 数が少ない典型ケースではやや遅くなりうるが、正しさを優先する。
     for (unsigned int row = first_row; row < last_row; ++row) {
         const int bucket = bucket_idx[row];
-        if (bucket >= 0 && static_cast<unsigned int>(bucket) < bucket_limit) {
-            accumulators[bucket] +=
+        if (bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets) {
+            const float contribution =
                 input[static_cast<unsigned long long>(row) * input_dimension + input_index] *
                 output_gradient[static_cast<unsigned long long>(row) * output_dimension + output_index];
+            atomicAdd(weight_gradient
+                          + static_cast<unsigned long long>(bucket) * cells_per_bucket + cell,
+                      contribution);
         }
-    }
-    for (unsigned int bucket = 0; bucket < bucket_limit; ++bucket) {
-        atomicAdd(weight_gradient + static_cast<unsigned long long>(bucket) * cells_per_bucket + cell,
-                  accumulators[bucket]);
     }
 }
 
@@ -2609,20 +2618,20 @@ extern "C" __global__ void dense_mm_bwd_weight_bucket_tiled_l3(
     const unsigned int lanes_per_column = blockDim.x / input_dimension;
     const unsigned int stride = gridDim.x * lanes_per_column;
     unsigned int row = blockIdx.x * lanes_per_column + lane;
-    float accumulators[kMaxSupportedNumBuckets] = {};
-    const unsigned int bucket_limit = min(num_buckets, kMaxSupportedNumBuckets);
+    // L2 版 (`dense_mm_bwd_weight_bucket_tiled_l2`) と同じ理由で register
+    // accumulator 配列 (旧 `kMaxSupportedNumBuckets` 固定長) をやめ、行ごとに
+    // 直接 atomicAdd する (`num_buckets` に上限を課さない)。
     while (row < batch) {
         const int bucket = bucket_idx[row];
-        if (bucket >= 0 && static_cast<unsigned int>(bucket) < bucket_limit) {
-            accumulators[bucket] +=
+        if (bucket >= 0 && static_cast<unsigned int>(bucket) < num_buckets) {
+            const float contribution =
                 input[static_cast<unsigned long long>(row) * input_dimension + input_index] *
                 output_gradient[static_cast<unsigned long long>(row) * output_dimension];
+            atomicAdd(weight_gradient
+                          + static_cast<unsigned long long>(bucket) * input_dimension + input_index,
+                      contribution);
         }
         row += stride;
-    }
-    for (unsigned int bucket = 0; bucket < bucket_limit; ++bucket) {
-        atomicAdd(weight_gradient + static_cast<unsigned long long>(bucket) * input_dimension + input_index,
-                  accumulators[bucket]);
     }
 }
 

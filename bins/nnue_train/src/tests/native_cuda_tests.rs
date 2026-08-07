@@ -553,25 +553,24 @@ fn cuda_launch_stays_within_known_production_roots() {
     );
 }
 
-/// `native_kernels.cu` の per-bucket accumulator 容量 (`kMaxSupportedNumBuckets`) が host 側の
-/// `MAX_SUPPORTED_NUM_BUCKETS` と一致することを固定する。host が上回ると kernel が
-/// `min(num_buckets, kMaxSupportedNumBuckets)` で clamp し、上位 bucket の勾配が黙って落ちる。
+/// `dense_mm_bwd_weight_bucket_tiled_{l2,l3}` はかつて per-bucket accumulator を
+/// 固定長 register array (`kMaxSupportedNumBuckets = 9`) で持っており、host 側
+/// `num_buckets` がこれを超えると上位 bucket の勾配が黙って落ちる問題があった。
+/// 両 kernel を行ごとの直接 `atomicAdd` に書き換えて `num_buckets` に上限が無い
+/// ようにしたので、この定数はもう存在しないはず — 誰かが同じ「固定長
+/// accumulator」パターンを再導入していないかの回帰ガードとして、定数が
+/// 復活していないことだけを確認する (host/native 定数の一致を見ていた旧
+/// `native_bucket_capacity_matches_host` の代わり)。
 #[test]
-fn native_bucket_capacity_matches_host() {
+fn native_kernels_do_not_reintroduce_a_fixed_bucket_capacity() {
     let native = include_str!("../../../../crates/cuda-native-runtime/kernels/native_kernels.cu");
-    let marker = "constexpr unsigned int kMaxSupportedNumBuckets = ";
-    let value = native
-        .lines()
-        .find_map(|line| line.trim_start().strip_prefix(marker))
-        .and_then(|rest| rest.split(';').next())
-        .map(str::trim)
-        .expect("native_kernels.cu must define kMaxSupportedNumBuckets")
-        .parse::<usize>()
-        .expect("kMaxSupportedNumBuckets must be an integer");
-    assert_eq!(
-        value,
-        crate::arch::MAX_SUPPORTED_NUM_BUCKETS,
-        "native kMaxSupportedNumBuckets must match host MAX_SUPPORTED_NUM_BUCKETS"
+    assert!(
+        !native.contains("kMaxSupportedNumBuckets"),
+        "native_kernels.cu should not define a fixed per-bucket accumulator capacity again \
+         (dense_mm_bwd_weight_bucket_tiled_l2/l3 must stay unbounded via direct atomicAdd); \
+         if you're intentionally reintroducing a cap, make sure it can't silently drop \
+         gradients for num_buckets beyond that cap, and keep bins/nnue_train/src/arch.rs's \
+         MAX_SUPPORTED_NUM_BUCKETS in sync"
     );
 }
 
