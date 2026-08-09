@@ -4,18 +4,23 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use nnue_format::layerstack_weights::{LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION};
-use nnue_format::{LayerStackWeights, YANEURAOU_LAYER_STACKS, save_yaneuraou};
+use nnue_format::{LayerStackWeights, save_yaneuraou};
 use shogi_features::FeatureSet;
 use shogi_features::router_kpabs::RouterKPAbsWeights;
 
-/// LayerStack バケット数。YaneuraOu SFNN は KingRank9 (3x3) 固定で、変換対象も
-/// これに揃える。
-const YO_LAYER_STACKS: usize = YANEURAOU_LAYER_STACKS;
+/// legacy (`LEGACY_NNUE_VERSION_BUCKETS9`) tatara `.bin` の暗黙 bucket 数。
+/// 現行 version の入力は header の `num_buckets` field から読む (9 に限らない
+/// — `--bucket-mode router --num-buckets N` の N をそのまま透過する)。
+const LEGACY_NUM_BUCKETS: usize = 9;
 
 /// 変換対象の SFNN 次元上限。実在アーキは十分収まり、壊れた arch 文字列 (0 次元 /
 /// 巨大値) が overflow や過大 allocation を起こす前に弾くための健全性ガード。
 const MAX_FT_OUT: usize = 8192;
 const MAX_HIDDEN_DIM: usize = 4096;
+/// `num_buckets` の健全性ガード (0 / 壊れた header 値による overflow を防ぐ)。
+/// kernel やファイル形式が課す上限ではなく typo guard
+/// ([`nnue_format::yaneuraou`] の `MAX_LAYER_STACKS` と揃える)。
+const MAX_LAYER_STACKS: usize = 4096;
 
 /// tatara `.bin` header から読み取った変換対象アーキ。
 #[derive(Debug)]
@@ -24,6 +29,10 @@ struct DetectedArch {
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
+    /// `.bin` header の `num_buckets` field (legacy version は暗黙
+    /// [`LEGACY_NUM_BUCKETS`])。KingRank9 (9) に限らない — `router` bucket-mode
+    /// で学習した net は任意の N を持つ。
+    num_buckets: usize,
 }
 
 #[derive(Parser)]
@@ -86,9 +95,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         arch.ft_out,
         arch.l1_out,
         arch.l2_out,
-        YO_LAYER_STACKS,
+        arch.num_buckets,
     )?;
-    reject_trailing_data(&mut reader)?;
+    reject_trailing_data(&mut reader, arch.num_buckets)?;
 
     let output = File::create(&args.output)?;
     let mut writer = BufWriter::new(output);
@@ -107,8 +116,10 @@ fn require_routing_assertion(assume_kingrank9: bool, has_router: bool) -> io::Re
 }
 
 /// `.bin` header (version + network_hash + arch_str + num_buckets) を読み、変換
-/// 可能な SFNN アーキかを判定する。PSQT / threat / effect bucket / 非 9 bucket /
-/// 未知 feature は YaneuraOu SFNN に受け皿が無いため明示的に reject する。
+/// 可能な SFNN アーキかを判定する。PSQT / threat / effect bucket / 未知 feature /
+/// 壊れた bucket 数は YaneuraOu SFNN に受け皿が無いため明示的に reject する。
+/// bucket 数自体は KingRank9 (9) に限定しない ([`nnue_format::save_yaneuraou`] が
+/// 任意の N を `LayerStack=N` として書き出せるため)。
 fn detect_arch<R: Read>(reader: &mut R) -> io::Result<DetectedArch> {
     let version = read_u32(reader)?;
     if version != NNUE_VERSION && version != LEGACY_NNUE_VERSION_BUCKETS9 {
@@ -129,17 +140,19 @@ fn detect_arch<R: Read>(reader: &mut R) -> io::Result<DetectedArch> {
 
     // num_buckets は現行 version のみ header に持ち、legacy は暗黙 9。
     let num_buckets = if version == LEGACY_NNUE_VERSION_BUCKETS9 {
-        YO_LAYER_STACKS
+        LEGACY_NUM_BUCKETS
     } else {
         read_u32(reader)? as usize
     };
-    if num_buckets != YO_LAYER_STACKS {
+    if num_buckets == 0 || num_buckets > MAX_LAYER_STACKS {
         return invalid_input(format!(
-            "YaneuraOu SFNN requires {YO_LAYER_STACKS} LayerStacks (KingRank9), but the input has {num_buckets} buckets"
+            "unsupported LayerStack count {num_buckets} (expected 1..={MAX_LAYER_STACKS})"
         ));
     }
 
-    parse_arch_str(arch_str)
+    let mut detected = parse_arch_str(arch_str)?;
+    detected.num_buckets = num_buckets;
+    Ok(detected)
 }
 
 /// tatara `build_arch_str` が生成する arch 文字列から feature set と隠れ層次元を
@@ -200,6 +213,9 @@ fn parse_arch_str(arch_str: &str) -> io::Result<DetectedArch> {
         ft_out,
         l1_out,
         l2_out,
+        // `detect_arch` が header の `num_buckets` field で上書きする
+        // (arch_str 自体は bucket 数を持たないため placeholder)。
+        num_buckets: 0,
     })
 }
 
@@ -214,14 +230,12 @@ fn parse_usize(value: &str) -> io::Result<usize> {
         .map_err(|error| invalid_input_err(format!("expected integer, got `{value}`: {error}")))
 }
 
-fn reject_trailing_data<R: Read>(reader: &mut R) -> io::Result<()> {
+fn reject_trailing_data<R: Read>(reader: &mut R, num_buckets: usize) -> io::Result<()> {
     let mut byte = [0_u8; 1];
     if reader.read(&mut byte)? != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "tatara input has trailing data after the expected {YO_LAYER_STACKS} LayerStacks"
-            ),
+            format!("tatara input has trailing data after the expected {num_buckets} LayerStacks"),
         ));
     }
     Ok(())
@@ -251,12 +265,14 @@ mod tests {
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        num_buckets: usize,
     ) -> DetectedArch {
         DetectedArch {
             feature_set,
             ft_out,
             l1_out,
             l2_out,
+            num_buckets,
         }
     }
 
@@ -384,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_arch_rejects_non9_current_buckets_and_accepts_legacy_implicit9() {
+    fn detect_arch_accepts_non9_current_buckets_rejects_zero_and_accepts_legacy_implicit9() {
         let arch_str = build_arch_str(
             FeatureSet::HalfKaHmMerged.spec().arch_feature_name(),
             73305,
@@ -398,10 +414,17 @@ mod tests {
             None,
         );
 
+        // `--bucket-mode router --num-buckets 4` 等、KingRank9 (9) 以外の
+        // bucket 数も現行 version header では受理する。
         let non9 = header_bytes(NNUE_VERSION, &arch_str, Some(4));
-        let error = detect_arch(&mut std::io::Cursor::new(non9)).unwrap_err();
+        let arch = detect_arch(&mut std::io::Cursor::new(non9)).expect("non-9 bucket count");
+        assert_eq!(arch.num_buckets, 4);
+        assert_eq!(arch.feature_set, FeatureSet::HalfKaHmMerged);
+
+        let zero = header_bytes(NNUE_VERSION, &arch_str, Some(0));
+        let error = detect_arch(&mut std::io::Cursor::new(zero)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-        assert!(error.to_string().contains("LayerStacks"), "got: {error}");
+        assert!(error.to_string().contains("LayerStack count"), "got: {error}");
 
         let legacy = header_bytes(LEGACY_NNUE_VERSION_BUCKETS9, &arch_str, None);
         let arch = detect_arch(&mut std::io::Cursor::new(legacy)).expect("legacy implicit 9");
@@ -409,13 +432,15 @@ mod tests {
         assert_eq!(arch.ft_out, 1536);
         assert_eq!(arch.l1_out, 16);
         assert_eq!(arch.l2_out, 32);
+        assert_eq!(arch.num_buckets, LEGACY_NUM_BUCKETS);
     }
 
     #[test]
     fn trailing_input_is_rejected() {
-        let error = reject_trailing_data(&mut &b"x"[..]).unwrap_err();
+        let error = reject_trailing_data(&mut &b"x"[..], LEGACY_NUM_BUCKETS).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        reject_trailing_data(&mut &b""[..]).unwrap();
+        assert!(error.to_string().contains("9 LayerStacks"), "got: {error}");
+        reject_trailing_data(&mut &b""[..], LEGACY_NUM_BUCKETS).unwrap();
     }
 
     #[test]
@@ -433,9 +458,10 @@ mod tests {
         ft_out: usize,
         l1_out: usize,
         l2_out: usize,
+        num_buckets: usize,
     ) -> Vec<u8> {
         let weights =
-            LayerStackWeights::zeroed(feature_set.spec(), ft_out, l1_out, l2_out, YO_LAYER_STACKS);
+            LayerStackWeights::zeroed(feature_set.spec(), ft_out, l1_out, l2_out, num_buckets);
         let mut bytes = Vec::new();
         weights
             .save_quantised(&mut bytes, Some(nnue_format::layerstack_weights::FV_SCALE))
@@ -451,6 +477,7 @@ mod tests {
         assert_eq!(arch.ft_out, expect.ft_out);
         assert_eq!(arch.l1_out, expect.l1_out);
         assert_eq!(arch.l2_out, expect.l2_out);
+        assert_eq!(arch.num_buckets, expect.num_buckets);
 
         let mut load_reader = std::io::Cursor::new(bytes);
         let weights = LayerStackWeights::load_quantised(
@@ -459,10 +486,10 @@ mod tests {
             arch.ft_out,
             arch.l1_out,
             arch.l2_out,
-            YO_LAYER_STACKS,
+            arch.num_buckets,
         )
         .expect("load_quantised");
-        reject_trailing_data(&mut load_reader).expect("no trailing data");
+        reject_trailing_data(&mut load_reader, arch.num_buckets).expect("no trailing data");
 
         let mut out = Vec::new();
         save_yaneuraou(&mut out, &weights, None).expect("save_yaneuraou");
@@ -472,7 +499,9 @@ mod tests {
     #[test]
     fn full_pipeline_produces_valid_yo_header_across_feature_sets_and_dims() {
         // 検証対象は header と affine のパディング済み次元追随なので、FT 出力は
-        // 小さめ (128 の倍数) にして全 feature set を高速に網羅する。
+        // 小さめ (128 の倍数) にして全 feature set を高速に網羅する。KingRank9
+        // (9 bucket) 経路のみを対象とする — router (N != 9) の回帰確認は
+        // `full_pipeline_round_trips_non_kingrank9_router_bucket_count` を参照。
         let configs = [
             (
                 FeatureSet::HalfKaHmMerged,
@@ -511,8 +540,8 @@ mod tests {
             ),
         ];
         for (fs, ft_out, l1_out, l2_out, expected_arch) in configs {
-            let expect = detected(fs, ft_out, l1_out, l2_out);
-            let bytes = synthetic_bin(fs, ft_out, l1_out, l2_out);
+            let expect = detected(fs, ft_out, l1_out, l2_out, LEGACY_NUM_BUCKETS);
+            let bytes = synthetic_bin(fs, ft_out, l1_out, l2_out, LEGACY_NUM_BUCKETS);
             let out = convert(&bytes, &expect);
 
             assert_eq!(
@@ -532,5 +561,25 @@ mod tests {
                 0x5f13_4ab8
             );
         }
+    }
+
+    /// `--bucket-mode router --num-buckets 16` のような KingRank9 以外の
+    /// bucket 数で学習した net も `net_to_yo` で変換できる (`--router` sidecar
+    /// で router 重みを埋め込む経路は `save_yaneuraou` 側でカバー済みなので、
+    /// ここでは bucket 数の detect → load → export 一般化のみを確認する)。
+    #[test]
+    fn full_pipeline_round_trips_non_kingrank9_router_bucket_count() {
+        let (fs, ft_out, l1_out, l2_out, num_buckets) =
+            (FeatureSet::HalfKaHmMerged, 256_usize, 16_usize, 32_usize, 16_usize);
+        let expect = detected(fs, ft_out, l1_out, l2_out, num_buckets);
+        let bytes = synthetic_bin(fs, ft_out, l1_out, l2_out, num_buckets);
+        let out = convert(&bytes, &expect);
+
+        let arch_len = u32::from_le_bytes(out[8..12].try_into().unwrap()) as usize;
+        let arch_str = std::str::from_utf8(&out[12..12 + arch_len]).unwrap();
+        assert_eq!(
+            arch_str,
+            "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->256x2],Network=SFNN_HALFKAHM2_256_15_32_LS16{LayerStack=16}"
+        );
     }
 }

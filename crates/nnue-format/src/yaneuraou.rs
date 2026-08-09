@@ -12,15 +12,27 @@ const YO_VERSION: u32 = 0x7af3_2f16;
 const YO_TOP_HASH: u32 = 0x3c20_3b32;
 const YO_FT_HASH: u32 = 0x5f13_4ab8;
 const YO_NETWORK_HASH: u32 = 0x6333_718a;
-/// `router` の trailing weight block を示す magic。全 `YANEURAOU_LAYER_STACKS`
-/// network を書き終えた**直後**にだけ現れうる (kingrank9 export では出現しない)。
+/// `router` の trailing weight block を示す magic。全 network block (bucket 数
+/// = `weights.num_buckets`) を書き終えた**直後**にだけ現れうる (kingrank9
+/// export では出現しない)。
 /// エンジン側 (`evaluate_nnue.cpp`) は network 群を読み終えた後、EOF を要求する前に
 /// この 4 byte を peek し、一致すれば router block を読み、不一致なら読み戻して
 /// 既存の EOF 検査に進む — 後方互換 (router 無しの既存ファイルはそのまま読める)。
 pub const YO_ROUTER9KPABS_HASH: u32 = 0x526f_3944; // "Ro9D" (Router9kpabs Data) 由来
 
-/// YaneuraOu SFNN が要求する KingRank9 LayerStack 数。
+/// YaneuraOu SFNN の KingRank9 (kingrank9 bucket-mode) LayerStack 数。
+///
+/// この値は KingRank9 の「両玉の段」分岐数という固定レイアウトの名前であり、
+/// SFNN が書き出せる LayerStack 数の上限ではない。`router` bucket-mode は任意の
+/// `--num-buckets N` (`weights.num_buckets`) を持ち、engine 側もそれに合わせて
+/// `LayerStacks=N` でビルドした router edition (例:
+/// `YANEURAOU_ENGINE_SFNN_halfkahm2_1536_16_32_routerN`) で読む。`save_yaneuraou`
+/// は `weights.num_buckets` をそのまま書き出す (9 に限定しない)。
 pub const YANEURAOU_LAYER_STACKS: usize = 9;
+
+/// `weights.num_buckets` の健全性ガード (0 / 壊れた値による overflow を防ぐ)。
+/// kernel やファイル形式が課す上限ではなく typo guard。
+const MAX_LAYER_STACKS: usize = 4096;
 
 const MAX_FT_OUT: usize = 8192;
 const MAX_HIDDEN_DIM: usize = 4096;
@@ -61,13 +73,15 @@ const YO_FEATURES: [YoFeature; 5] = [
 
 /// LayerStack weights を YaneuraOu SFNNWithoutPsqt 形式で書き出す。
 ///
-/// feature set と各層次元は weights の shape から決定する。YaneuraOu SFNN が
-/// 表現できない拡張 feature、PSQT、KingRank9 以外の bucket 数は reject する。
-/// bucket routing mode 自体は weights に含まれないため、caller は学習 config 等から
-/// KingRank9 (または router) であることを確認してから呼ぶ必要がある。
+/// feature set と各層次元は weights の shape から決定する。bucket 数は
+/// `weights.num_buckets` をそのまま `LayerStack=N` として書き出す (KingRank9 の
+/// `9` に限定しない — `router` bucket-mode は任意の N を持つ)。YaneuraOu SFNN が
+/// 表現できない拡張 feature、PSQT は reject する。bucket routing mode 自体は
+/// weights に含まれないため、caller は学習 config 等から KingRank9 (または
+/// router) であることを確認してから呼ぶ必要がある。
 ///
-/// `router` が `Some` のとき、全 `YANEURAOU_LAYER_STACKS` network を書いた直後に
-/// `router` の重み ([`YO_ROUTER9KPABS_HASH`] + `RouterKPAbsWeights::write_to`)
+/// `router` が `Some` のとき、全 `weights.num_buckets` 個の network を書いた
+/// 直後に `router` の重み ([`YO_ROUTER9KPABS_HASH`] + `RouterKPAbsWeights::write_to`)
 /// を追記する。`None` (kingrank9 export 等) では従来通り network 群で終わる。
 pub fn save_yaneuraou<W: Write>(
     writer: &mut W,
@@ -95,7 +109,7 @@ pub fn save_yaneuraou<W: Write>(
     write_leb128_tensor_i16(writer, &quantize_i16(&weights.ft_b, QA as f64))?;
     write_leb128_tensor_i16(writer, &quantize_i16(&weights.ft_w, QA as f64))?;
 
-    for bucket in 0..YANEURAOU_LAYER_STACKS {
+    for bucket in 0..arch.num_buckets {
         write_u32(writer, YO_NETWORK_HASH)?;
 
         // factorizer 共有項は通常 export 前に L1 へ fold 済み。未 fold の weights を
@@ -139,6 +153,7 @@ struct Architecture {
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
+    num_buckets: usize,
 }
 
 fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
@@ -149,10 +164,9 @@ fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
     let ft_out = weights.ft_b.len();
     let l1_out = weights.l1f_b.len();
     let num_buckets = weights.num_buckets;
-    if num_buckets != YANEURAOU_LAYER_STACKS {
+    if num_buckets == 0 || num_buckets > MAX_LAYER_STACKS {
         return invalid_input(format!(
-            "YaneuraOu SFNN requires {} LayerStacks (KingRank9), but weights have {num_buckets} buckets",
-            YANEURAOU_LAYER_STACKS
+            "unsupported LayerStack count {num_buckets} (expected 1..={MAX_LAYER_STACKS})"
         ));
     }
     let l2_out = weights.l2_b.len().checked_div(num_buckets).unwrap_or(0);
@@ -161,7 +175,22 @@ fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
         ft_out,
         l1_out,
         l2_out,
+        num_buckets,
     })
+}
+
+/// `arch.num_buckets` の layout を表す edition suffix (`architectures/*.h` の
+/// 生成元 edition 名末尾トークンと合わせる)。`YANEURAOU_LAYER_STACKS` (9,
+/// KingRank9 の固定レイアウト) は既存配布 net との互換のため従来どおり
+/// `k3k3` を使い、それ以外の N は
+/// `docs/progress-sfnn-1536-build.md` が推奨する `ls<N>` 命名に従う (router
+/// bucket-mode 等、選択方式に依らず LayerStacks 数だけを表す)。
+fn layer_stack_suffix(num_buckets: usize) -> String {
+    if num_buckets == YANEURAOU_LAYER_STACKS {
+        "k3k3".to_string()
+    } else {
+        format!("ls{num_buckets}")
+    }
 }
 
 fn arch_string(arch: &Architecture) -> String {
@@ -171,7 +200,8 @@ fn arch_string(arch: &Architecture) -> String {
         .expect("every FeatureSet has a YaneuraOu mapping");
     let input_size = arch.feature_set.spec().ft_in();
     let h1 = arch.l1_out - 1;
-    let network = if arch.feature_set == FeatureSet::HalfKaHmMerged
+    let network = if arch.num_buckets == YANEURAOU_LAYER_STACKS
+        && arch.feature_set == FeatureSet::HalfKaHmMerged
         && arch.ft_out == 1536
         && arch.l1_out == 16
         && arch.l2_out == 32
@@ -179,14 +209,18 @@ fn arch_string(arch: &Architecture) -> String {
         "SFNN-1536".to_string()
     } else {
         format!(
-            "SFNN_{}_{}_{}_{}_k3k3",
-            feature.gen_key, arch.ft_out, h1, arch.l2_out
+            "SFNN_{}_{}_{}_{}_{}",
+            feature.gen_key,
+            arch.ft_out,
+            h1,
+            arch.l2_out,
+            layer_stack_suffix(arch.num_buckets)
         )
         .to_ascii_uppercase()
     };
     format!(
-        "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={YANEURAOU_LAYER_STACKS}}}",
-        feature.yo_name, arch.ft_out
+        "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={}}}",
+        feature.yo_name, arch.ft_out, arch.num_buckets
     )
 }
 
@@ -220,30 +254,30 @@ fn validate_weights(arch: &Architecture, weights: &LayerStackWeights) -> io::Res
         (
             "l1_b",
             weights.l1_b.len(),
-            YANEURAOU_LAYER_STACKS * arch.l1_out,
+            arch.num_buckets * arch.l1_out,
         ),
         (
             "l1_w",
             weights.l1_w.len(),
-            YANEURAOU_LAYER_STACKS * arch.l1_out * arch.ft_out,
+            arch.num_buckets * arch.l1_out * arch.ft_out,
         ),
         ("l1f_b", weights.l1f_b.len(), arch.l1_out),
         ("l1f_w", weights.l1f_w.len(), arch.ft_out * arch.l1_out),
         (
             "l2_b",
             weights.l2_b.len(),
-            YANEURAOU_LAYER_STACKS * arch.l2_out,
+            arch.num_buckets * arch.l2_out,
         ),
-        ("l3_b", weights.l3_b.len(), YANEURAOU_LAYER_STACKS),
+        ("l3_b", weights.l3_b.len(), arch.num_buckets),
         (
             "l2_w",
             weights.l2_w.len(),
-            YANEURAOU_LAYER_STACKS * arch.l2_out * l2_in,
+            arch.num_buckets * arch.l2_out * l2_in,
         ),
         (
             "l3_w",
             weights.l3_w.len(),
-            YANEURAOU_LAYER_STACKS * arch.l2_out,
+            arch.num_buckets * arch.l2_out,
         ),
     ];
     for (name, actual, expected) in lengths {
@@ -391,10 +425,63 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_kingrank9_shape() {
-        let weights = LayerStackWeights::zeroed(FeatureSet::HalfKaHmMerged.spec(), 128, 16, 32, 8);
+    fn rejects_zero_buckets() {
+        let weights = LayerStackWeights::zeroed(FeatureSet::HalfKaHmMerged.spec(), 128, 16, 32, 1);
+        let mut weights = weights;
+        weights.num_buckets = 0;
         let error = save_yaneuraou(&mut Vec::new(), &weights, None).unwrap_err();
-        assert!(error.to_string().contains("KingRank9"), "{error}");
+        assert!(error.to_string().contains("LayerStack count"), "{error}");
+    }
+
+    /// `--bucket-mode router --num-buckets N` (N != 9) は KingRank9 以外の
+    /// LayerStack 数を持つ。engine 側は `LayerStacks=N` でビルドした router
+    /// edition (`YANEURAOU_ENGINE_SFNN_..._routerN` 等) でこれを読む。
+    #[test]
+    fn non_kingrank9_bucket_count_is_accepted_with_ls_suffix() {
+        let weights = LayerStackWeights::zeroed(FeatureSet::HalfKaHmMerged.spec(), 128, 16, 32, 8);
+        assert_eq!(
+            arch_string(&architecture(&weights).unwrap()),
+            "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->128x2],Network=SFNN_HALFKAHM2_128_15_32_LS8{LayerStack=8}"
+        );
+
+        let mut out = Vec::new();
+        save_yaneuraou(&mut out, &weights, None).expect("save_yaneuraou accepts 8 buckets");
+        // 8 network block を書いた分、9-bucket export よりファイルは短い。
+        let mut nine_bucket_out = Vec::new();
+        let nine_bucket =
+            LayerStackWeights::zeroed(FeatureSet::HalfKaHmMerged.spec(), 128, 16, 32, 9);
+        save_yaneuraou(&mut nine_bucket_out, &nine_bucket, None).unwrap();
+        assert!(out.len() < nine_bucket_out.len());
+    }
+
+    /// 1536/16/32 の標準構成でも `LayerStack=9` の `SFNN-1536` 特別扱い名は
+    /// KingRank9 (N=9) 限定で、router 等の他 bucket 数では汎用の `_ls<N>` 命名に
+    /// フォールバックする (`SFNN-1536` という名前自体は bucket 数を含まないため
+    /// 既存 9-bucket 配布 net と紛らわしくなるのを避ける)。
+    #[test]
+    fn standard_1536_dims_with_non_9_buckets_do_not_use_bare_sfnn_1536_name() {
+        let weights =
+            LayerStackWeights::zeroed(FeatureSet::HalfKaHmMerged.spec(), 1536, 16, 32, 16);
+        let arch_str = arch_string(&architecture(&weights).unwrap());
+        assert!(!arch_str.contains("Network=SFNN-1536{"), "{arch_str}");
+        assert_eq!(
+            arch_str,
+            "ModelType=SFNNWithoutPsqt;Features=HalfKA_hm2(Friend)[73305->1536x2],Network=SFNN_HALFKAHM2_1536_15_32_LS16{LayerStack=16}"
+        );
+    }
+
+    /// router 重み ([`RouterKPAbsWeights`]) を伴う export は bucket 数に依らず
+    /// trailing block を書ける (9 固定だった頃の制約が bucket 数一般化後も
+    /// 崩れていないことの回帰確認)。
+    #[test]
+    fn router_block_is_appended_for_non_9_bucket_export() {
+        let weights = LayerStackWeights::zeroed(FeatureSet::HalfKaHmMerged.spec(), 128, 16, 32, 16);
+        let router = RouterKPAbsWeights::zeroed(16);
+        let mut with_router = Vec::new();
+        save_yaneuraou(&mut with_router, &weights, Some(&router)).unwrap();
+        let mut without_router = Vec::new();
+        save_yaneuraou(&mut without_router, &weights, None).unwrap();
+        assert!(with_router.len() > without_router.len());
     }
 
     #[test]
