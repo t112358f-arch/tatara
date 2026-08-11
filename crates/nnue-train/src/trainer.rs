@@ -56,7 +56,7 @@ use std::time::Instant;
 use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
-use shogi_features::router_kpabs::{RouterAdamState, RouterKPAbs};
+use shogi_features::router_kpabs::{RouterAdamState, RouterKPAbs, RouterMode};
 
 use crate::dataloader::{Batch, BucketMode, BucketedPrefetchedLoader, PSV_RECORD_BYTES};
 use crate::experiment::{ExperimentLogger, RouterHistoryEntry};
@@ -405,6 +405,13 @@ pub struct RouterTrainingConfig {
     /// リスクあり)。詳細は [`shogi_features::router_kpabs::RouterKPAbsWeights::train_oracle_batch`]
     /// のドキュメントを参照。
     pub balance_weight: f64,
+    /// router の M step の切替 (`--router-mode`)。[`RouterMode::HardEm`]
+    /// (既定) は oracle ターゲット EM 手続き、[`RouterMode::Backprop`] は
+    /// oracle ターゲットを経由しない通常の誤差逆伝播。`top_k` /
+    /// `top_k_reduction_interval` / `top_k_min` はどちらのモードでも使う
+    /// (詳細は [`shogi_features::router_kpabs`] モジュール doc、および
+    /// `top_k` フィールドの doc を参照)。
+    pub mode: RouterMode,
     /// hard-EM oracle refresh を何 batch ごとに行うか (`--router-refresh-interval`)。
     /// `1` で毎 batch (評価関数と "一緒に" 学習する度合いが最大、その分 forward
     /// を batch あたり 9 回余計に (bucket 数分) 実行するので低速)。`N > 1` で
@@ -426,14 +433,39 @@ pub struct RouterTrainingConfig {
     /// これを下回らない (`balance_weight_gamma < 1.0` で完全に 0 まで落として
     /// しまうのを防ぐ安全弁)。
     pub balance_weight_min: f64,
-    /// hard-EM / soft-EM / Top-K Hard Routing の切替 (`--top-k`)。E step で
+    /// `--router-mode` 共通 (`hard-EM` / `backprop` どちらでも使う): E step で
     /// 求めた N 個 (N = `TrainingConfig::num_buckets`) の bucket 誤差のうち、
-    /// 誤差が小さい方から `top_k` 個だけを `softmax(-err)` で重み付けした分布を
-    /// router の教師信号にする (`shogi_features::router_kpabs::oracle_targets_from_errors`)。
-    /// `1` (既定) で従来の hard-EM (one-hot)、`num_buckets` で古典的な soft-EM
-    /// (Jacobs & Jordan 1991 の responsibility)、その中間で Top-K Hard Routing。
+    /// 誤差が小さい方から `top_k` 個だけを M step の対象にする Top-K 選択。
+    /// - [`RouterMode::HardEm`]: 選ばれた `top_k` 個を `softmax(-err)` で重み
+    ///   付けした分布を router の教師信号にする
+    ///   (`shogi_features::router_kpabs::oracle_targets_from_errors`)。`1`
+    ///   (既定) で従来の hard-EM (one-hot)、`num_buckets` で古典的な soft-EM
+    ///   (Jacobs & Jordan 1991 の responsibility)、その中間で Top-K Hard
+    ///   Routing。
+    /// - [`RouterMode::Backprop`]: 選ばれた `top_k` 個に softmax を制限した
+    ///   router 自身の分布 `Q` の下での期待損失を router の重みについて直接
+    ///   backprop する (`shogi_features::router_kpabs::RouterKPAbsWeights::train_backprop_batch`、
+    ///   実際の LLM MoE で使われる Top-K routing と同じ考え方)。`top_k = 1`
+    ///   は softmax の支持集合が 1 点に固定され勾配が恒等的に 0 になる
+    ///   (学習が完全に止まる) ため、`backprop` では `top_k >= 2` が必要
+    ///   ── `top_k_reduction_interval` で anneal する場合は `top_k_min` を
+    ///   `2` 以上にしておくこと。
+    ///
     /// `[1, num_buckets]` の範囲でなければならない (`run()` が検証する)。
     pub top_k: usize,
+    /// `top_k` の superbatch ごとの減衰間隔 (`--top-k-reduction-interval`、
+    /// `hard-EM` / `backprop` 共通)。`N` superbatch 終える度に `top_k -= 1`
+    /// する (`1` の場合は毎 superbatch、`lr_gamma` / `balance_weight_gamma` と
+    /// 同じタイミングで適用する)。`top_k` は `top_k_min` を下回らない。`0`
+    /// (既定) で無効化 (`--top-k` を最後まで一定に保つ、従来動作)。
+    pub top_k_reduction_interval: usize,
+    /// `top_k` を anneal (`top_k_reduction_interval`) させるときの下限
+    /// (`--top-k-min`)。既定は `1` (`--top-k-reduction-interval` を使わない
+    /// 従来動作と同じ)。[`RouterMode::Backprop`] で `top_k_reduction_interval`
+    /// を使う場合、`top_k` が `1` まで落ちると勾配が恒等的に 0 になり学習が
+    /// 止まってしまう (`top_k` の doc 参照) ため、`2` 以上を指定すること。
+    /// `[1, top_k]` の範囲でなければならない (`run()` が検証する)。
+    pub top_k_min: usize,
 }
 
 /// LayerStack (bucket-aware) / Simple (bucket-less) どちらの backend で学習する
@@ -869,6 +901,10 @@ where
     // `cfg.router` が `None` (router 以外) のときは未使用。
     let mut current_router_lr: f64 = cfg.router.map(|rc| rc.lr).unwrap_or(0.0);
     let mut current_router_balance_weight: f64 = cfg.router.map(|rc| rc.balance_weight).unwrap_or(0.0);
+    // `RouterTrainingConfig::top_k` の実効値。1 superbatch 終える度に
+    // `--top-k-reduction-interval` superbatch ごとに 1 ずつ減らす
+    // (`--top-k-reduction-interval` が `0` なら不変、従来動作)。`1` を下回らない。
+    let mut current_top_k: usize = cfg.router.map(|rc| rc.top_k).unwrap_or(1);
     // sb 内で直近に観測した router 学習の診断情報 (負荷分散 loss / bucket 使用率
     // など)。sb 末の `[router]` ログ用。`refresh_interval > 1` の場合、更新され
     // なかった batch では前回の値がそのまま残る (= その sb 最後の refresh 時点の
@@ -910,18 +946,23 @@ where
             })?;
             let n_pos = batch.n_positions;
 
-            // router hard-EM/soft-EM/Top-K Hard Routing: bucket_mode 自体
+            // router (hard-EM/backprop 共通): bucket_mode 自体
             // (`bucket_mode.bucket_board` 経由で dataloader が既に割り当てた
             // `buckets`) は毎 batch 常に最新の router 出力を使う。ここでは
             // さらに router 自身を **この batch の現在の eval net に対する
-            // oracle ターゲット分布** で更新する (`--router-refresh-interval`
-            // 間隔)。N 通り (N = `cfg.num_buckets`) の固定 bucket で
-            // forward-only (`validate_step`、backward/optimizer step なし) を
-            // 回して各 position・各 bucket の誤差を求め、
-            // `oracle_targets_from_errors` (`--top-k` 依存、詳細は
-            // `router_kpabs` モジュール doc) で教師分布を作り、router の
-            // (soft-label) N-class cross entropy を 1 step 分 backprop する
-            // (`RouterKPAbs::train_oracle_batch`、CPU 側・GPU kernel 変更不要)。
+            // 誤差** で更新する (`--router-refresh-interval` 間隔)。N 通り
+            // (N = `cfg.num_buckets`) の固定 bucket で forward-only
+            // (`validate_step`、backward/optimizer step なし) を回して各
+            // position・各 bucket の誤差 `errs_by_position` を求め、その先の
+            // M step は `rc.mode` で分岐する (詳細は `router_kpabs` モジュール
+            // doc):
+            // - `RouterMode::HardEm`: `oracle_targets_from_errors` (`--top-k`
+            //   依存) で教師分布を作り、router の (soft-label) N-class cross
+            //   entropy を 1 step 分 backprop する (`RouterKPAbs::train_oracle_batch`)。
+            // - `RouterMode::Backprop`: 教師分布を経由せず、router 自身の
+            //   softmax 分布の下での期待損失を router の重みについて直接
+            //   backprop する (`RouterKPAbs::train_backprop_batch`)。
+            // いずれも CPU 側の計算のみで GPU kernel の変更は不要。
             if let (Some(rc), Some(adam)) = (cfg.router, router_adam.as_mut())
                 && batch_idx % rc.refresh_interval.max(1) == 0
             {
@@ -943,20 +984,39 @@ where
                     }
                     errs.push(err_k);
                 }
-                let oracle_targets: Vec<Vec<f64>> = (0..n_pos)
-                    .map(|i| {
-                        let errs_i: Vec<f64> = (0..cfg.num_buckets).map(|k| errs[k][i]).collect();
-                        shogi_features::router_kpabs::oracle_targets_from_errors(&errs_i, rc.top_k)
-                    })
+                let errs_by_position: Vec<Vec<f64>> = (0..n_pos)
+                    .map(|i| (0..cfg.num_buckets).map(|k| errs[k][i]).collect())
                     .collect();
-                let stats = RouterKPAbs::train_oracle_batch(
-                    &router_indices[..n_pos],
-                    &oracle_targets,
-                    adam,
-                    current_router_lr,
-                    rc.weight_decay,
-                    current_router_balance_weight,
-                );
+                let stats = match rc.mode {
+                    RouterMode::HardEm => {
+                        let oracle_targets: Vec<Vec<f64>> = errs_by_position
+                            .iter()
+                            .map(|errs_i| {
+                                shogi_features::router_kpabs::oracle_targets_from_errors(
+                                    errs_i,
+                                    current_top_k,
+                                )
+                            })
+                            .collect();
+                        RouterKPAbs::train_oracle_batch(
+                            &router_indices[..n_pos],
+                            &oracle_targets,
+                            adam,
+                            current_router_lr,
+                            rc.weight_decay,
+                            current_router_balance_weight,
+                        )
+                    }
+                    RouterMode::Backprop => RouterKPAbs::train_backprop_batch(
+                        &router_indices[..n_pos],
+                        &errs_by_position,
+                        adam,
+                        current_router_lr,
+                        rc.weight_decay,
+                        current_router_balance_weight,
+                        current_top_k,
+                    ),
+                };
                 last_router_stats = Some(stats);
             }
 
@@ -1082,12 +1142,18 @@ where
                 .map(|u| format!("{:.2}", u))
                 .collect::<Vec<_>>()
                 .join(",");
+            let mode = cfg.router.map(|rc| rc.mode).unwrap_or_default();
+            let mode_str = match mode {
+                RouterMode::HardEm => format!("hard-em top_k={current_top_k}"),
+                RouterMode::Backprop => format!("backprop top_k={current_top_k}"),
+            };
             eprintln!(
-                "[router] sb={} ce_loss={:.4} balance_loss={:.4} (min=1.0,max={}) usage=[{}]",
+                "[router] sb={} loss={:.4} balance_loss={:.4} (min=1.0,max={}) mode={} usage=[{}]",
                 sb,
                 stats.cross_entropy_loss,
                 stats.balance_loss,
                 stats.bucket_usage.len(),
+                mode_str,
                 usage_str,
             );
         }
@@ -1205,6 +1271,17 @@ where
             current_router_lr *= rc.lr_gamma;
             current_router_balance_weight =
                 (current_router_balance_weight * rc.balance_weight_gamma).max(rc.balance_weight_min);
+            // `--top-k-reduction-interval` superbatch 終える度に top_k を 1 減らす
+            // (`0` なら無効化、従来動作のまま)。`start_superbatch` からの経過
+            // superbatch 数で数えるので resume 後も interval の周期は維持される。
+            // `hard-EM` / `backprop` 共通 (`backprop` で `top_k` が `top_k_min`
+            // 未満、特に `1` まで落ちると勾配が恒等的に 0 になる点は `top_k_min`
+            // の doc を参照)。
+            if rc.top_k_reduction_interval > 0
+                && (sb - cfg.start_superbatch + 1) % rc.top_k_reduction_interval == 0
+            {
+                current_top_k = current_top_k.saturating_sub(1).max(rc.top_k_min);
+            }
         }
     }
 

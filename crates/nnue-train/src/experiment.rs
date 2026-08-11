@@ -274,8 +274,10 @@ pub struct HistoryEntry {
 #[derive(Debug, Clone, Serialize)]
 pub struct RouterHistoryEntry {
     pub superbatch: usize,
-    /// oracle ラベルとの 9-class cross entropy (batch 平均、その sb 最後の
-    /// oracle refresh 時点のスナップショット)。
+    /// router 学習損失 (batch 平均、その sb 最後の refresh 時点のスナップショット)。
+    /// `--router-mode hard-em` では oracle ラベルとの N-class cross entropy、
+    /// `--router-mode backprop` では router 自身の分布の下での期待損失
+    /// (詳細は [`shogi_features::router_kpabs::RouterTrainStats::cross_entropy_loss`])。
     pub ce_loss: f64,
     /// 負荷分散補助損失 (`N * Σ_i f_i * P_i`、最小値 1.0 で完全均等)。
     pub balance_loss: f64,

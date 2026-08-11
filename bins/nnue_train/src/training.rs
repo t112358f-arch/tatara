@@ -26,6 +26,8 @@ use nnue_train::trainer::TrainingConfig;
 #[cfg(feature = "gpu")]
 use nnue_train::trainer::RouterTrainingConfig;
 #[cfg(feature = "gpu")]
+use crate::cli::RouterModeArg;
+#[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 #[cfg(feature = "gpu")]
 use shogi_features::{EffectBucketConfig, FtFactorizeMode, ThreatProfile};
@@ -221,6 +223,30 @@ pub(crate) fn validate_output_format(
              router; progress8kpabs routing is not representable in YaneuraOu SFNN"
                 .into(),
         );
+    }
+    Ok(())
+}
+
+/// `--top-k` / `--top-k-min` の範囲検証 (`--router-mode hard-em` / `backprop`
+/// 共通)。`num_buckets` は `--num-buckets`、`top_k` は `--top-k`、`top_k_min`
+/// は `--top-k-min`。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn validate_router_top_k(
+    num_buckets: usize,
+    top_k: usize,
+    top_k_min: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !(1..=num_buckets).contains(&top_k) {
+        return Err(format!(
+            "--top-k must be in [1, --num-buckets] (num-buckets={num_buckets}, got --top-k={top_k})"
+        )
+        .into());
+    }
+    if !(1..=top_k).contains(&top_k_min) {
+        return Err(format!(
+            "--top-k-min must be in [1, --top-k] (top-k={top_k}, got --top-k-min={top_k_min})"
+        )
+        .into());
     }
     Ok(())
 }
@@ -572,22 +598,34 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             }
         }
-        if !(1..=layerstack.num_buckets).contains(&layerstack.top_k) {
-            return Err(format!(
-                "--top-k must be in [1, --num-buckets] (num-buckets={}, got --top-k={})",
-                layerstack.num_buckets, layerstack.top_k
-            )
-            .into());
+        // `--top-k` / `--top-k-reduction-interval` / `--top-k-min` now apply
+        // to both `--router-mode` values (see the `top_k` doc on
+        // `LayerstackArgs` for how the meaning differs by mode).
+        validate_router_top_k(layerstack.num_buckets, layerstack.top_k, layerstack.top_k_min)?;
+        if layerstack.router_mode == RouterModeArg::Backprop
+            && layerstack.top_k_reduction_interval > 0
+            && layerstack.top_k_min < 2
+        {
+            eprintln!(
+                "[train] warning: --router-mode backprop with --top-k-reduction-interval \
+                 annealing down to --top-k-min={} — once top_k reaches 1 the router's \
+                 softmax gradient is identically zero and training stalls; consider \
+                 --top-k-min=2 or higher",
+                layerstack.top_k_min
+            );
         }
         Some(RouterTrainingConfig {
             lr: layerstack.router_lr as f64,
             weight_decay: layerstack.router_weight_decay as f64,
             balance_weight: layerstack.router_balance_weight as f64,
+            mode: layerstack.router_mode.into(),
             refresh_interval: layerstack.router_refresh_interval.max(1),
             lr_gamma: layerstack.router_lr_gamma as f64,
             balance_weight_gamma: layerstack.router_balance_weight_gamma as f64,
             balance_weight_min: layerstack.router_balance_weight_min as f64,
             top_k: layerstack.top_k,
+            top_k_reduction_interval: layerstack.top_k_reduction_interval,
+            top_k_min: layerstack.top_k_min,
         })
     } else {
         None

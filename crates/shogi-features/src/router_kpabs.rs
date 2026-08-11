@@ -52,6 +52,37 @@
 //! 進める。router の重みは学習開始時にランダム初期化され (`init_random`)、以後
 //! 評価関数と共に更新される。
 //!
+//! ## 学習方式 (`--router-mode`)
+//!
+//! 上記 (E step で N 個の誤差を求め、oracle ターゲット分布との cross entropy を
+//! 最小化する) が [`RouterMode::HardEm`] (`hard-EM`、既定)。もう一方の
+//! [`RouterMode::Backprop`] は、oracle ターゲット分布を経由せず、router 自身の
+//! softmax 分布の下での **期待損失を router の重みについて直接微分**する —
+//! LLM の Mixture-of-Experts で使われる、ゲートネットワークを本体と同じ計算
+//! グラフの一部として誤差逆伝播で学習する方式と同じ発想 (E step 自体は共有:
+//! N 個の bucket 誤差 `errs[k]` を求めるところまでは hard-EM と同じ、その先の
+//! M step だけが異なる)。
+//!
+//! `--top-k` はどちらのモードでも使うが、意味が異なる:
+//! - `hard-EM`: 誤差最小の `top_k` 個を `oracle_targets_from_errors` で
+//!   `softmax(-err)` 重み付けした教師分布にする (`hard-EM`/`soft-EM`/Top-K
+//!   Hard Routing の切替)。
+//! - `backprop`: 誤差最小の `top_k` 個 `S` に softmax を制限した router 自身
+//!   の分布 `Q` (実際の LLM MoE の Top-K routing、例えば Switch Transformer
+//!   の Top-1 や Mixtral の Top-2 と同じ考え方) の下での期待損失
+//!   ```text
+//!   L = Σ_{k∈S} Q_k · errs[k]
+//!   d L / d logits_j = Q_j · (errs[j] − L)   (j∈S、j∉S は勾配 0)
+//!   ```
+//!   を router の重みについて直接微分する。`top_k = 1` は `Q` が one-hot に
+//!   退化し `d L/d logits ≡ 0` になる (softmax の支持集合が 1 点しかないため
+//!   自由度が無い) — `backprop` で学習させるには `top_k >= 2` が必要
+//!   (`--top-k-reduction-interval` で anneal する場合は `--top-k-min` を
+//!   `2` 以上にすること)。
+//!
+//! 負荷分散補助損失は [`RouterKPAbsWeights::train_oracle_batch`] と同じ式を
+//! そのまま加算する ([`RouterKPAbsWeights::train_backprop_batch`] 参照)。
+//!
 //! ## プロセス全体で 1 個
 //!
 //! `progress_kpabs::ShogiProgressKPAbs` と同様、重みはプロセス global
@@ -84,10 +115,31 @@ pub struct RouterKPAbsWeights {
     pub w: Vec<f64>,
 }
 
-/// `RouterKPAbsWeights::train_oracle_batch` の戻り値。ログ用の診断情報一式。
+/// router の M step の切替 (`--router-mode`)。E step (N 個の bucket それぞれに
+/// 固定して forward し誤差を求める) はどちらも共通、この先の router 重み更新
+/// 方法だけが異なる。詳細は [module 冒頭のドキュメント](self) を参照。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RouterMode {
+    /// oracle ターゲット分布 (`oracle_targets_from_errors`、`--top-k` で
+    /// hard-EM / soft-EM / Top-K Hard Routing を切替) との cross entropy を
+    /// 最小化する EM 手続き ([`RouterKPAbsWeights::train_oracle_batch`])。
+    #[default]
+    HardEm,
+    /// oracle ターゲット分布を経由せず、router 自身の softmax 分布 (`--top-k`
+    /// で誤差最小の上位 `top_k` 個に制限) の下での期待損失を router の重みに
+    /// ついて直接微分する、通常の誤差逆伝播
+    /// ([`RouterKPAbsWeights::train_backprop_batch`])。
+    Backprop,
+}
+
+/// `RouterKPAbsWeights::train_oracle_batch` / `train_backprop_batch` の
+/// 戻り値。ログ用の診断情報一式。
 #[derive(Clone, Debug)]
 pub struct RouterTrainStats {
-    /// oracle ラベルとの N-class cross entropy (batch 平均)。
+    /// router 学習損失 (batch 平均)。[`RouterMode::HardEm`] では oracle
+    /// ラベルとの N-class cross entropy、[`RouterMode::Backprop`] では
+    /// router 自身の分布の下での期待損失 (`Σ_k P_k · errs[k]`) — いずれも
+    /// 「router を今の状態からどれだけ動かす必要があるか」を表す点は共通。
     pub cross_entropy_loss: f64,
     /// 負荷分散補助損失 (Switch Transformer 式、batch 平均)。`balance_weight`
     /// 込みではない生の値 (`N * Σ_i f_i * P_i`) なので、`0.0` に近いほど N
@@ -378,6 +430,141 @@ impl RouterKPAbsWeights {
         }
     }
 
+    /// `--router-mode backprop` の M step。oracle ターゲット分布を経由せず、
+    /// E step で求めた bucket 誤差 `errs_batch[i][k]` を「bucket k を選んだ
+    /// ときの損失」とみなし、router 自身の softmax 分布の下での期待損失を
+    /// router の重みについて直接 backprop する (通常の誤差逆伝播、詳細は
+    /// [module 冒頭のドキュメント](self) を参照)。負荷分散補助損失は
+    /// [`Self::train_oracle_batch`] と同じ式をそのまま加算する。
+    ///
+    /// `top_k` (`hard-EM` と共有の `--top-k` 値) は、誤差昇順で上位 `top_k`
+    /// 個の bucket だけを残した **部分集合 `S`** に softmax を制限した分布
+    /// `Q` (`hard-EM` の `oracle_targets_from_errors` と同じ Top-K 選択、
+    /// `Q_k = P_k / Σ_{j∈S} P_j` for `k ∈ S`、それ以外は 0) を使う、実際の
+    /// LLM MoE で使われる Top-K routing (Switch Transformer の Top-1、
+    /// Mixtral の Top-2 等) と同じ考え方: 選ばれなかった bucket の logit は
+    /// この loss 項からは勾配を受け取らない。`top_k = num_buckets` なら
+    /// 制限なし (全 bucket が `S`、`Q = P`) になり、`top_k = 1` は退化して
+    /// `Q` が one-hot になり `d L/d logits = 0` (softmax が 1 点に固定される
+    /// ため勾配が消える) — `backprop` モードで学習させるには `top_k >= 2`
+    /// が必要 (`--top-k-min` で anneal の下限を 1 より大きくできる)。
+    ///
+    /// ```text
+    /// L = Σ_{k∈S} Q_k · errs[k]                 (S = 誤差昇順の上位 top_k)
+    /// d L / d logits_j = Q_j · (errs[j] − L)  (j∈S)
+    /// d L / d logits_j = 0                    (j∉S)
+    /// ```
+    ///
+    /// `indices_batch[i]` は position `i` の active index 列、
+    /// `errs_batch[i]` は E step で求めたその position の bucket ごとの誤差
+    /// (長さ `num_buckets`、小さいほど良い)。両者は同じ長さでなければならない。
+    pub fn train_backprop_batch(
+        &mut self,
+        indices_batch: &[Vec<u32>],
+        errs_batch: &[Vec<f64>],
+        adam: &mut RouterAdamState,
+        lr: f64,
+        weight_decay: f64,
+        balance_weight: f64,
+        top_k: usize,
+    ) -> RouterTrainStats {
+        assert_eq!(indices_batch.len(), errs_batch.len());
+        assert_eq!(
+            adam.num_buckets, self.num_buckets,
+            "RouterAdamState num_buckets mismatch with RouterKPAbsWeights"
+        );
+        let n = indices_batch.len();
+        let num_buckets = self.num_buckets;
+        assert!(top_k >= 1 && top_k <= num_buckets, "top_k must be in [1, num_buckets]");
+        if n == 0 {
+            return RouterTrainStats {
+                cross_entropy_loss: 0.0,
+                balance_loss: 0.0,
+                bucket_usage: vec![0.0; num_buckets],
+            };
+        }
+
+        // 1st pass: `train_oracle_batch` と同様、forward しつつ probs をキャッシュ
+        // し、負荷分散補助損失用の dispatch 分布 f を先に求める。負荷分散項は
+        // (`train_oracle_batch` と同じく) top_k 制限とは無関係に全 bucket の
+        // 使用率に対してかける。
+        let mut all_probs: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut dispatch_count = vec![0u32; num_buckets];
+        for indices in indices_batch {
+            let logits = self.forward_logits(indices);
+            let (dispatch_bucket, _, probs) = Self::bucket_and_probs(&logits);
+            dispatch_count[dispatch_bucket as usize] += 1;
+            all_probs.push(probs);
+        }
+        let mut f = vec![0.0_f64; num_buckets];
+        for k in 0..num_buckets {
+            f[k] = dispatch_count[k] as f64 / n as f64;
+        }
+
+        // 2nd pass: 誤差昇順の上位 top_k に制限した softmax 分布 Q による
+        // 期待損失 L = Σ_{k∈S} Q_k · errs[k] の勾配
+        //   d L / d logits_j = Q_j · (errs[j] − L)   (j∈S、j∉S は 0)
+        // (+ balance_weight != 0 なら `train_oracle_batch` と同じ負荷分散項、
+        // こちらは top_k 制限なしの全 bucket 分) を合成して backprop する。
+        let mut grad_w = vec![0.0_f64; self.w.len()];
+        let mut total_expected_loss = 0.0_f64;
+        let mut avg_probs = vec![0.0_f64; num_buckets];
+
+        for (indices, (errs, probs)) in indices_batch.iter().zip(errs_batch.iter().zip(all_probs.iter())) {
+            debug_assert_eq!(errs.len(), num_buckets);
+            for k in 0..num_buckets {
+                avg_probs[k] += probs[k];
+            }
+
+            let selected = top_k_error_ranked_indices(errs, top_k);
+            let sum_sel: f64 = selected.iter().map(|&k| probs[k]).sum();
+            // `probs[k] > 0` は softmax の性質上常に成り立つので `sum_sel > 0`。
+            let expected: f64 = selected.iter().map(|&k| (probs[k] / sum_sel) * errs[k]).sum();
+            total_expected_loss += expected;
+
+            let mut d_logits = vec![0.0_f64; num_buckets];
+            for &k in &selected {
+                let q_k = probs[k] / sum_sel;
+                d_logits[k] = q_k * (errs[k] - expected);
+            }
+
+            if balance_weight != 0.0 {
+                let dot: f64 = f.iter().zip(probs.iter()).map(|(&fi, &pi)| fi * pi).sum();
+                let n_buckets = num_buckets as f64;
+                for j in 0..num_buckets {
+                    d_logits[j] += balance_weight * n_buckets * probs[j] * (f[j] - dot);
+                }
+            }
+
+            for &idx in indices {
+                let base = idx as usize * num_buckets;
+                for k in 0..num_buckets {
+                    grad_w[base + k] += d_logits[k];
+                }
+            }
+        }
+
+        let inv_n = 1.0_f64 / n as f64;
+        for g in grad_w.iter_mut() {
+            *g *= inv_n;
+        }
+        for p in avg_probs.iter_mut() {
+            *p *= inv_n;
+        }
+
+        adam.t += 1;
+        adam_step(&mut self.w, &grad_w, &mut adam.m_w, &mut adam.v_w, lr, weight_decay, adam.t);
+
+        let balance_loss: f64 =
+            num_buckets as f64 * f.iter().zip(avg_probs.iter()).map(|(&fi, &pi)| fi * pi).sum::<f64>();
+
+        RouterTrainStats {
+            cross_entropy_loss: total_expected_loss / n as f64,
+            balance_loss,
+            bucket_usage: f,
+        }
+    }
+
     /// raw 形式で書き出す: magic(u32) / num_weights(u32) / num_buckets(u32) /
     /// w(f64 LE)。`progress.bin` と同じ f64 精度。progress8kpabs 同様 bias は
     /// 無いので、これだけで完結する。
@@ -612,6 +799,21 @@ impl RouterKPAbs {
         let mut w = Self::state().write().unwrap();
         w.train_oracle_batch(indices_batch, oracle_targets, adam, lr, weight_decay, balance_weight)
     }
+
+    /// `--router-mode backprop` の M step。詳細は
+    /// [`RouterKPAbsWeights::train_backprop_batch`] を参照。
+    pub fn train_backprop_batch(
+        indices_batch: &[Vec<u32>],
+        errs_batch: &[Vec<f64>],
+        adam: &mut RouterAdamState,
+        lr: f64,
+        weight_decay: f64,
+        balance_weight: f64,
+        top_k: usize,
+    ) -> RouterTrainStats {
+        let mut w = Self::state().write().unwrap();
+        w.train_backprop_batch(indices_batch, errs_batch, adam, lr, weight_decay, balance_weight, top_k)
+    }
 }
 
 /// E step で求めた per-position・per-bucket の誤差 (`errs[position][bucket]`、
@@ -631,26 +833,33 @@ impl RouterKPAbs {
 /// `err` はそのまま `-err` を logit とみなして softmax するので、絶対スケールは
 /// 気にしなくてよい (`oracle_pred_scale`/`sigmoid` 由来の `[0,1]` 程度の二乗誤差
 /// を想定)。
-pub fn oracle_targets_from_errors(errs: &[f64], top_k: usize) -> Vec<f64> {
+/// 誤差昇順 (良い順) に bucket index を並べ、上位 `top_k` 個だけを返す
+/// (`oracle_targets_from_errors` と `RouterKPAbsWeights::train_backprop_batch`
+/// の Top-K 選択で共有するヘルパー)。
+fn top_k_error_ranked_indices(errs: &[f64], top_k: usize) -> Vec<usize> {
     let num_buckets = errs.len();
     assert!(top_k >= 1 && top_k <= num_buckets, "top_k must be in [1, num_buckets]");
-
-    // 誤差昇順 (良い順) に bucket index を並べ、上位 top_k だけを残す。
     let mut order: Vec<usize> = (0..num_buckets).collect();
     order.sort_by(|&a, &b| errs[a].partial_cmp(&errs[b]).unwrap_or(std::cmp::Ordering::Equal));
-    let selected = &order[..top_k];
+    order.truncate(top_k);
+    order
+}
+
+pub fn oracle_targets_from_errors(errs: &[f64], top_k: usize) -> Vec<f64> {
+    let num_buckets = errs.len();
+    let selected = top_k_error_ranked_indices(errs, top_k);
 
     // softmax(-err) を選ばれた top_k の中だけで取る (top_k==1 なら自動的に
     // one-hot、softmax の分母がその 1 要素だけになるため)。
     let min_err = selected.iter().map(|&k| errs[k]).fold(f64::INFINITY, f64::min);
     let mut weights = vec![0.0_f64; num_buckets];
     let mut sum = 0.0_f64;
-    for &k in selected {
+    for &k in &selected {
         let w = (-(errs[k] - min_err)).exp(); // min_err を引いてから exp: オーバーフロー対策
         weights[k] = w;
         sum += w;
     }
-    for &k in selected {
+    for &k in &selected {
         weights[k] /= sum;
     }
     weights
@@ -734,6 +943,82 @@ mod tests {
              (loss0={}, last={last})",
             stats0.cross_entropy_loss,
         );
+    }
+
+    #[test]
+    fn train_backprop_batch_reduces_expected_loss_on_repeated_errors() {
+        // bucket 3 の誤差だけ低く固定した batch を繰り返し与えると、
+        // 期待損失 (= Σ_{k∈S} Q_k · errs[k]、top_k=9 なので S = 全 bucket) は
+        // router が bucket 3 に確率質量を寄せるほど下がるはず。
+        let mut w = RouterKPAbsWeights::random(9, 1);
+        let mut adam = RouterAdamState::zeros(9);
+        let board = sample_board();
+        let indices = RouterKPAbs::active_indices_board(&board);
+        let batch = vec![indices.clone(), indices.clone(), indices];
+        let mut errs = vec![1.0_f64; 9];
+        errs[3] = 0.0;
+        let errs_batch = vec![errs.clone(), errs.clone(), errs];
+
+        let stats0 = w.train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, 0.0, 9);
+        let mut last = stats0.cross_entropy_loss;
+        for _ in 0..40 {
+            last = w
+                .train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, 0.0, 9)
+                .cross_entropy_loss;
+        }
+        assert!(
+            last < stats0.cross_entropy_loss,
+            "expected loss should decrease when repeatedly trained on the same bucket errors \
+             (loss0={}, last={last})",
+            stats0.cross_entropy_loss,
+        );
+    }
+
+    #[test]
+    fn train_backprop_batch_top_k_restricts_gradient_to_selected_buckets() {
+        // top_k で選ばれなかった bucket の重み列は勾配 0 (weight_decay も 0 に
+        // しておく) なので更新されないはず。誤差最大の bucket (最も選ばれにくい)
+        // だけを比較対象にする。
+        let mut w = RouterKPAbsWeights::random(9, 3);
+        let w_before = w.w.clone();
+        let mut adam = RouterAdamState::zeros(9);
+        let board = sample_board();
+        let indices = RouterKPAbs::active_indices_board(&board);
+        let batch = vec![indices.clone()];
+        // bucket 0..=1 (top_k=2) が誤差最小、bucket 8 が誤差最大 = 確実に非選択。
+        let errs = vec![0.0, 0.1, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 1.0];
+        let errs_batch = vec![errs];
+
+        w.train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, 0.0, 2);
+
+        for &idx in &indices {
+            let base = idx as usize * 9;
+            assert_eq!(
+                w.w[base + 8], w_before[base + 8],
+                "bucket 8 (worst err, outside top_k=2) must not receive gradient"
+            );
+        }
+    }
+
+    #[test]
+    fn train_backprop_batch_top_k_one_is_a_no_op() {
+        // top_k=1 は softmax の支持集合が 1 点に固定されるため、選ばれた bucket
+        // 自身への勾配も常に 0 になる (期待損失が定義上その bucket の誤差と一致
+        // し、そこから動かす自由度が無い)。`--top-k-min` で 1 に落ちないように
+        // する運用上の理由がここにある。
+        let mut w = RouterKPAbsWeights::random(9, 5);
+        let w_before = w.w.clone();
+        let mut adam = RouterAdamState::zeros(9);
+        let board = sample_board();
+        let indices = RouterKPAbs::active_indices_board(&board);
+        let batch = vec![indices];
+        let mut errs = vec![1.0_f64; 9];
+        errs[3] = 0.0;
+        let errs_batch = vec![errs];
+
+        let stats = w.train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, 0.0, 1);
+        assert_eq!(w.w, w_before, "top_k=1 should leave router weights unchanged");
+        assert_eq!(stats.cross_entropy_loss, 0.0, "top_k=1 expected loss collapses to the sole selected bucket's error");
     }
 
     #[test]

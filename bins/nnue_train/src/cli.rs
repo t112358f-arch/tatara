@@ -599,6 +599,28 @@ impl From<OutputFormatArg> for nnue_train::trainer::OutputFormat {
     }
 }
 
+/// `--router-mode` の選択肢。`router` bucket mode でのみ意味を持つ (`bucket_mode
+/// != router` では無視される)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum RouterModeArg {
+    /// oracle ターゲット分布 (`--top-k` で hard-EM / soft-EM / Top-K Hard
+    /// Routing を切替) との cross entropy を最小化する従来の EM 手続き。
+    #[default]
+    #[value(name = "hard-em")]
+    HardEm,
+    /// oracle ターゲット分布を経由しない、通常の誤差逆伝播。
+    Backprop,
+}
+
+impl From<RouterModeArg> for shogi_features::router_kpabs::RouterMode {
+    fn from(value: RouterModeArg) -> Self {
+        match value {
+            RouterModeArg::HardEm => Self::HardEm,
+            RouterModeArg::Backprop => Self::Backprop,
+        }
+    }
+}
+
 /// `--ft-fp16-out` が `--ft-fp16` を要求する制約を **実効値** (`--all-optim` の含意込み)
 /// で検証する。`true` を返したら制約違反 = error (FT activation FP16 が ON だが
 /// FT weight FP16 が OFF)。
@@ -782,9 +804,21 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value = "progress8kpabs")]
     pub(crate) bucket_mode: String,
 
-    /// `router` only: Adam learning rate for the router's own hard-EM
-    /// training step (independent of the main `--lr` schedule). Ignored for
+    /// `router` only: how the router's own weights are trained. `hard-em`
+    /// (default) fits the router to an oracle target distribution built from
+    /// per-bucket errors. `backprop` skips the oracle target and instead
+    /// backpropagates the expected loss under the router's own softmax
+    /// distribution directly into its weights, the way a gating network in a
+    /// standard (LLM-style) Mixture-of-Experts is trained. `--top-k`,
+    /// `--top-k-reduction-interval`, and `--top-k-min` apply to both modes
+    /// (see `--top-k` for how the meaning differs by mode). Ignored for
     /// other bucket modes.
+    #[arg(long, value_enum, default_value_t = RouterModeArg::HardEm)]
+    pub(crate) router_mode: RouterModeArg,
+
+    /// `router` only: Adam learning rate for the router's own training step
+    /// (independent of the main `--lr` schedule). Ignored for other bucket
+    /// modes.
     #[arg(long, default_value_t = 0.01)]
     pub(crate) router_lr: f32,
 
@@ -833,19 +867,47 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) router_refresh_interval: usize,
 
-    /// `router` only: hard-EM (`1`, default) / soft-EM (`--num-buckets`) /
-    /// Top-K Hard Routing (in between) switch. Of the `--num-buckets` E-step
-    /// candidate buckets, only the `top_k` with the smallest error are kept
-    /// and weighted by `softmax(-error)` to form the router's soft training
-    /// target (`1` reduces to the previous one-hot hard-EM oracle;
-    /// `--num-buckets` gives the classic Jacobs & Jordan 1991 soft-EM
-    /// responsibility over every bucket). Inference in YaneuraOu always picks
-    /// a single bucket via argmax regardless of this setting — Top-K/soft
-    /// routing only slows down search with no benefit there, so it stays a
-    /// training-only technique. Must be in `[1, --num-buckets]`. Ignored for
-    /// other bucket modes.
+    /// `router` only: of the `--num-buckets` E-step candidate buckets (ranked
+    /// by error, smallest first), only the `top_k` best are used by the M
+    /// step; the meaning of "used" depends on `--router-mode`:
+    /// - `hard-em` (default `top_k=1`): the selected buckets are weighted by
+    ///   `softmax(-error)` to form the router's soft training target (`1`
+    ///   reduces to the previous one-hot hard-EM oracle; `--num-buckets`
+    ///   gives the classic Jacobs & Jordan 1991 soft-EM responsibility over
+    ///   every bucket).
+    /// - `backprop`: softmax is restricted to the selected buckets (mirroring
+    ///   real top-k MoE routing, e.g. Switch Transformer's top-1 or Mixtral's
+    ///   top-2); only those buckets' logits receive gradient this step.
+    ///   `top_k=1` collapses the softmax to a single point and the gradient
+    ///   is identically zero, so training stalls — use `top_k >= 2` (see
+    ///   `--top-k-min` if annealing `--top-k` down over the run).
+    ///
+    /// Inference in YaneuraOu always picks a single bucket via argmax
+    /// regardless of this setting — Top-K/soft routing only slows down
+    /// search with no benefit there, so it stays a training-only technique.
+    /// Must be in `[1, --num-buckets]`. Ignored for other bucket modes.
     #[arg(long, default_value_t = 1)]
     pub(crate) top_k: usize,
+
+    /// `router` only: superbatch interval at which `--top-k` is annealed
+    /// down by 1 (`1 superbatch ごとに top_k -= 1` when `1`, `every N
+    /// superbatches` when `N`). Applied at the end of each superbatch,
+    /// alongside `--router-lr-gamma` / `--router-balance-weight-gamma`
+    /// decay; never lowers `top_k` below `--top-k-min`. `0` (default)
+    /// disables the anneal, keeping `--top-k` constant for the whole run
+    /// (previous behavior). Ignored for other bucket modes.
+    #[arg(long, default_value_t = 0)]
+    pub(crate) top_k_reduction_interval: usize,
+
+    /// `router` only: floor for `--top-k` when annealed by
+    /// `--top-k-reduction-interval`. `1` (default) matches the previous
+    /// behavior (anneal all the way down to hard-EM one-hot / a single
+    /// selected bucket). `--router-mode backprop` needs `top_k >= 2` to get
+    /// a nonzero gradient (see `--top-k`), so set this to `2` or higher when
+    /// annealing in that mode. Must be in `[1, --top-k]`. Ignored for other
+    /// bucket modes.
+    #[arg(long, default_value_t = 1)]
+    pub(crate) top_k_min: usize,
 
     /// `router` only: resume the router's weights + Adam optimizer state
     /// from a `{net_id}-{sb}.router.ckpt` sidecar file written by a previous

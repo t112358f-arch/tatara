@@ -8,7 +8,7 @@ use nnue_format::{ArchKind, SimpleActivation};
 use crate::cli::*;
 use crate::training::{
     per_group_optim_flags, reject_simple_unsupported_flags, require_simple_win_rate_model,
-    validate_bucket_mode, validate_output_format,
+    validate_bucket_mode, validate_output_format, validate_router_top_k,
 };
 
 use clap::CommandFactory;
@@ -273,7 +273,75 @@ fn kingrank9_bucket_mode_validation() {
 }
 
 #[test]
-fn simple_subcommand_parses() {
+fn router_mode_defaults_to_hard_em_and_parses_backprop() {
+    let default_args = layerstack_args(&["--bucket-mode", "router"]);
+    assert_eq!(default_args.router_mode, RouterModeArg::HardEm);
+    // `--top-k` / `--top-k-min` は既定でどちらも `1` (従来動作)。
+    assert_eq!(default_args.top_k, 1);
+    assert_eq!(default_args.top_k_min, 1);
+
+    let backprop_args = layerstack_args(&[
+        "--bucket-mode",
+        "router",
+        "--router-mode",
+        "backprop",
+        "--top-k",
+        "3",
+        "--top-k-reduction-interval",
+        "5",
+        "--top-k-min",
+        "2",
+    ]);
+    assert_eq!(backprop_args.router_mode, RouterModeArg::Backprop);
+    assert_eq!(backprop_args.top_k, 3);
+    assert_eq!(backprop_args.top_k_reduction_interval, 5);
+    assert_eq!(backprop_args.top_k_min, 2);
+
+    let hard_em_args =
+        layerstack_args(&["--bucket-mode", "router", "--router-mode", "hard-em"]);
+    assert_eq!(hard_em_args.router_mode, RouterModeArg::HardEm);
+}
+
+#[test]
+fn router_mode_converts_to_shogi_features_router_mode() {
+    assert_eq!(
+        shogi_features::router_kpabs::RouterMode::from(RouterModeArg::HardEm),
+        shogi_features::router_kpabs::RouterMode::HardEm,
+    );
+    assert_eq!(
+        shogi_features::router_kpabs::RouterMode::from(RouterModeArg::Backprop),
+        shogi_features::router_kpabs::RouterMode::Backprop,
+    );
+}
+
+#[test]
+fn validate_router_top_k_accepts_defaults_and_widened_range() {
+    assert!(validate_router_top_k(9, 1, 1).is_ok());
+    assert!(validate_router_top_k(9, 9, 1).is_ok());
+    assert!(validate_router_top_k(9, 4, 2).is_ok());
+    assert!(validate_router_top_k(9, 4, 4).is_ok());
+}
+
+#[test]
+fn validate_router_top_k_rejects_out_of_range_top_k() {
+    let err = validate_router_top_k(9, 0, 1).unwrap_err().to_string();
+    assert!(err.contains("--top-k must be in [1, --num-buckets]"));
+
+    let err = validate_router_top_k(9, 10, 1).unwrap_err().to_string();
+    assert!(err.contains("--top-k must be in [1, --num-buckets]"));
+}
+
+#[test]
+fn validate_router_top_k_rejects_top_k_min_out_of_range() {
+    let err = validate_router_top_k(9, 3, 0).unwrap_err().to_string();
+    assert!(err.contains("--top-k-min must be in [1, --top-k]"));
+
+    // top_k_min > top_k is rejected even though both are individually valid.
+    let err = validate_router_top_k(9, 3, 4).unwrap_err().to_string();
+    assert!(err.contains("--top-k-min must be in [1, --top-k]"));
+}
+
+
     let cli = Cli::try_parse_from(["nnue-train", "simple"]).expect("simple subcommand");
     assert_eq!(cli.arch.kind(), ArchKind::Simple);
 }
