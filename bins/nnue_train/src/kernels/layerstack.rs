@@ -7,7 +7,9 @@
 //! - perm を使う non-atomic scatter は caller が real row に対する単射性を保証する
 //! - cuda-oxide 制限: `f32::clamp` / `f32::max` / `f32::min` は if-else 展開
 
-use cuda_device::atomic::{AtomicOrdering, DeviceAtomicF32, DeviceAtomicU32, DeviceAtomicU64};
+use cuda_device::atomic::{
+    AtomicOrdering, DeviceAtomicF32, DeviceAtomicF64, DeviceAtomicU32, DeviceAtomicU64,
+};
 use cuda_device::{DisjointSlice, SharedArray, kernel, thread};
 
 /// Fused FT post-processing (forward) — bias add → CReLU → pairwise_mul → scale。
@@ -2704,4 +2706,202 @@ pub fn psqt_diff_sparse_bwd(
         };
         cell.fetch_add(-half_g, AtomicOrdering::Relaxed);
     }
+}
+
+// =============================================================================
+// `--bucket-mode router` GPU-resident 学習 (`bins/nnue_train::router_gpu`)
+// =============================================================================
+//
+// router (`shogi_features::router_kpabs::RouterKPAbsWeights`、bias 無しの
+// KP-absolute sparse 重み和 × N bucket) を GPU 上で学習するための 3 kernel。
+// host 側 orchestration は `bins/nnue_train/src/router_gpu.rs`:
+//
+// 1. `router_forward_f64` で GPU 上の router 重み (f64、index-major
+//    `w[idx*num_buckets+k]`、`RouterKPAbsWeights::w` と同レイアウト、
+//    `sparse_ft_forward`/`sparse_ft_backward` の column-major
+//    `weight[col*rows+row]` (`rows=num_buckets`) と数式上同一) から
+//    per-position の N-way logits を計算し host へ read back する
+// 2. host 側 (`RouterGpuState`) が `RouterKPAbsWeights::train_oracle_batch` /
+//    `train_backprop_batch` と **全く同じ式** で softmax + cross entropy /
+//    Top-K expected loss + 負荷分散補助損失の勾配 (`d_logits`、batch size で
+//    平均済) を計算する (num_buckets が小さい dense 計算のため host で十分)
+// 3. `router_backward_scatter_f64` で `d_logits` を `grad_weight` (host が
+//    呼出前に 0 初期化) へ atomic scatter-add する
+// 4. `router_adam_step_f64` で router 専用の plain Adam (RAdam ではない、
+//    `shogi_features::router_kpabs` 内部の `adam_step` と同じ式) を重み全体
+//    (`SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * num_buckets` 要素) に適用する
+//
+// `--router-refresh-interval` ごとの低頻度呼び出しであり、`GpuTrainer` の
+// per-step hot path (forward/backward/optimizer) とは独立した device buffer
+// を使う (`RouterGpuState` が保持、`GpuWorkspace` の固定 batch 容量規律には
+// 従わず、呼び出しごとに indices/logits/grad の一時 buffer を確保する—
+// forward/backward の間で `self.stream.synchronize()` するため in-flight race
+// は無い)。
+//
+// ## cuda-oxide 制限についての注記
+//
+// - `weight`/`m`/`v`/`grad` buffer は `RouterKPAbsWeights` の精度契約
+//   (`progress.bin` と同じ f64) に合わせて `f64` のまま (他 kernel の `f32`
+//   と異なる)。`DeviceAtomicF64::fetch_add` は `common.rs` の loss
+//   accumulator (`loss_acc`) で既に使われている前例に倣う
+// - scalar kernel 引数に `f64` を直接渡す前例が本 codebase に無いため
+//   (`radam_step` 系はすべて `f32` scalar)、`router_adam_step_f64` の
+//   hyperparameter (`lr`/`weight_decay`/`beta1`/`beta2`/`eps`/
+//   `bias_correction1`/`bias_correction2`) は `f32` で受け取り kernel 内で
+//   `f64` へ upcast する (buffer 自体は f64 のまま、host 側 CPU-only 経路
+//   (`shogi_features::router_kpabs` の private `adam_step`、完全 f64) との
+//   bit-exact は放棄し、近似同等に留める — `gpu_kernels::pointwise::
+//   router_adam_step::router_adam_step_cpu` が同じ scalar 丸めを再現する
+//   reference)
+
+/// [`super::super::sparse::router_forward::router_forward_cpu`] の GPU 版。
+///
+/// 1 thread = 1 (batch, bucket) cell。`weight` は index-major
+/// (`weight[idx * num_buckets + k]`)。`indices` は `-1` padding 付き固定幅
+/// (`max_active`、host 側が batch 内の実 active 数の最大値まで pad する)、
+/// `idx >= num_features` も defensive に silent skip
+/// (`sparse_ft_forward`/`sparse_ft_backward` と同じ契約)。非 atomic な
+/// out-of-place 出力 (`DisjointSlice::get_mut(ThreadIndex)` — `ft_post_perspective_fwd`
+/// と同じ 1 thread = 1 cell disjoint write)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn router_forward_f64(
+    weight: &[f64],
+    indices: &[i32],
+    mut out: DisjointSlice<f64>,
+    batch: u32,
+    num_buckets: u32,
+    num_features: u32,
+    max_active: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (num_buckets as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (num_buckets as usize);
+    let k = tid.get() % (num_buckets as usize);
+
+    let base_idx = bi * (max_active as usize);
+    let mut sum = 0.0_f64;
+    let mut ni: u32 = 0;
+    while ni < max_active {
+        let idx = indices[base_idx + (ni as usize)];
+        if idx >= 0 && (idx as u32) < num_features {
+            sum += weight[(idx as usize) * (num_buckets as usize) + k];
+        }
+        ni += 1;
+    }
+    if let Some(o) = out.get_mut(tid) {
+        *o = sum;
+    }
+}
+
+/// [`super::super::sparse::router_backward::router_backward_scatter_cpu`] の
+/// GPU 版 (atomic scatter)。`d_logits` (batch × num_buckets、host が
+/// `RouterKPAbsWeights::train_oracle_batch`/`train_backprop_batch` と同じ式で
+/// 計算し batch size で平均済) を `grad_weight` (index-major、host が呼出前に
+/// 0 初期化する accumulate semantics、`sparse_ft_backward` と同じ契約) へ
+/// scatter-add する。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn router_backward_scatter_f64(
+    d_logits: &[f64],
+    indices: &[i32],
+    grad_weight: &[f64],
+    batch: u32,
+    num_buckets: u32,
+    num_features: u32,
+    max_active: u32,
+) {
+    let tid = thread::index_1d();
+    let total = (batch as usize) * (num_buckets as usize);
+    if tid.get() >= total {
+        return;
+    }
+    let bi = tid.get() / (num_buckets as usize);
+    let k = tid.get() % (num_buckets as usize);
+
+    let g = d_logits[tid.get()];
+    let base_idx = bi * (max_active as usize);
+    let mut ni: u32 = 0;
+    while ni < max_active {
+        let idx = indices[base_idx + (ni as usize)];
+        if idx >= 0 && (idx as u32) < num_features {
+            // SAFETY: `grad_weight.len() == num_features * num_buckets` host invariant、
+            // `idx < num_features` / `k < num_buckets` で範囲内。`f64` (align 8) と
+            // `DeviceAtomicF64` (`#[repr(transparent)]` over UnsafeCell) は同 alignment。
+            // non-atomic 経路で同 memory に書く path は本 kernel/host loop に無し。
+            let cell = unsafe {
+                &*(grad_weight
+                    .as_ptr()
+                    .add((idx as usize) * (num_buckets as usize) + (k as usize))
+                    as *const DeviceAtomicF64)
+            };
+            cell.fetch_add(g, AtomicOrdering::Relaxed);
+        }
+        ni += 1;
+    }
+}
+
+/// router weight 専用の plain Adam optimizer step
+/// (`gpu_kernels::pointwise::router_adam_step::router_adam_step_cpu` が
+/// reference)。`radam_step` (RAdam、`f32`、weight decay を掛けてから update
+/// する AdamW、`min_w`/`max_w` clamp あり) とは異なる、
+/// `shogi_features::router_kpabs` 内部の (private) plain `adam_step` と同じ式
+/// (bias correction あり、weight decay は `grad += decay * w` として grad に
+/// 足すだけ、clamp 無し) を `f64` buffer に適用する。
+///
+/// `bias_correction1`/`bias_correction2` (= `1 - beta1^t` / `1 - beta2^t`) は
+/// host 側で step 番号 `t` から事前計算し値渡しする (`radam_step` の
+/// `step_size`/`denom` と同じ流儀)。1 thread = 1 element、3 buffer
+/// (`weights`/`m`/`v`) を `get_unchecked_mut` で同一 index 更新する
+/// (`radam_step_body!` マクロと同じ thread-disjoint 契約)。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn router_adam_step_f64(
+    mut weights: DisjointSlice<f64>,
+    mut m: DisjointSlice<f64>,
+    mut v: DisjointSlice<f64>,
+    grad: &[f64],
+    lr: f32,
+    weight_decay: f32,
+    beta1: f32,
+    beta2: f32,
+    eps: f32,
+    bias_correction1: f32,
+    bias_correction2: f32,
+    n: u32,
+) {
+    let tid = thread::index_1d();
+    if tid.get() >= n as usize {
+        return;
+    }
+    let i = tid.get();
+    if i >= grad.len() || i >= m.len() || i >= v.len() || i >= weights.len() {
+        return;
+    }
+    // SAFETY: bounds checked above; `weights`/`m`/`v` は互いに別 allocation、1D launch
+    // の各 thread は一意な `i` の cell だけを更新する (`router_forward_f64` /
+    // `router_backward_scatter_f64` と同じ thread-disjoint 契約、`radam_step_body!`
+    // マクロの `get_unchecked_mut` 分岐と同型)。
+    let (m_ref, v_ref, w_ref) =
+        unsafe { (m.get_unchecked_mut(i), v.get_unchecked_mut(i), weights.get_unchecked_mut(i)) };
+
+    let lr = lr as f64;
+    let weight_decay = weight_decay as f64;
+    let beta1 = beta1 as f64;
+    let beta2 = beta2 as f64;
+    let eps = eps as f64;
+    let bias_correction1 = bias_correction1 as f64;
+    let bias_correction2 = bias_correction2 as f64;
+
+    let g = grad[i] + weight_decay * *w_ref;
+    let mi = beta1 * *m_ref + (1.0 - beta1) * g;
+    let vi = beta2 * *v_ref + (1.0 - beta2) * g * g;
+    *m_ref = mi;
+    *v_ref = vi;
+    let m_hat = mi / bias_correction1;
+    let v_hat = vi / bias_correction2;
+    *w_ref -= lr * m_hat / (v_hat.sqrt() + eps);
 }

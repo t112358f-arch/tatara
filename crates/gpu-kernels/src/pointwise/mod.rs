@@ -13,11 +13,14 @@
 //! - `ranger_step` — RAdam + lookahead lerp
 //! - `norm_loss` — per-weight-group L2-norm regularisation
 //! - `loss_wrm` — win-rate-model loss
+//! - `router_adam_step` — `--bucket-mode router` の GPU-resident 学習用 plain
+//!   Adam (f64 buffer、`radam_step` とは異なる optimizer)
 
 pub mod loss_wdl;
 pub mod loss_wrm;
 pub mod norm_loss;
 pub mod radam_step;
 pub mod ranger_step;
+pub mod router_adam_step;
 pub mod screlu_fwd;
 pub mod screlu_grad;

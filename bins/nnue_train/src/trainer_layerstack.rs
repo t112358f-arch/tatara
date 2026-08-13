@@ -19,6 +19,15 @@ struct StepContext<'a> {
     wdl_lambda: f32,
     loss: LossKind,
     validate: bool,
+    /// `true` のとき `forward()` は入力 6 buffer の H2D 再アップロードと FT
+    /// forward (sparse_ft_forward × 2 + ft_post_perspective_fwd) を丸ごと
+    /// skip し、`self.ws.combined` (直前呼出しの FT-post 出力、bucket に依存
+    /// しない値) をそのまま再利用する。`bucket_idx` だけを新規 H2D する。
+    /// router bucket mode の E-step (`GpuTrainer::validate_reuse_ft`) が、同一
+    /// batch を bucket だけ変えて N 回 forward するときの重複 FT 計算 /
+    /// 重複 H2D を無くすために使う。通常の `step`/`validate` は常に `false`
+    /// (挙動は本 flag 追加前と完全に同一)。
+    skip_ft: bool,
     profile_step: bool,
     prof_t0: &'a mut std::time::Instant,
     b: usize,
@@ -43,6 +52,8 @@ pub(crate) struct StepOptions<'a> {
     wdl_lambda: f32,
     loss: LossKind,
     validate: bool,
+    /// [`StepContext::skip_ft`] 参照。
+    skip_ft: bool,
     profile_step: bool,
     prof_t0: &'a mut std::time::Instant,
 }
@@ -82,6 +93,7 @@ impl<'a> StepContext<'a> {
             wdl_lambda: options.wdl_lambda,
             loss: options.loss,
             validate: options.validate,
+            skip_ft: options.skip_ft,
             profile_step: options.profile_step,
             prof_t0: options.prof_t0,
             b,
@@ -265,6 +277,20 @@ pub(crate) struct GpuTrainer {
     bucket_mode: BucketMode,
     optimizer: OptimizerKind,
     step_count: u64,
+    /// `--bucket-mode router` の GPU-resident 学習 state
+    /// (`bins/nnue_train::router_gpu::RouterGpuState`)。`cuda-oxide` backend
+    /// のみ (router 用 GPU kernel は `native-cuda` の `.cu` 側に未実装)。
+    /// `bucket_mode != BucketMode::Router` では常に `None`。`Router` でも、
+    /// `TrainerBackend::router_train_oracle_batch`/`router_train_backprop_batch`
+    /// の初回呼び出しまでは `None` (`ctx`/`stream`/`module` を保持していない
+    /// `GpuTrainer::new` 時点では作らず、初回呼出時に process-global
+    /// `RouterKPAbs::snapshot()` + 渡された `RouterAdamState` から遅延構築する)。
+    #[cfg(feature = "cuda-oxide")]
+    router_gpu: Option<crate::router_gpu::RouterGpuState>,
+    /// `cuda-oxide` の default context (`GpuTrainer::new` の `ctx` 引数) を
+    /// [`Self::router_gpu`] の遅延初期化のために保持する。
+    #[cfg(feature = "cuda-oxide")]
+    ctx: std::sync::Arc<CudaContext>,
 }
 
 /// PSQT shortcut の weight + optimizer state を集約した sub-struct。
@@ -1014,6 +1040,10 @@ impl GpuTrainer {
             bucket_mode,
             optimizer,
             step_count: 0,
+            #[cfg(feature = "cuda-oxide")]
+            router_gpu: None,
+            #[cfg(feature = "cuda-oxide")]
+            ctx: ctx.clone(),
         };
         // forward 用 FT weight (mirror / comb) を初期重みと同期し、構築直後から
         // step / validate 可能にする (zero のままの buffer を初回 forward が読む
@@ -1656,6 +1686,7 @@ impl GpuTrainer {
                 wdl_lambda,
                 loss,
                 validate: false,
+                skip_ft: false,
                 profile_step,
                 prof_t0: &mut prof_t0,
             },
@@ -1729,10 +1760,80 @@ impl GpuTrainer {
                 wdl_lambda,
                 loss,
                 validate: true,
+                skip_ft: false,
                 profile_step,
                 prof_t0: &mut prof_t0,
             },
         )
+    }
+
+    /// [`GpuTrainer::validate`] の亜種。router bucket mode の E-step
+    /// (`crates/nnue-train::trainer::run` が `--num-buckets` 通り同じ batch を
+    /// 異なる固定 bucket で forward する sweep) 専用。
+    ///
+    /// FT forward (`sparse_ft_forward` × 2 + `ft_post_perspective_fwd`、疎な
+    /// 埋め込みテーブルを読む最も重い段) は **bucket に一切依存しない** —
+    /// LayerStack の bucket 選択が効き始めるのは post-FT の `combined` を読む
+    /// L1 (per-bucket dense) 以降のみ。そのため E-step で `validate()` を
+    /// `num_buckets` 回呼ぶと、本来 1 回で済む FT forward と、それに伴う
+    /// stm/nstm sparse indices の巨大な H2D 転送まで毎回丸ごと重複していた。
+    ///
+    /// 本メソッドは同じ `batch` (直前に **`validate()` を呼んで FT forward 済**
+    /// であること — `self.ws.combined` に前回呼出しの FT-post 出力が残っている
+    /// 前提) に対して `bucket_idx` だけを差し替えて forward の bucket-依存部分
+    /// (L1 以降) だけをやり直す。呼び出し順の契約:
+    ///
+    /// ```text
+    /// let out0 = trainer.validate(&batch_k0, wdl, loss)?;           // bucket=k0、FT forward あり
+    /// let out1 = trainer.validate_reuse_ft(&batch_k1, wdl, loss)?;  // bucket=k1、FT forward 再利用
+    /// let out2 = trainer.validate_reuse_ft(&batch_k2, wdl, loss)?;  // bucket=k2、FT forward 再利用
+    /// ```
+    ///
+    /// `batch` の `stm_indices`/`nstm_indices`/`nnz`/`score`/`wdl`/`n_pos`/
+    /// `per_pos_norm` は直前の `validate()` 呼出しと同一でなければならない
+    /// (`bucket_idx` だけが変わってよい) — 呼び出し側 (`crates/nnue-train::
+    /// trainer::run`) は同じ `BatchData` から `bucket_idx` だけ差し替えた copy
+    /// (`BatchData { bucket_idx: &k_buckets, ..batch }`、`BatchData: Copy`) を渡す。
+    ///
+    /// 直前 `validate()`/`step()` からの H2D/kernel 完了待ち同期は行わない
+    /// (直前呼出しと同じ `self.stream` 上に順序通り enqueue されるだけなので
+    /// host 側の hard sync は不要 — `validate()` 冒頭の `stream.synchronize()`
+    /// は「training step からの遷移」を守るためのものであり、E-step 内の
+    /// `validate()` → `validate_reuse_ft()` × N という同種呼出しの連鎖には
+    /// 不要)。
+    pub(crate) fn validate_reuse_ft(
+        &mut self,
+        batch: &BatchData,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        let profile_step = std::env::var_os("NNUE_TRAIN_STEP_PROFILE").is_some();
+        let mut prof_t0 = std::time::Instant::now();
+        self.step_impl(
+            batch,
+            StepOptions {
+                lr: 0.0,
+                wdl_lambda,
+                loss,
+                validate: true,
+                skip_ft: true,
+                profile_step,
+                prof_t0: &mut prof_t0,
+            },
+        )
+    }
+
+    /// `trainer_backend_impl!` マクロが呼ぶ inherent method。`GpuTrainer` は
+    /// 実際に [`Self::validate_reuse_ft`] (FT forward 再利用) へ委譲する
+    /// (`SimpleGpuTrainer` 側は bucket 非対応アーキなので通常の `validate` に
+    /// フォールバックする stub を持つ、`trainer_simple.rs` 参照)。
+    fn validate_reuse_ft_or_fallback(
+        &mut self,
+        batch: &BatchData,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        self.validate_reuse_ft(batch, wdl_lambda, loss)
     }
 
     /// `step` の実体。`loss` が [`LossKind::Sigmoid`] なら `loss_wdl` (plain sigmoid-MSE)、
@@ -1794,6 +1895,7 @@ impl GpuTrainer {
             wdl_lambda,
             loss,
             validate,
+            skip_ft,
             profile_step,
             b,
             b_u32,
@@ -1829,6 +1931,13 @@ impl GpuTrainer {
         // する。H2D は直前 step の compute と並走し、compute stream は H2D 完了 event を
         // 待ってから forward に進む ([`InputUploadRing`])。pageable な dataloader `Vec`
         // は ring 内の pinned host buffer 経由で copy engine の DMA に載る。
+        //
+        // `skip_ft` (router bucket mode の E-step 専用、[`StepContext::skip_ft`] 参照) が
+        // `true` のときは、この 6-buffer H2D と、それに続く FT forward (sparse_ft_forward
+        // × 2 + ft_post_perspective_fwd、`self.ws.combined` を書く) を丸ごと skip し、
+        // `self.ws.combined` を直前呼出しの値のまま (bucket 非依存なので変える必要が無い)
+        // 再利用する。`else` 節で `bucket_idx` だけを別途 H2D する。
+        if !skip_ft {
         std::mem::swap(&mut self.ws.stm_idx_dev, &mut self.ws.stm_idx_dev_back);
         std::mem::swap(&mut self.ws.nstm_idx_dev, &mut self.ws.nstm_idx_dev_back);
         std::mem::swap(&mut self.ws.nnz_dev, &mut self.ws.nnz_dev_back);
@@ -2036,6 +2145,27 @@ impl GpuTrainer {
                     ]
                 }
             }?;
+        }
+        } else {
+            // router bucket mode の E-step 専用経路 ([`StepContext::skip_ft`] 参照)。
+            // `self.ws.combined` (直前呼出しの FT-post 出力、bucket 非依存) はそのまま
+            // 再利用し、`bucket_idx` だけを新しい値で H2D し直す。`stm_idx_dev` 等の
+            // ping-pong 用 `_back` buffer は使わない (`InputUploadRing` の copy stream
+            // 経由の非同期並走が必要なのは train_step の連続実行と重なる場合のみ —
+            // ここでは同じ `self.stream` 上に enqueue するだけなので、直後の
+            // `stream.synchronize()` で完了を待てば `self.ws.bucket_idx_dev` を直接
+            // 上書きしても、直前の kernel がまだそれを読んでいる、という race は
+            // 起きない — 同一 stream 上の操作は発行順に実行される)。
+            //
+            // SAFETY: `batch.bucket_idx` は本関数のスコープ内で生存しており、直後の
+            // `stream.synchronize()` が転送完了を待ってから返るため、host 側の一時
+            // slice を安全に破棄できる。
+            unsafe {
+                gpu_runtime::memcpy_htod_async(&self.ws.bucket_idx_dev, batch.bucket_idx, &self.stream)?;
+            }
+            self.stream.synchronize()?;
+            memset_zero(&self.stream, &self.loss_acc)?;
+            memset_zero(&self.stream, &self.weight_sum_acc)?;
         }
 
         prof_tick!("fwd_ftpost");
@@ -4078,6 +4208,138 @@ impl GpuTrainer {
 // ===========================================================================
 // TrainerBackend impl — `nnue-train::trainer::run` から 1 batch ずつ呼ばれる
 // ===========================================================================
+
+// ===========================================================================
+// `--bucket-mode router` GPU-resident 学習 hook (`trainer_backend_impl!` が
+// 呼ぶ inherent method)。`cuda-oxide` backend のみ実装を持ち (router 用 GPU
+// kernel は `bins/nnue_train::kernels` (`cuda-oxide` feature 限定) にしか
+// 無いため)、`native-cuda`/`native-cuda-host` backend は trait 既定と同じ
+// no-op stub (`None`/`Ok(())`) を返す — router 学習は CPU
+// (`shogi_features::router_kpabs::RouterKPAbs::train_oracle_batch` /
+// `train_backprop_batch`) にそのまま fall back する。
+// ===========================================================================
+
+#[cfg(feature = "cuda-oxide")]
+impl GpuTrainer {
+    /// [`Self::router_gpu`] が未初期化なら、process-global router 重み
+    /// (`RouterKPAbs::snapshot()`) と渡された `adam` (resume 済なら resume
+    /// 状態を引き継ぐ) から `RouterGpuState` を新規構築する。以後の呼び出し
+    /// では何もしない (2 回目以降は device 側の状態をそのまま使い続ける)。
+    fn ensure_router_gpu(
+        &mut self,
+        adam: &shogi_features::router_kpabs::RouterAdamState,
+    ) -> gpu_runtime::Result<&mut crate::router_gpu::RouterGpuState> {
+        if self.router_gpu.is_none() {
+            let weights = shogi_features::router_kpabs::RouterKPAbs::snapshot();
+            let state = crate::router_gpu::RouterGpuState::new(
+                &self.ctx,
+                std::sync::Arc::clone(&self.stream),
+                std::sync::Arc::clone(&self.module),
+                &weights,
+                adam,
+            )?;
+            self.router_gpu = Some(state);
+        }
+        Ok(self.router_gpu.as_mut().expect("router_gpu just initialized"))
+    }
+
+    fn router_train_oracle_batch_gpu(
+        &mut self,
+        indices_batch: &[Vec<u32>],
+        oracle_targets: &[Vec<f64>],
+        adam: &shogi_features::router_kpabs::RouterAdamState,
+        lr: f64,
+        weight_decay: f64,
+        balance_weight: f64,
+    ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
+    {
+        let state = self.ensure_router_gpu(adam)?;
+        let stats =
+            state.train_oracle_batch(indices_batch, oracle_targets, lr, weight_decay, balance_weight)?;
+        Ok(Some(stats))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn router_train_backprop_batch_gpu(
+        &mut self,
+        indices_batch: &[Vec<u32>],
+        errs_batch: &[Vec<f64>],
+        adam: &shogi_features::router_kpabs::RouterAdamState,
+        lr: f64,
+        weight_decay: f64,
+        balance_weight: f64,
+        top_k: usize,
+    ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
+    {
+        let state = self.ensure_router_gpu(adam)?;
+        let stats = state.train_backprop_batch(
+            indices_batch,
+            errs_batch,
+            lr,
+            weight_decay,
+            balance_weight,
+            top_k,
+        )?;
+        Ok(Some(stats))
+    }
+
+    /// GPU 上の router 重み / Adam moment / step 数を process-global
+    /// `RouterKPAbs` と、呼び出し側が保持する `adam` (checkpoint 保存に使う)
+    /// へ書き戻す。[`Self::router_gpu`] が未初期化 (このバッチまで一度も GPU
+    /// router 学習が起きていない) なら no-op。
+    fn router_sync_to_host_gpu(
+        &mut self,
+        adam: &mut shogi_features::router_kpabs::RouterAdamState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(state) = self.router_gpu.as_ref() else {
+            return Ok(());
+        };
+        let (w, m, v, t) = state.sync_to_host()?;
+        shogi_features::router_kpabs::RouterKPAbs::overwrite_weights(w);
+        adam.m_w_mut().copy_from_slice(&m);
+        adam.v_w_mut().copy_from_slice(&v);
+        adam.set_t(t);
+        Ok(())
+    }
+}
+
+#[cfg(not(feature = "cuda-oxide"))]
+impl GpuTrainer {
+    fn router_train_oracle_batch_gpu(
+        &mut self,
+        _indices_batch: &[Vec<u32>],
+        _oracle_targets: &[Vec<f64>],
+        _adam: &shogi_features::router_kpabs::RouterAdamState,
+        _lr: f64,
+        _weight_decay: f64,
+        _balance_weight: f64,
+    ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
+    {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn router_train_backprop_batch_gpu(
+        &mut self,
+        _indices_batch: &[Vec<u32>],
+        _errs_batch: &[Vec<f64>],
+        _adam: &shogi_features::router_kpabs::RouterAdamState,
+        _lr: f64,
+        _weight_decay: f64,
+        _balance_weight: f64,
+        _top_k: usize,
+    ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
+    {
+        Ok(None)
+    }
+
+    fn router_sync_to_host_gpu(
+        &mut self,
+        _adam: &mut shogi_features::router_kpabs::RouterAdamState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+}
 
 trainer_backend_impl! {
     trainer: GpuTrainer,

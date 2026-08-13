@@ -155,6 +155,11 @@ pub(crate) struct StepOutput {
 /// Smoke / trainer 用の 1 batch 入力データ。
 /// owned 版 (smoke path) と borrowed 版 (train_step path) を統一するため scalar の
 /// `per_pos_norm` を持ち (= 1/n_pos)、ref 化された slice を直接 H2D 投入する。
+/// 全 field が `&'a [T]` / `usize` / `f32` (すべて `Copy`) なので `Clone, Copy` を
+/// derive できる — router E-step の FT-reuse sweep (`GpuTrainer::validate_reuse_ft`)
+/// が `BatchData { bucket_idx: &k_buckets, ..batch }` の構造体更新記法で
+/// `bucket_idx` だけ差し替えた copy を作るのに使う。
+#[derive(Clone, Copy)]
 pub(crate) struct BatchData<'a> {
     pub(crate) n_pos: usize,
     pub(crate) stm_indices: &'a [i32], // (n_pos × max_active)、-1 padding 可
@@ -362,6 +367,34 @@ macro_rules! trainer_backend_impl {
                 })
             }
 
+            fn validate_step_reuse_ft(
+                &mut self,
+                batch: &nnue_train::dataloader::Batch,
+                bucket_idx: &[i32],
+                wdl_lambda: f32,
+                loss: nnue_train::trainer::LossKind,
+            ) -> std::io::Result<nnue_train::trainer::ValidationStepOutput> {
+                if batch.feature_set != self.$($feature_set).+ {
+                    return Err(std::io::Error::other(format!(
+                        "batch feature set '{}' does not match trainer feature set '{}'",
+                        batch.feature_set.canonical_name(),
+                        self.$($feature_set).+.canonical_name(),
+                    )));
+                }
+                let data = $crate::trainer_common::trainer_backend_impl!(
+                    @batch $batch_kind,
+                    batch,
+                    bucket_idx
+                );
+                let out = self
+                    .validate_reuse_ft_or_fallback(&data, wdl_lambda, loss)
+                    .map_err(|e| std::io::Error::other(format!($validate_error, e)))?;
+                Ok(nnue_train::trainer::ValidationStepOutput {
+                    sum_sq_err: out.loss,
+                    net_output: out.net_output,
+                })
+            }
+
             fn flush_pending_loss(&mut self) -> std::io::Result<f64> {
                 self.loss_ring
                     .flush_pending_loss()
@@ -413,6 +446,61 @@ macro_rules! trainer_backend_impl {
                         std::io::Error::other(format!("clamp counter D2H failed: {e}"))
                     })?;
                 Ok((host[0], self.fp16_clamp_elems_written))
+            }
+
+            // `--bucket-mode router` の GPU-resident 学習 hook。各 `$trainer` は
+            // 同名 inherent method を持つ必要がある — `GpuTrainer` (layerstack)
+            // は実際に `bins/nnue_train::router_gpu::RouterGpuState` へ委譲し、
+            // `SimpleGpuTrainer` (router 非対応アーキ) はトレイト既定と同じ
+            // no-op stub を持つ (`trainer_simple.rs` 参照)。
+            fn router_train_oracle_batch(
+                &mut self,
+                indices_batch: &[Vec<u32>],
+                oracle_targets: &[Vec<f64>],
+                adam: &shogi_features::router_kpabs::RouterAdamState,
+                lr: f64,
+                weight_decay: f64,
+                balance_weight: f64,
+            ) -> std::io::Result<Option<shogi_features::router_kpabs::RouterTrainStats>> {
+                self.router_train_oracle_batch_gpu(
+                    indices_batch,
+                    oracle_targets,
+                    adam,
+                    lr,
+                    weight_decay,
+                    balance_weight,
+                )
+                .map_err(|e| std::io::Error::other(format!("router GPU train_oracle_batch failed: {e}")))
+            }
+
+            fn router_train_backprop_batch(
+                &mut self,
+                indices_batch: &[Vec<u32>],
+                errs_batch: &[Vec<f64>],
+                adam: &shogi_features::router_kpabs::RouterAdamState,
+                lr: f64,
+                weight_decay: f64,
+                balance_weight: f64,
+                top_k: usize,
+            ) -> std::io::Result<Option<shogi_features::router_kpabs::RouterTrainStats>> {
+                self.router_train_backprop_batch_gpu(
+                    indices_batch,
+                    errs_batch,
+                    adam,
+                    lr,
+                    weight_decay,
+                    balance_weight,
+                    top_k,
+                )
+                .map_err(|e| std::io::Error::other(format!("router GPU train_backprop_batch failed: {e}")))
+            }
+
+            fn router_sync_to_host(
+                &mut self,
+                adam: &mut shogi_features::router_kpabs::RouterAdamState,
+            ) -> std::io::Result<()> {
+                self.router_sync_to_host_gpu(adam)
+                    .map_err(|e| std::io::Error::other(format!("router GPU sync_to_host failed: {e}")))
             }
         }
     };

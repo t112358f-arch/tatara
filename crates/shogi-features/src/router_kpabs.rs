@@ -19,13 +19,29 @@
 //! 重み和を progress8kpabs と全く同じ計算方法 (Q16.16/Q8.8/Q4.4 固定小数点の
 //! 重み和) で N 回 (バケットごとに 1 回ずつ) 行い、argmax でバケットを選ぶ。
 //!
-//! ## 学習方式 (hard-EM / soft-EM / Top-K Hard Routing)
+//! ## E step は GPU、M step は CPU が既定 (GPU-resident 学習も選択可)
 //!
 //! GPU 側の LayerStack 学習ループ (`bins/nnue_train::trainer_layerstack`) は
 //! per-position の `bucket_idx` を学習開始前に host 側で確定させる設計になって
-//! おり、CUDA kernel 内で router の勾配を直接引き戻す経路を持たない。そのため
-//! 本 router は次の EM 系の手法 (Jacobs & Jordan 1991 の Adaptive Mixtures of
-//! Local Experts と同じ発想) で学習する:
+//! おり、評価関数本体の CUDA kernel は router の勾配を直接引き戻す経路を持たない
+//! (E step の N 通り forward 自体は `GpuTrainer::validate` を bucket = 0..N で
+//! N 回呼ぶだけで GPU 上で完結する)。そのため本 module (M step、router 自身の
+//! 重み更新) は元々 CPU 実装のみを持つ。
+//!
+//! `nnue-trainer` が GPU 有効でビルドされた場合、`bins/nnue_train::router_gpu::
+//! RouterGpuState` が本 module の [`RouterKPAbsWeights::train_oracle_batch`] /
+//! [`RouterKPAbsWeights::train_backprop_batch`] と **数式上同一**の forward /
+//! softmax cross entropy (or Top-K 期待損失) + 負荷分散勾配 / backward /
+//! Adam を GPU 上で行う (forward の sparse 重み和・backward の atomic scatter・
+//! Adam の全重み更新のみを GPU kernel 化し、num_buckets 次元の dense な
+//! softmax/loss/勾配計算自体は host で行う——本 module の CPU 実装は
+//! GPU 未使用時のフォールバックとして常に有効)。詳細は
+//! `bins/nnue_train/src/router_gpu.rs` の module doc を参照。
+//!
+//! ## 学習方式 (hard-EM / soft-EM / Top-K Hard Routing)
+//!
+//! 上記の E step / M step 分割は次の EM 系の手法 (Jacobs & Jordan 1991 の
+//! Adaptive Mixtures of Local Experts と同じ発想) で行う:
 //!
 //! 1. (E step) 同じ batch を N 通りの固定 bucket 割当それぞれで forward し
 //!    (`GpuTrainer::validate` を bucket = 0..N で N 回呼ぶだけで、新規 kernel
@@ -172,6 +188,39 @@ impl RouterAdamState {
 
     pub fn num_buckets(&self) -> usize {
         self.num_buckets
+    }
+
+    /// Adam の 1st moment (`m`)。GPU-resident router 学習
+    /// (`bins/nnue_train::router_gpu`) が H2D/D2H で同期するための accessor。
+    pub fn m_w(&self) -> &[f64] {
+        &self.m_w
+    }
+
+    /// [`Self::m_w`] の mutable 版 (D2H 後の書き戻し用)。
+    pub fn m_w_mut(&mut self) -> &mut [f64] {
+        &mut self.m_w
+    }
+
+    /// Adam の 2nd moment (`v`)。[`Self::m_w`] と同じ用途。
+    pub fn v_w(&self) -> &[f64] {
+        &self.v_w
+    }
+
+    /// [`Self::v_w`] の mutable 版。
+    pub fn v_w_mut(&mut self) -> &mut [f64] {
+        &mut self.v_w
+    }
+
+    /// 現在の Adam step 数。GPU-resident 学習は device 側で `t` を持ち回すため、
+    /// checkpoint 保存前に [`Self::set_t`] で host 側 (`save_full` が読む) へ
+    /// 書き戻す。
+    pub fn t(&self) -> u64 {
+        self.t
+    }
+
+    /// [`Self::t`] の setter (GPU→host 同期専用)。
+    pub fn set_t(&mut self, t: u64) {
+        self.t = t;
     }
 }
 
@@ -700,6 +749,29 @@ impl RouterKPAbs {
             .expect("RouterKPAbs used before init_random / init_with_weights / load_from_bin")
     }
 
+    /// GPU-resident router 学習 (`bins/nnue_train::router_gpu`、`--gpu` build の
+    /// `TrainerBackend::router_train_oracle_batch` / `router_train_backprop_batch`
+    /// が forward/backward/Adam を device 側で行った後) の更新後の重みを
+    /// process-global state へ書き戻す。dataloader worker の `bucket_board` /
+    /// `bucket_from_indices` (CPU forward、position ごとの bucket 割当) と
+    /// checkpoint 保存 (`save_to_bin` / `save_full` / `snapshot`) は常にこの
+    /// global を読むため、GPU backend は `--router-refresh-interval` ごとに
+    /// (最低でも checkpoint 保存前には必ず) 本メソッドで同期する責務を持つ。
+    ///
+    /// `new_w.len()` が現在の重み長 (`num_buckets * SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS`)
+    /// と一致しないと panic する (呼び出し側の buffer shape 管理バグ)。
+    pub fn overwrite_weights(new_w: Vec<f64>) {
+        let mut w = Self::state().write().unwrap();
+        assert_eq!(
+            new_w.len(),
+            w.w.len(),
+            "router GPU sync-back length mismatch: expected {}, got {}",
+            w.w.len(),
+            new_w.len(),
+        );
+        w.w = new_w;
+    }
+
     /// 現在の重みを `.bin` に保存する。
     pub fn save_to_bin(path: &Path) -> io::Result<()> {
         let mut file = std::fs::File::create(path)?;
@@ -835,8 +907,10 @@ impl RouterKPAbs {
 /// を想定)。
 /// 誤差昇順 (良い順) に bucket index を並べ、上位 `top_k` 個だけを返す
 /// (`oracle_targets_from_errors` と `RouterKPAbsWeights::train_backprop_batch`
-/// の Top-K 選択で共有するヘルパー)。
-fn top_k_error_ranked_indices(errs: &[f64], top_k: usize) -> Vec<usize> {
+/// の Top-K 選択で共有するヘルパー)。GPU-resident 学習
+/// (`bins/nnue_train::router_gpu::RouterGpuState::train_backprop_batch`) が
+/// host 側で `train_backprop_batch` と同じ Top-K 選択を再現するために `pub`。
+pub fn top_k_error_ranked_indices(errs: &[f64], top_k: usize) -> Vec<usize> {
     let num_buckets = errs.len();
     assert!(top_k >= 1 && top_k <= num_buckets, "top_k must be in [1, num_buckets]");
     let mut order: Vec<usize> = (0..num_buckets).collect();

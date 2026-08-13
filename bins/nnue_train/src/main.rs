@@ -37,6 +37,8 @@ mod kernel_module;
 mod kernels;
 #[cfg(any(feature = "native-cuda", feature = "native-cuda-host"))]
 mod native_bench;
+#[cfg(feature = "cuda-oxide")]
+mod router_gpu;
 #[cfg(feature = "gpu")]
 mod smoke;
 #[cfg(feature = "gpu")]

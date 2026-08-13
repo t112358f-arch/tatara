@@ -316,6 +316,32 @@ pub trait TrainerBackend {
         loss: LossKind,
     ) -> io::Result<ValidationStepOutput>;
 
+    /// [`Self::validate_step`] の亜種。router bucket mode の E-step
+    /// (`--num-buckets` 通り同じ `batch` を bucket だけ変えて forward する
+    /// sweep) で、**直前の呼び出しが同じ `batch` に対する [`Self::validate_step`]
+    /// (または本メソッド) だった場合にのみ**使ってよい。
+    ///
+    /// FT forward (sparse な特徴量埋め込みの読み出し、bucket sweep の中で
+    /// 最も計算・転送コストが大きい段) は元々 bucket に依存しない値なので、
+    /// 対応する backend はこれを再計算せず前回の結果を使い回せる (`GpuTrainer`
+    /// が [`crate::trainer::TrainerBackend`] を実装する具体的な GPU backend
+    /// でこの最適化を行う)。デフォルト実装は [`Self::validate_step`] へそのまま
+    /// 委譲するので、対応しない backend でも常に正しい結果が返る (性能上の
+    /// 最適化が効かないだけ)。
+    ///
+    /// 呼び出し側 ([`run`] の router E-step) の契約:
+    /// `batch`/`wdl_lambda`/`loss` は直前の [`Self::validate_step`] 呼出しと
+    /// 同一でなければならない (`bucket_idx` だけが変わってよい)。
+    fn validate_step_reuse_ft(
+        &mut self,
+        batch: &Batch,
+        bucket_idx: &[i32],
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> io::Result<ValidationStepOutput> {
+        self.validate_step(batch, bucket_idx, wdl_lambda, loss)
+    }
+
     /// 現在の weight を量子化 NNUE binary として `path` に書き出す (推論用
     /// artifact、`nnue-format` の `save_quantised` 相当を backend 内で実行する)。
     fn save_checkpoint(
@@ -364,6 +390,61 @@ pub trait TrainerBackend {
     /// `[fp16-clamp]` log line にする。
     fn read_fp16_clamp_count(&mut self) -> io::Result<(u64, u64)> {
         Ok((0, 0))
+    }
+
+    /// `--bucket-mode router` の GPU-resident 学習 (M step、`--router-mode
+    /// hard-EM`)。対応 backend ([`--gpu` build かつ `cuda-oxide` backend])
+    /// は router の forward/backward/Adam を GPU 上で行い `Some(stats)` を
+    /// 返す。CPU-only backend や GPU-resident router state 未初期化の
+    /// backend は既定で `None` を返し、caller ([`run`]) はそれを見て
+    /// `shogi_features::router_kpabs::RouterKPAbs::train_oracle_batch`
+    /// (CPU) に fall back する。
+    ///
+    /// `adam` は初回呼出時の GPU-resident state 初期化にのみ読む
+    /// (resume 済の Adam moment を引き継ぐため)。以後は device 側で
+    /// 状態を持ち回すので毎呼出では変更されない —
+    /// [`Self::router_sync_to_host`] を呼んだときだけ最新値に更新される。
+    /// 引数のそれ以外の意味は `RouterKPAbs::train_oracle_batch` と同じ。
+    fn router_train_oracle_batch(
+        &mut self,
+        _indices_batch: &[Vec<u32>],
+        _oracle_targets: &[Vec<f64>],
+        _adam: &RouterAdamState,
+        _lr: f64,
+        _weight_decay: f64,
+        _balance_weight: f64,
+    ) -> io::Result<Option<shogi_features::router_kpabs::RouterTrainStats>> {
+        Ok(None)
+    }
+
+    /// [`Self::router_train_oracle_batch`] の `--router-mode backprop` 版
+    /// (`RouterKPAbs::train_backprop_batch` の GPU-resident 版)。
+    fn router_train_backprop_batch(
+        &mut self,
+        _indices_batch: &[Vec<u32>],
+        _errs_batch: &[Vec<f64>],
+        _adam: &RouterAdamState,
+        _lr: f64,
+        _weight_decay: f64,
+        _balance_weight: f64,
+        _top_k: usize,
+    ) -> io::Result<Option<shogi_features::router_kpabs::RouterTrainStats>> {
+        Ok(None)
+    }
+
+    /// GPU-resident router state (重み / Adam moment / step 数) を
+    /// process-global `RouterKPAbs` (dataloader の bucket 割当が読む) と、
+    /// 呼び出し側が保持する `adam` (checkpoint 保存に使う) へ同期する。
+    /// [`Self::router_train_oracle_batch`] / [`Self::router_train_backprop_batch`]
+    /// が一度でも `Some` を返した backend は、caller が checkpoint 保存直前に
+    /// 必ず呼ぶ (`run()` が sb 末で自動的に行う)。既定は no-op (CPU-only
+    /// backend、`RouterKPAbs::train_oracle_batch`/`train_backprop_batch` が
+    /// process-global と `adam` を直接更新するので同期不要)。
+    fn router_sync_to_host(
+        &mut self,
+        _adam: &mut shogi_features::router_kpabs::RouterAdamState,
+    ) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -962,7 +1043,13 @@ where
             // - `RouterMode::Backprop`: 教師分布を経由せず、router 自身の
             //   softmax 分布の下での期待損失を router の重みについて直接
             //   backprop する (`RouterKPAbs::train_backprop_batch`)。
-            // いずれも CPU 側の計算のみで GPU kernel の変更は不要。
+            // `--gpu` build (`cuda-oxide` backend) は `TrainerBackend::
+            // router_train_oracle_batch`/`router_train_backprop_batch`
+            // (GPU-resident、`bins/nnue_train::router_gpu::RouterGpuState`)
+            // が forward/backward/Adam を GPU 上で行い `Some` を返す。それ以外
+            // (CPU-only backend、または GPU state 未初期化) は `None` を返すので
+            // 従来通り CPU (`RouterKPAbs::train_oracle_batch`/`train_backprop_batch`)
+            // に fall back する。
             if let (Some(rc), Some(adam)) = (cfg.router, router_adam.as_mut())
                 && batch_idx % rc.refresh_interval.max(1) == 0
             {
@@ -971,10 +1058,23 @@ where
                 // `errs[k][i]` = bucket k に固定して forward したときの position
                 // i の誤差。Top-K/soft-EM ターゲットを作るには N 個すべての
                 // bucket の誤差が要る (hard-EM の argmin だけでは足りない)。
+                //
+                // FT forward (疎な特徴量埋め込みの読み出し、この sweep の中で
+                // 最も計算・転送コストが大きい段) は bucket に依存しない値。
+                // k=0 では通常の `validate_step` (FT forward あり) を呼び、
+                // k=1..N は `validate_step_reuse_ft` (対応 backend では FT
+                // forward を再計算せず前回の結果を使い回す) を呼ぶことで、
+                // N 回の bucket sweep で FT forward を 1 回だけに減らす
+                // (対応しない backend ではデフォルト実装が `validate_step` に
+                // そのまま委譲するので、数値結果は常に同一)。
                 let mut errs: Vec<Vec<f64>> = Vec::with_capacity(cfg.num_buckets);
                 for k in 0..cfg.num_buckets {
                     let k_buckets = vec![k as i32; n_pos];
-                    let out = backend.validate_step(&batch, &k_buckets, wdl, cfg.loss)?;
+                    let out = if k == 0 {
+                        backend.validate_step(&batch, &k_buckets, wdl, cfg.loss)?
+                    } else {
+                        backend.validate_step_reuse_ft(&batch, &k_buckets, wdl, cfg.loss)?
+                    };
                     let mut err_k = Vec::with_capacity(n_pos);
                     for i in 0..n_pos {
                         let pred = sigmoid(out.net_output[i] * pred_scale);
@@ -998,16 +1098,26 @@ where
                                 )
                             })
                             .collect();
-                        RouterKPAbs::train_oracle_batch(
+                        match backend.router_train_oracle_batch(
                             &router_indices[..n_pos],
                             &oracle_targets,
                             adam,
                             current_router_lr,
                             rc.weight_decay,
                             current_router_balance_weight,
-                        )
+                        )? {
+                            Some(stats) => stats,
+                            None => RouterKPAbs::train_oracle_batch(
+                                &router_indices[..n_pos],
+                                &oracle_targets,
+                                adam,
+                                current_router_lr,
+                                rc.weight_decay,
+                                current_router_balance_weight,
+                            ),
+                        }
                     }
-                    RouterMode::Backprop => RouterKPAbs::train_backprop_batch(
+                    RouterMode::Backprop => match backend.router_train_backprop_batch(
                         &router_indices[..n_pos],
                         &errs_by_position,
                         adam,
@@ -1015,7 +1125,18 @@ where
                         rc.weight_decay,
                         current_router_balance_weight,
                         current_top_k,
-                    ),
+                    )? {
+                        Some(stats) => stats,
+                        None => RouterKPAbs::train_backprop_batch(
+                            &router_indices[..n_pos],
+                            &errs_by_position,
+                            adam,
+                            current_router_lr,
+                            rc.weight_decay,
+                            current_router_balance_weight,
+                            current_top_k,
+                        ),
+                    },
                 };
                 last_router_stats = Some(stats);
             }
@@ -1215,8 +1336,13 @@ where
 
             // router: 重み + Adam optimizer state を sidecar file に保存する
             // (main net の raw checkpoint とは別ファイル、`--router-resume` で
-            // 読み戻せる)。
-            if let Some(adam) = router_adam.as_ref() {
+            // 読み戻せる)。GPU-resident 学習 (`router_train_oracle_batch`/
+            // `router_train_backprop_batch` が `Some` を返す backend) は device
+            // 上の重み/Adam moment が最新なので、保存前に必ず `router_sync_to_host`
+            // で process-global (`RouterKPAbs`) と `adam` へ書き戻す (CPU-only
+            // backend では no-op)。
+            if let Some(adam) = router_adam.as_mut() {
+                backend.router_sync_to_host(adam)?;
                 let router_path = cfg
                     .output_dir
                     .join(format!("{}-{}.router.ckpt", cfg.net_id, sb));

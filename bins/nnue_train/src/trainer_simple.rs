@@ -387,6 +387,60 @@ impl Drop for SimpleGpuTrainer {
 }
 
 impl SimpleGpuTrainer {
+    /// `--bucket-mode router` は LayerStack アーキ (`GpuTrainer`) 専用
+    /// (`crates/nnue-train::dataloader::BucketMode::Router` は `--arch simple`
+    /// では CLI 側で拒否される)。そのため `SimpleGpuTrainer` は
+    /// `trainer_backend_impl!` マクロが要求する router GPU hook 3 種を
+    /// トレイト既定 (`None`/no-op) と同じ stub で満たすだけでよい。
+    fn router_train_oracle_batch_gpu(
+        &mut self,
+        _indices_batch: &[Vec<u32>],
+        _oracle_targets: &[Vec<f64>],
+        _adam: &shogi_features::router_kpabs::RouterAdamState,
+        _lr: f64,
+        _weight_decay: f64,
+        _balance_weight: f64,
+    ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
+    {
+        Ok(None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn router_train_backprop_batch_gpu(
+        &mut self,
+        _indices_batch: &[Vec<u32>],
+        _errs_batch: &[Vec<f64>],
+        _adam: &shogi_features::router_kpabs::RouterAdamState,
+        _lr: f64,
+        _weight_decay: f64,
+        _balance_weight: f64,
+        _top_k: usize,
+    ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
+    {
+        Ok(None)
+    }
+
+    fn router_sync_to_host_gpu(
+        &mut self,
+        _adam: &mut shogi_features::router_kpabs::RouterAdamState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        Ok(())
+    }
+
+    /// `trainer_backend_impl!` マクロが呼ぶ inherent method。`--bucket-mode
+    /// router` は LayerStack アーキ専用 (`GpuTrainer::validate_reuse_ft` 参照)
+    /// なので、bucket 非対応の `SimpleGpuTrainer` は常に通常の `validate` へ
+    /// フォールバックする (FT forward 再利用の最適化を持たない = 常に完全な
+    /// forward をやり直す、が router 経路からは呼ばれないので実害無し)。
+    fn validate_reuse_ft_or_fallback(
+        &mut self,
+        batch: &BatchData,
+        wdl_lambda: f32,
+        loss: LossKind,
+    ) -> Result<StepOutput, Box<dyn std::error::Error>> {
+        self.validate(batch, wdl_lambda, loss)
+    }
+
     /// 数値精度と optimizer state の形式は [`PrecisionFlags`] で指定する。
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
