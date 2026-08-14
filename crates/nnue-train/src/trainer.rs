@@ -27,6 +27,11 @@
 //! index 駆動 (`StepLR` は `(sb-1)/step` を使う) なので `start_superbatch` を
 //! 渡せば lr が自動で正しい値に戻る。weight + optimizer state の復元自体は
 //! backend 側で別途行う必要がある (`bins/nnue_train --resume` 経路)。
+//! `bucket_mode = router` の `--router-lr` / `--router-balance-weight` /
+//! `--top-k` は反対に **iterative** な (状態を持ち越す) decay/anneal な
+//! ため、この対称性を保つには [`router_state_at_start`] で
+//! `start_superbatch - 1` 回分を fast-forward してから初期値にする必要が
+//! ある (`run()` が内部で行う)。
 //!
 //! ## per-position output bucket
 //!
@@ -549,6 +554,35 @@ pub struct RouterTrainingConfig {
     pub top_k_min: usize,
 }
 
+/// `rc` (CLI で指定された router の base 値) から、`start_superbatch` の直前
+/// までに **既に完了しているはずの** `start_superbatch - 1` superbatch 分の
+/// decay/anneal を fast-forward した実効値 `(lr, balance_weight, top_k)` を返す。
+///
+/// `run()` 内の per-superbatch decay ループ (`current_router_lr *= rc.lr_gamma`
+/// 等) と同じ更新式を `start_superbatch - 1` 回繰り返して求める (継続 run と
+/// resume run とで同じ superbatch 番号なら同じ値になるようにするため)。
+/// `start_superbatch <= 1` (resume なし、または `--start-superbatch 1`) の
+/// ときは fast-forward 0 回、つまり `rc` の base 値をそのまま返す (従来動作)。
+fn router_state_at_start(rc: &RouterTrainingConfig, start_superbatch: usize) -> (f64, f64, usize) {
+    let elapsed = start_superbatch.saturating_sub(1);
+
+    let lr = rc.lr * rc.lr_gamma.powi(elapsed as i32);
+
+    let mut balance_weight = rc.balance_weight;
+    for _ in 0..elapsed {
+        balance_weight = (balance_weight * rc.balance_weight_gamma).max(rc.balance_weight_min);
+    }
+
+    let top_k = if rc.top_k_reduction_interval > 0 {
+        let reductions = elapsed / rc.top_k_reduction_interval;
+        rc.top_k.saturating_sub(reductions).max(rc.top_k_min)
+    } else {
+        rc.top_k
+    };
+
+    (lr, balance_weight, top_k)
+}
+
 /// LayerStack (bucket-aware) / Simple (bucket-less) どちらの backend で学習する
 /// にも要る subset。bucket 数 N は [`TrainingConfig::num_buckets`] で持つ (既定 9、
 /// LayerStack `--num-buckets` 由来)。learning rate / WDL schedule は別に
@@ -975,17 +1009,22 @@ where
     } else {
         None
     };
-    // `RouterTrainingConfig::lr` / `balance_weight` の実効値。1 superbatch 終える
-    // 度に `*_gamma` を掛けて減衰させる (`--router-lr-gamma` /
-    // `--router-balance-weight-gamma`)。`balance_weight` は
-    // `--router-balance-weight-min` を下回らないよう毎回 clamp する。
+    // `RouterTrainingConfig::lr` / `balance_weight` / `top_k` の実効値。1
+    // superbatch 終える度に減衰・anneal させる (`--router-lr-gamma` /
+    // `--router-balance-weight-gamma` / `--top-k-reduction-interval`)。
+    // `--resume` / `--router-resume` で `cfg.start_superbatch` が 1 より
+    // 大きい (= 既に `cfg.start_superbatch - 1` superbatch 分の decay が
+    // 過去の run で進んでいるはず) 場合、CLI の base 値 (`rc.lr` /
+    // `rc.balance_weight` / `rc.top_k`) をそのまま初期値にすると、resume の
+    // 度に schedule が先頭へ巻き戻ってしまう。そこで
+    // `cfg.start_superbatch - 1` 回分の decay/anneal を fast-forward して
+    // から初期値とする (継続 run と同じ superbatch では同じ値になる)。
     // `cfg.router` が `None` (router 以外) のときは未使用。
-    let mut current_router_lr: f64 = cfg.router.map(|rc| rc.lr).unwrap_or(0.0);
-    let mut current_router_balance_weight: f64 = cfg.router.map(|rc| rc.balance_weight).unwrap_or(0.0);
-    // `RouterTrainingConfig::top_k` の実効値。1 superbatch 終える度に
-    // `--top-k-reduction-interval` superbatch ごとに 1 ずつ減らす
-    // (`--top-k-reduction-interval` が `0` なら不変、従来動作)。`1` を下回らない。
-    let mut current_top_k: usize = cfg.router.map(|rc| rc.top_k).unwrap_or(1);
+    let (mut current_router_lr, mut current_router_balance_weight, mut current_top_k) =
+        match cfg.router {
+            Some(rc) => router_state_at_start(&rc, cfg.start_superbatch),
+            None => (0.0, 0.0, 1),
+        };
     // sb 内で直近に観測した router 学習の診断情報 (負荷分散 loss / bucket 使用率
     // など)。sb 末の `[router]` ログ用。`refresh_interval > 1` の場合、更新され
     // なかった batch では前回の値がそのまま残る (= その sb 最後の refresh 時点の
@@ -2753,6 +2792,66 @@ mod tests {
             .validate()
             .is_ok()
         );
+    }
+
+    fn sample_router_cfg() -> RouterTrainingConfig {
+        RouterTrainingConfig {
+            lr: 1.0,
+            weight_decay: 0.0,
+            balance_weight: 1.0,
+            mode: RouterMode::HardEm,
+            refresh_interval: 1,
+            lr_gamma: 0.5,
+            balance_weight_gamma: 0.5,
+            balance_weight_min: 0.1,
+            top_k: 5,
+            top_k_reduction_interval: 2,
+            top_k_min: 2,
+        }
+    }
+
+    #[test]
+    fn router_state_at_start_is_noop_for_a_fresh_run() {
+        let rc = sample_router_cfg();
+        // start_superbatch == 1 (no resume): base 値がそのまま返る (従来動作)。
+        assert_eq!(router_state_at_start(&rc, 1), (rc.lr, rc.balance_weight, rc.top_k));
+    }
+
+    #[test]
+    fn router_state_at_start_fast_forwards_lr_and_balance_weight_decay() {
+        let rc = sample_router_cfg();
+        // start_superbatch = 4 => 3 superbatch 分の decay が既に起きている前提。
+        let (lr, balance_weight, _top_k) = router_state_at_start(&rc, 4);
+        assert!((lr - rc.lr * rc.lr_gamma.powi(3)).abs() < 1e-12);
+        // balance_weight: 1.0 -> 0.5 -> 0.25 -> max(0.125, 0.1) = 0.125.
+        assert!((balance_weight - 0.125).abs() < 1e-12);
+    }
+
+    #[test]
+    fn router_state_at_start_clamps_balance_weight_to_the_configured_min() {
+        let rc = sample_router_cfg();
+        // 十分大きい start_superbatch なら balance_weight は min に張り付く。
+        let (_lr, balance_weight, _top_k) = router_state_at_start(&rc, 100);
+        assert!((balance_weight - rc.balance_weight_min).abs() < 1e-12);
+    }
+
+    #[test]
+    fn router_state_at_start_fast_forwards_top_k_annealing() {
+        let rc = sample_router_cfg();
+        // top_k_reduction_interval=2, top_k=5, top_k_min=2:
+        // elapsed=0 (start=1) -> 5, elapsed=2 (start=3) -> 4, elapsed=4 (start=5) -> 3,
+        // elapsed=100 (start=101) -> clamped to top_k_min=2.
+        assert_eq!(router_state_at_start(&rc, 1).2, 5);
+        assert_eq!(router_state_at_start(&rc, 3).2, 4);
+        assert_eq!(router_state_at_start(&rc, 5).2, 3);
+        assert_eq!(router_state_at_start(&rc, 101).2, 2);
+    }
+
+    #[test]
+    fn router_state_at_start_leaves_top_k_untouched_when_annealing_disabled() {
+        let mut rc = sample_router_cfg();
+        rc.top_k_reduction_interval = 0;
+        assert_eq!(router_state_at_start(&rc, 50).2, rc.top_k);
     }
 
     #[test]

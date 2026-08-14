@@ -817,8 +817,12 @@ pub(crate) struct LayerstackArgs {
     pub(crate) router_mode: RouterModeArg,
 
     /// `router` only: Adam learning rate for the router's own training step
-    /// (independent of the main `--lr` schedule). Ignored for other bucket
-    /// modes.
+    /// (independent of the main `--lr` schedule). On `--resume` /
+    /// `--router-resume`, the effective starting value has
+    /// `--router-lr-gamma` decay fast-forwarded by the number of superbatches
+    /// already completed (`start_superbatch - 1`), so the curve is the same
+    /// as an uninterrupted run at any given superbatch. Ignored for other
+    /// bucket modes.
     #[arg(long, default_value_t = 0.01)]
     pub(crate) router_lr: f32,
 
@@ -839,7 +843,11 @@ pub(crate) struct LayerstackArgs {
     /// load-balancing auxiliary loss (`L_balance = N * Σ_i f_i * P_i`, added to
     /// the router's cross-entropy loss) that discourages the router from
     /// collapsing onto a small subset of the `--num-buckets` buckets. `0.0`
-    /// disables it (cross-entropy only, matching the earlier behavior).
+    /// disables it (cross-entropy only, matching the earlier behavior). On
+    /// `--resume` / `--router-resume`, the effective starting value has
+    /// `--router-balance-weight-gamma` decay (and the
+    /// `--router-balance-weight-min` clamp) fast-forwarded by the number of
+    /// superbatches already completed, matching an uninterrupted run.
     /// Ignored for other bucket modes.
     #[arg(long, default_value_t = 0.01)]
     pub(crate) router_balance_weight: f32,
@@ -885,7 +893,11 @@ pub(crate) struct LayerstackArgs {
     /// Inference in YaneuraOu always picks a single bucket via argmax
     /// regardless of this setting — Top-K/soft routing only slows down
     /// search with no benefit there, so it stays a training-only technique.
-    /// Must be in `[1, --num-buckets]`. Ignored for other bucket modes.
+    /// Must be in `[1, --num-buckets]`. On `--resume` / `--router-resume`,
+    /// the effective starting value has `--top-k-reduction-interval`
+    /// annealing fast-forwarded by the number of superbatches already
+    /// completed, matching an uninterrupted run. Ignored for other bucket
+    /// modes.
     #[arg(long, default_value_t = 1)]
     pub(crate) top_k: usize,
 
