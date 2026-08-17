@@ -636,10 +636,11 @@ pub struct TrainingConfig {
     /// 満タン batch を作る)。`test_data` / `test_tail_positions` がいずれも
     /// `None` のときは無視される。
     pub test_positions: usize,
-    /// `Some(n)` のとき `data_path` 末尾 `n` 局面を training stream から除外し
-    /// held-out 専用に分離する (`--test-tail-positions`)。training は
-    /// `[0, file_size - n * PSV_RECORD_BYTES)`、validation は
-    /// `[file_size - n * PSV_RECORD_BYTES, file_size)` を読む。`test_data` と
+    /// `Some(n)` のとき `data` (仮想連結後、複数 file なら末尾は最後の file の
+    /// 末尾) の末尾 `n` 局面を training stream から除外し held-out 専用に
+    /// 分離する (`--test-tail-positions`)。training は
+    /// `[0, total_size - n * PSV_RECORD_BYTES)`、validation は
+    /// `[total_size - n * PSV_RECORD_BYTES, total_size)` を読む。`test_data` と
     /// 同時指定は `validate()` で error。
     pub test_tail_positions: Option<u64>,
     /// dataloader worker で選択された bucket mode を計算して per-position
@@ -825,7 +826,9 @@ impl ActiveHistStats {
 /// superbatch training loop を実行し、`cfg.output_dir` 配下に checkpoint を書き出す。
 ///
 /// - `backend`: GPU step を実行する backend (`bins/nnue_train::GpuTrainer`)
-/// - `data_path`: PSV file (`PackedSfenValue` × N、40 bytes 固定)
+/// - `data_files`: PSV file 群 (`PackedSfenValue` × N、40 bytes 固定)。`--data`
+///   が wildcard 展開された場合は複数 file になり、与えた順序で仮想連結された
+///   1 本の stream として読まれる
 /// - `bucket_mode`: dataloader と held-out validation に共通の bucket 算出方式。
 ///   progress8kpabs の重みは process-global なので呼び出し前に load 済であること
 /// - `lr_scheduler` / `wdl_scheduler`: superbatch / batch index から lr / wdl lambda を返す
@@ -840,7 +843,7 @@ impl ActiveHistStats {
 /// (training では問題ない)。
 pub fn run<B, L, W, M>(
     backend: &mut B,
-    data_path: &Path,
+    data_files: &[PathBuf],
     bucket_mode: &M,
     lr_scheduler: &L,
     wdl_scheduler: &W,
@@ -866,17 +869,27 @@ where
         ));
     }
 
-    // data file の byte サイズを取って PSV alignment を確認。
-    // `--test-tail-positions` の split 計算がここで PSV record 境界に揃うか
-    // 決まるため、tail 経路に入る前に確実に reject する。
-    let file_size = std::fs::metadata(data_path)?.len();
-    if !file_size.is_multiple_of(PSV_RECORD_BYTES) {
-        return Err(io::Error::other(format!(
-            "data file {} size {file_size} is not a multiple of PSV record size \
-             ({PSV_RECORD_BYTES} bytes); the file is corrupted or not a PackedSfenValue stream",
-            data_path.display(),
-        )));
+    if data_files.is_empty() {
+        return Err(io::Error::other(
+            "--data matched no files (empty glob expansion or missing file)",
+        ));
     }
+
+    // 各 data file の byte サイズを取って PSV alignment を確認。
+    // `--test-tail-positions` の split 計算がここで PSV record 境界に揃うか
+    // 決まるため、tail 経路に入る前に確実に reject する。複数 file はここで
+    // 仮想連結される (与えた順序、`total_size` はその合計)。
+    let sizes = crate::dataloader::file_sizes(data_files)?;
+    for (path, &size) in data_files.iter().zip(sizes.iter()) {
+        if !size.is_multiple_of(PSV_RECORD_BYTES) {
+            return Err(io::Error::other(format!(
+                "data file {} size {size} is not a multiple of PSV record size \
+                 ({PSV_RECORD_BYTES} bytes); the file is corrupted or not a PackedSfenValue stream",
+                path.display(),
+            )));
+        }
+    }
+    let total_size: u64 = sizes.iter().sum();
 
     let train_end_offset = match cfg.test_tail_positions {
         Some(n) => {
@@ -886,21 +899,21 @@ where
                      overflows u64"
                 ))
             })?;
-            if tail_bytes >= file_size {
+            if tail_bytes >= total_size {
                 return Err(io::Error::other(format!(
                     "test_tail_positions ({n}) leaves no training records \
-                     (data file {} has {} records)",
-                    data_path.display(),
-                    file_size / PSV_RECORD_BYTES,
+                     (data {} has {} records total)",
+                    crate::dataloader::display_file_list(data_files),
+                    total_size / PSV_RECORD_BYTES,
                 )));
             }
-            file_size - tail_bytes
+            total_size - tail_bytes
         }
-        None => file_size,
+        None => total_size,
     };
 
     let mut loader = BucketedPrefetchedLoader::spawn(
-        data_path,
+        data_files,
         cfg.batch_size,
         cfg.score_drop_abs,
         cfg.score_clamp_abs,
@@ -916,7 +929,7 @@ where
     println!(
         "[train] data={} | net_id={} | superbatches {}..={} | {} batches/sb x bs {} \
          | lr-sched: {lr_scheduler} | wdl-sched: {wdl_scheduler} | loss: {} | score-drop-abs {:?} | score-clamp-abs {:?} | dataloader threads {}",
-        data_path.display(),
+        crate::dataloader::display_file_list(data_files),
         cfg.net_id,
         cfg.start_superbatch,
         cfg.end_superbatch,
@@ -955,9 +968,9 @@ where
         }
         (None, Some(_)) => {
             let set = crate::validation::HeldoutSet::load_from_range(
-                data_path,
+                data_files,
                 train_end_offset,
-                file_size,
+                total_size,
                 cfg.batch_size,
                 cfg.score_drop_abs,
                 cfg.score_clamp_abs,
@@ -969,9 +982,9 @@ where
             println!(
                 "[train] held-out validation (training tail): data={} | range [{}, {}) | \
                  {} batches x bs {} ({} positions)",
-                data_path.display(),
+                crate::dataloader::display_file_list(data_files),
                 train_end_offset,
-                file_size,
+                total_size,
                 set.n_batches(),
                 cfg.batch_size,
                 set.n_positions(),
@@ -1784,7 +1797,7 @@ mod tests {
 
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -1871,7 +1884,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2031,7 +2044,7 @@ mod tests {
 
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2080,7 +2093,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2142,7 +2155,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2182,7 +2195,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2211,7 +2224,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2243,7 +2256,7 @@ mod tests {
         let mut backend = MockBackend::new();
         run(
             &mut backend,
-            &sample_psv_path(),
+            &[sample_psv_path()],
             &progress,
             &lr,
             &wdl,
@@ -2464,7 +2477,15 @@ mod tests {
         std::fs::write(&tmp, b"").expect("write empty psv");
 
         let mut backend = MockBackend::new();
-        let result = run(&mut backend, &tmp, &progress, &lr, &wdl, &cfg, None);
+        let result = run(
+            &mut backend,
+            std::slice::from_ref(&tmp),
+            &progress,
+            &lr,
+            &wdl,
+            &cfg,
+            None,
+        );
         let _ = std::fs::remove_file(&tmp);
 
         let err = result.expect_err("empty data file should error, not hang");

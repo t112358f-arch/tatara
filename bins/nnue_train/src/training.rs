@@ -1,5 +1,5 @@
 #[cfg(feature = "gpu")]
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "gpu")]
 use gpu_runtime::CudaContext;
@@ -371,7 +371,13 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // --data は通常学習と --eval-only --test-tail-positions では必須だが、
     // --threat-norm-dump と --eval-only --test-data は学習データを読まないので任意。
     // 必須経路では参照点で明示 error にする (None のまま誤って学習に進ませない)。
-    let data = cli.data.as_ref();
+    // wildcard (`*` / `?`) を含む場合はここで展開し、以降は常に file 一覧として扱う。
+    let data: Option<Vec<PathBuf>> = cli
+        .data
+        .as_ref()
+        .map(|pattern| crate::cli::expand_data_glob(pattern))
+        .transpose()?;
+    let data = data.as_deref();
 
     if (cli.threat_ablate.is_some() || cli.threat_norm_dump) && cli.init_from.is_none() {
         return Err(
@@ -924,19 +930,20 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     return Err("--test-tail-positions must be >= 1".into());
                 }
                 let data = data.ok_or(
-                    "--eval-only --test-tail-positions requires --data (the file whose tail is the held-out set)",
+                    "--eval-only --test-tail-positions requires --data (the file(s) whose tail is the held-out set)",
                 )?;
-                let file_size = std::fs::metadata(data)?.len();
+                let sizes = nnue_train::dataloader::file_sizes(data)?;
+                let total_size: u64 = sizes.iter().sum();
                 let tail_bytes = n.checked_mul(PSV_RECORD_BYTES).ok_or_else(|| {
                     std::io::Error::other("--test-tail-positions * PSV record size overflows u64")
                 })?;
-                if tail_bytes >= file_size {
+                if tail_bytes >= total_size {
                     return Err("--test-tail-positions leaves no data to evaluate".into());
                 }
                 nnue_train::validation::HeldoutSet::load_from_range(
                     data,
-                    file_size - tail_bytes,
-                    file_size,
+                    total_size - tail_bytes,
+                    total_size,
                     cfg.batch_size,
                     cfg.score_drop_abs,
                     cfg.score_clamp_abs,
@@ -1527,7 +1534,7 @@ pub(crate) fn build_experiment_logger(
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
     resume_parent_id: Option<String>,
-    data: &Path,
+    data: &[PathBuf],
     lr_schedule: String,
     fv_scale: Option<i32>,
 ) -> ExperimentLogger {
@@ -1666,21 +1673,25 @@ pub(crate) fn build_experiment_logger(
 
 /// `--data` の raw record 数から `--test-tail-positions` 分を差し引いて
 /// training-only な局面数を返す。両 builder (LayerStack / Simple) が同じ
-/// 算出ロジックを使うための単一エントリポイント。`data` の metadata 読み
-/// 出しに失敗したときは `0`、`--test-tail-positions` が raw 件数以上の場合は
-/// raw record 数をそのまま返す (`trainer::run` 側で `validate` 経由 reject
-/// される前提の defensive fallback)。
+/// 算出ロジックを使うための単一エントリポイント。`data` (wildcard 展開後の
+/// file 一覧) の metadata 読み出しに失敗したときは `0`、`--test-tail-positions`
+/// が raw 件数以上の場合は raw record 数をそのまま返す (`trainer::run` 側で
+/// `validate` 経由 reject される前提の defensive fallback)。
 #[cfg(feature = "gpu")]
-pub(crate) fn build_data_info(cli: &Cli, data: &Path) -> DataInfo {
-    let total_records = std::fs::metadata(data)
-        .map(|m| m.len() / PSV_RECORD_BYTES)
+pub(crate) fn build_data_info(cli: &Cli, data: &[PathBuf]) -> DataInfo {
+    let total_records = nnue_train::dataloader::file_sizes(data)
+        .map(|sizes| sizes.iter().sum::<u64>() / PSV_RECORD_BYTES)
         .unwrap_or(0);
     let train_records = match cli.test_tail_positions {
         Some(n) if n < total_records => total_records - n,
         _ => total_records,
     };
     DataInfo {
-        name: file_basename(data),
+        name: match data {
+            [] => "<no files>".to_string(),
+            [only] => file_basename(only),
+            [first, rest @ ..] => format!("{} (+{} more)", file_basename(first), rest.len()),
+        },
         positions: train_records,
         total_positions: 0,
         dataset_passes: 0.0,
@@ -1701,7 +1712,7 @@ pub(crate) fn build_experiment_logger_simple(
     start_superbatch: usize,
     resumed_superbatch: Option<usize>,
     resume_parent_id: Option<String>,
-    data: &Path,
+    data: &[PathBuf],
     ft_fp16: bool,
     ft_fp16_out: bool,
     fp16_opt_state: bool,
@@ -1894,6 +1905,8 @@ pub(crate) fn run_simple_training(
         .data
         .as_ref()
         .expect("run_simple_training called with --data");
+    let data = crate::cli::expand_data_glob(data)?;
+    let data = data.as_slice();
 
     let shared = validate_shared_cli(cli, simple_args.ft_fp16_out, simple_args.tf32)?;
     let feature_set = shared.feature_set;
@@ -2405,7 +2418,7 @@ mod tests {
             0,
             None,
             None,
-            &data,
+            std::slice::from_ref(&data),
             false,
             false,
             false,

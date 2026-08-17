@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::io;
+use std::path::{Component, Path, PathBuf};
 
 use clap::{Args, Parser, Subcommand};
 #[cfg(any(feature = "gpu", test))]
@@ -17,6 +18,174 @@ fn parse_positive_i32(value: &str) -> Result<i32, String> {
 }
 
 // ===========================================================================
+// `--data` wildcard 展開
+//
+// `--data` は複数 PSV file を 1 本の training stream として扱うため、
+// `*` / `?` を含む path を shell 風 glob として展開する (shell が展開済の
+// 場合はここに来ず単一 path のまま通る; クオートして渡した場合や、shell の
+// argv 上限を避けたい場合に有効)。追加の依存 crate は増やさず本 file 内で
+// 完結させる。
+// ===========================================================================
+
+/// 単一 path segment (path 区切り文字を含まない) に対する shell 風 glob
+/// pattern match。`*` は 0 文字以上の任意文字列、`?` は任意の 1 文字に
+/// マッチする。古典的な動的計画法による wildcard match で、`pattern` /
+/// `name` の長さの積に比例した時間で判定する (指数爆発しない)。
+fn glob_match_segment(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let s: Vec<char> = name.chars().collect();
+    let mut dp = vec![vec![false; s.len() + 1]; p.len() + 1];
+    dp[0][0] = true;
+    for i in 1..=p.len() {
+        if p[i - 1] == '*' {
+            dp[i][0] = dp[i - 1][0];
+        }
+    }
+    for i in 1..=p.len() {
+        for j in 1..=s.len() {
+            dp[i][j] = match p[i - 1] {
+                '*' => dp[i - 1][j] || dp[i][j - 1],
+                '?' => dp[i - 1][j - 1],
+                c => c == s[j - 1] && dp[i - 1][j - 1],
+            };
+        }
+    }
+    dp[p.len()][s.len()]
+}
+
+/// `pattern` の1 path component (`Component::Normal`) が `*` / `?` を含むか。
+fn component_has_wildcard(comp: &Component<'_>) -> bool {
+    matches!(comp, Component::Normal(seg) if seg.to_string_lossy().contains(['*', '?']))
+}
+
+/// `--data` の値を wildcard 展開する。`pattern` が `*` / `?` を含まないときは
+/// 展開せず `[pattern]` をそのまま返す (存在確認は行わない: 従来どおり後続の
+/// file open で error にする)。
+///
+/// `*` / `?` を含む場合は shell 風 glob として展開し、一致した path を
+/// (安定した学習順序のため) 昇順ソートして返す。中間 path component の
+/// wildcard (`data/*/train.psv` 等) にも対応するが、再帰的ディレクトリ探索
+/// (`**`) は対応しない。1 件も一致しなければ error にする (誤って空データで
+/// 学習が始まるのを防ぐ)。dotfile は shell 慣例と同様、pattern 側の
+/// component が `.` から始まらない限りマッチしない。
+pub(crate) fn expand_data_glob(pattern: &Path) -> io::Result<Vec<PathBuf>> {
+    let components: Vec<Component<'_>> = pattern.components().collect();
+    if !components.iter().any(component_has_wildcard) {
+        return Ok(vec![pattern.to_path_buf()]);
+    }
+
+    let mut current: Vec<PathBuf> = vec![PathBuf::new()];
+    for comp in &components {
+        if component_has_wildcard(comp) {
+            let Component::Normal(seg) = comp else {
+                unreachable!("component_has_wildcard only matches Component::Normal");
+            };
+            let seg_str = seg.to_string_lossy();
+            let mut next = Vec::new();
+            for base in &current {
+                let dir = if base.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    base.clone()
+                };
+                let entries = std::fs::read_dir(&dir).map_err(|e| {
+                    io::Error::other(format!(
+                        "--data '{}': cannot list directory {} while expanding wildcard: {e}",
+                        pattern.display(),
+                        dir.display(),
+                    ))
+                })?;
+                for entry in entries {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with('.') && !seg_str.starts_with('.') {
+                        continue; // shell 慣例: 明示しない限り dotfile は除外
+                    }
+                    if glob_match_segment(&seg_str, &name_str) {
+                        let mut matched = base.clone();
+                        matched.push(&name);
+                        next.push(matched);
+                    }
+                }
+            }
+            current = next;
+        } else {
+            for base in current.iter_mut() {
+                base.push(comp.as_os_str());
+            }
+        }
+    }
+
+    current.sort();
+    if current.is_empty() {
+        return Err(io::Error::other(format!(
+            "--data '{}' matched no files",
+            pattern.display()
+        )));
+    }
+    Ok(current)
+}
+
+#[cfg(test)]
+mod data_glob_tests {
+    use super::*;
+
+    #[test]
+    fn glob_match_segment_star_and_question_mark() {
+        assert!(glob_match_segment("*.psv", "train.psv"));
+        assert!(glob_match_segment("*.psv", ".psv"));
+        assert!(!glob_match_segment("*.psv", "train.hcpe"));
+        assert!(glob_match_segment("shard-???.psv", "shard-001.psv"));
+        assert!(!glob_match_segment("shard-???.psv", "shard-1.psv"));
+        assert!(glob_match_segment("*", "anything.psv"));
+    }
+
+    #[test]
+    fn expand_data_glob_passthrough_without_wildcard() {
+        let path = PathBuf::from("some/exact/file.psv");
+        let expanded = expand_data_glob(&path).unwrap();
+        assert_eq!(expanded, vec![path]);
+    }
+
+    #[test]
+    fn expand_data_glob_matches_and_sorts_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "nnue-train-cli-glob-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        for name in ["shard-002.psv", "shard-000.psv", "shard-001.psv", "notes.txt"] {
+            std::fs::write(dir.join(name), b"").expect("write fixture file");
+        }
+
+        let pattern = dir.join("shard-*.psv");
+        let expanded = expand_data_glob(&pattern).expect("glob should match files");
+        let expected = vec![
+            dir.join("shard-000.psv"),
+            dir.join("shard-001.psv"),
+            dir.join("shard-002.psv"),
+        ];
+        assert_eq!(expanded, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn expand_data_glob_errors_when_no_match() {
+        let dir = std::env::temp_dir().join(format!(
+            "nnue-train-cli-glob-empty-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let pattern = dir.join("*.psv");
+        let err = expand_data_glob(&pattern).expect_err("empty match should error");
+        assert!(err.to_string().contains("matched no files"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+// ===========================================================================
 // CLI (clap)
 // ===========================================================================
 
@@ -29,7 +198,10 @@ fn parse_positive_i32(value: &str) -> Result<i32, String> {
 #[derive(Parser, Debug)]
 #[command(name = "nnue-train", about = "Shogi NNUE trainer")]
 pub(crate) struct Cli {
-    /// Training data PSV file (`PackedSfenValue` x N, 40 bytes each). When omitted, runs a GPU smoke test.
+    /// Training data PSV file (`PackedSfenValue` x N, 40 bytes each). When omitted, runs a GPU
+    /// smoke test. Accepts a `*` / `?` wildcard (e.g. `shards/*.psv`) to train on multiple files
+    /// as a single concatenated stream, in sorted filename order; quote the pattern so the shell
+    /// doesn't expand it first if you rely on this.
     #[arg(long, global = true)]
     pub(crate) data: Option<PathBuf>,
 

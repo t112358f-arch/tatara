@@ -20,13 +20,13 @@
 //! 比較できる。
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 
-use crate::dataloader::{Batch, BucketMode, HcpeFileLoader, PsvFileLoader};
+use crate::dataloader::{Batch, BucketMode, HcpeFileLoader, PsvMultiFileLoader, file_sizes};
 use crate::trainer::{LossKind, TrainerBackend};
 
 /// held-out validation 1 回分の集計結果。
@@ -87,7 +87,7 @@ impl HeldoutSet {
             return Self::load_boards(
                 loader,
                 |loader| loader.next_board(),
-                path,
+                std::slice::from_ref(&path.to_path_buf()),
                 batch_size,
                 score_drop_abs,
                 score_clamp_abs,
@@ -100,7 +100,7 @@ impl HeldoutSet {
 
         let file_size = std::fs::metadata(path)?.len();
         Self::load_from_range(
-            path,
+            std::slice::from_ref(&path.to_path_buf()),
             0,
             file_size,
             batch_size,
@@ -113,15 +113,16 @@ impl HeldoutSet {
         )
     }
 
-    /// test PSV file の `[start_offset, end_offset)` byte range から固定の検証
-    /// 集合を読み込む。training PSV の末尾 N 局面を holdout 専用に分離する
+    /// test PSV file 群 (`--data` 同様、複数 file なら与えた順で仮想連結される)
+    /// の `[start_offset, end_offset)` 仮想 byte range から固定の検証集合を
+    /// 読み込む。training PSV の末尾 N 局面を holdout 専用に分離する
     /// (`--test-tail-positions`) 経路で使う。挙動は [`HeldoutSet::load`] と同じく
     /// EOF (= range 末尾) で打ち切り、wrap はしない。range 検証 (alignment /
-    /// `end <= file_size` / `start <= end`) は [`PsvFileLoader::new_range`] に
-    /// 委譲する。
+    /// `end <= total_size` / `start <= end`) は [`PsvMultiFileLoader::new_range`]
+    /// に委譲する。
     #[allow(clippy::too_many_arguments)]
     pub fn load_from_range(
-        path: &Path,
+        paths: &[PathBuf],
         start_offset: u64,
         end_offset: u64,
         batch_size: usize,
@@ -132,11 +133,12 @@ impl HeldoutSet {
         feature_set: FeatureSetSpec,
         num_buckets: usize,
     ) -> io::Result<Self> {
-        let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
+        let sizes = file_sizes(paths)?;
+        let loader = PsvMultiFileLoader::new_range(paths, &sizes, start_offset, end_offset)?;
         Self::load_boards(
             loader,
             |loader| Ok(loader.next_psv()?.map(|psv| psv.decode())),
-            path,
+            paths,
             batch_size,
             score_drop_abs,
             score_clamp_abs,
@@ -151,7 +153,7 @@ impl HeldoutSet {
     fn load_boards<L>(
         mut loader: L,
         mut next_board: impl FnMut(&mut L) -> io::Result<Option<shogi_format::ShogiBoard>>,
-        path: &Path,
+        paths: &[PathBuf],
         batch_size: usize,
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
@@ -197,9 +199,9 @@ impl HeldoutSet {
 
         if batches.is_empty() {
             return Err(io::Error::other(format!(
-                "test data file {} has fewer than batch_size ({batch_size}) usable positions; \
+                "test data ({}) has fewer than batch_size ({batch_size}) usable positions; \
                  held-out validation needs at least one full batch",
-                path.display()
+                crate::dataloader::display_file_list(paths)
             )));
         }
         let n_positions = (batches.len() as u64) * (batch_size as u64);
@@ -288,8 +290,8 @@ pub fn sign_agreement(net_output: &[f32], batch: &Batch) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dataloader::PsvFileLoader;
     use shogi_features::FeatureSet;
-    use std::path::PathBuf;
 
     fn test_spec() -> FeatureSetSpec {
         FeatureSet::HalfKaHmMerged.spec()
@@ -465,7 +467,7 @@ mod tests {
         // EOF 打ち切りで満タン batch は 1 個 (16 pos)。
         let progress = ShogiProgressKPAbs;
         let set = HeldoutSet::load_from_range(
-            &sample_psv_path(),
+            &[sample_psv_path()],
             2800,
             4000,
             16,
@@ -486,7 +488,7 @@ mod tests {
         // 空 range (start == end) は 1 件も埋められず error。
         let progress = ShogiProgressKPAbs;
         let err = HeldoutSet::load_from_range(
-            &sample_psv_path(),
+            &[sample_psv_path()],
             4000,
             4000,
             16,

@@ -438,6 +438,133 @@ impl PsvFileLoader {
     }
 }
 
+/// `paths` それぞれの file size (byte) を `paths` と同じ順序で返す。`--data` が
+/// wildcard 展開で複数 file になったとき、concatenation の累積 offset 計算に使う。
+pub fn file_sizes(paths: &[PathBuf]) -> io::Result<Vec<u64>> {
+    paths
+        .iter()
+        .map(|p| std::fs::metadata(p).map(|m| m.len()))
+        .collect()
+}
+
+/// エラーメッセージ・ログ表示用に `paths` を人間可読な 1 行にまとめる。1 file
+/// ならそのまま、複数 file なら先頭 1 件 + 残り件数 (`--data` wildcard 展開時に
+/// 全 path を並べるとログが読みにくくなるため)。
+pub(crate) fn display_file_list(paths: &[PathBuf]) -> String {
+    match paths {
+        [] => "<no files>".to_string(),
+        [only] => only.display().to_string(),
+        [first, rest @ ..] => format!("{} (+{} more)", first.display(), rest.len()),
+    }
+}
+
+// =============================================================================
+// PsvMultiFileLoader — 複数 PSV file を「仮想的に連結した 1 本の byte 列」と
+// して逐次読む reader (`--data` の wildcard 展開対応)
+// =============================================================================
+
+/// `files` (与えられた順序) を仮想的に連結した byte 空間の `[start, end)` を
+/// 逐次読む reader。ディスク上で実際に結合はせず、必要な file だけを順に
+/// `PsvFileLoader::new_range` で開き直しながら読み進める。
+///
+/// `start` / `end` は「連結後の」仮想 offset であり個々の file の byte 数とは
+/// 対応しない。[`PsvFileLoader::new_range`] と同様 [`PSV_RECORD_BYTES`] の倍数
+/// でなければならない。1 file だけの `files` を渡せば [`PsvFileLoader`] と同じ
+/// 挙動になる (wildcard が 1 file にしか一致しなかった場合の自然な縮退)。
+pub(crate) struct PsvMultiFileLoader {
+    /// まだ開いていない後続 file の `(path, local_start, local_end)`。`advance`
+    /// が先頭から順に pop して開く。
+    remaining: std::collections::VecDeque<(PathBuf, u64, u64)>,
+    /// 現在読んでいる file の sub-range reader。全 file を読み切ったら `None`
+    /// (以降 `next_psv` は `Ok(None)` を返し続ける)。
+    current: Option<PsvFileLoader>,
+}
+
+impl PsvMultiFileLoader {
+    /// `files` (`sizes` は対応する file size、事前に呼び出し側が計測済のものを
+    /// 渡す — 同じ metadata 読み出しを epoch wrap のたびに繰り返さないため) の
+    /// 連結 byte 空間 `[start, end)` を開く。範囲外・非 alignment は
+    /// [`PsvFileLoader::new_range`] と同じ検証で error になる。
+    pub(crate) fn new_range(
+        files: &[PathBuf],
+        sizes: &[u64],
+        start: u64,
+        end: u64,
+    ) -> io::Result<Self> {
+        assert_eq!(
+            files.len(),
+            sizes.len(),
+            "PsvMultiFileLoader::new_range: files/sizes length mismatch"
+        );
+        if start > end {
+            return Err(io::Error::other(format!(
+                "PsvMultiFileLoader range start ({start}) > end ({end})"
+            )));
+        }
+        let total: u64 = sizes.iter().sum();
+        if end > total {
+            return Err(io::Error::other(format!(
+                "PsvMultiFileLoader range end ({end}) > total size ({total}) across {} file(s)",
+                files.len()
+            )));
+        }
+        if !start.is_multiple_of(PSV_RECORD_BYTES) || !end.is_multiple_of(PSV_RECORD_BYTES) {
+            return Err(io::Error::other(format!(
+                "PsvMultiFileLoader range [{start}, {end}) is not aligned to PSV record size \
+                 ({PSV_RECORD_BYTES} bytes)"
+            )));
+        }
+        // 連結 byte 空間上での各 file の位置 (`[file_start, file_end)`) と
+        // `[start, end)` の overlap から、実際に読む sub-range だけを積む
+        // (完全に範囲外の file は queue に積まない = 開かない)。
+        let mut remaining = std::collections::VecDeque::new();
+        let mut cursor = 0u64;
+        for (path, &size) in files.iter().zip(sizes.iter()) {
+            let file_start = cursor;
+            let file_end = cursor + size;
+            cursor = file_end;
+            let lo = start.max(file_start);
+            let hi = end.min(file_end);
+            if lo < hi {
+                remaining.push_back((path.clone(), lo - file_start, hi - file_start));
+            }
+        }
+        let mut this = Self {
+            remaining,
+            current: None,
+        };
+        this.advance()?;
+        Ok(this)
+    }
+
+    /// queue の先頭 file を開いて `current` にする。queue が空なら `current`
+    /// は `None` (= 連結全体の EOF)。
+    fn advance(&mut self) -> io::Result<()> {
+        self.current = match self.remaining.pop_front() {
+            Some((path, local_start, local_end)) => {
+                Some(PsvFileLoader::new_range(&path, local_start, local_end)?)
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
+    /// 1 PSV record を読む。現在の file を読み切ったら次の file へ自動で
+    /// 進む (`PsvFileLoader::next_psv` の EOF を跨いで透過的に連結する)。
+    /// 全 file を読み終えたら `Ok(None)`。
+    pub(crate) fn next_psv(&mut self) -> io::Result<Option<PackedSfenValue>> {
+        loop {
+            let Some(loader) = self.current.as_mut() else {
+                return Ok(None);
+            };
+            match loader.next_psv()? {
+                Some(psv) => return Ok(Some(psv)),
+                None => self.advance()?,
+            }
+        }
+    }
+}
+
 // =============================================================================
 // PrefetchedLoader (multi-thread prefetch、minimum wrapper)
 // =============================================================================
@@ -527,13 +654,18 @@ pub const MAX_BARREN_PASSES: u32 = 5;
 /// `next()` は常に「使える PSV」を返すか barren-error を返す (epoch は無限に
 /// wrap するので「終わり」は無い)。
 struct PsvEpochReader {
-    path: PathBuf,
-    /// 1 epoch の byte range `[start_offset, end_offset)`。wrap 時に
-    /// `PsvFileLoader::new_range(path, start, end)` で再 open する。`new()`
-    /// 経路では `(0, file_size)` で全体に等しい。
+    /// `--data` を wildcard 展開した file 一覧 (この順序で仮想連結される)。
+    files: Vec<PathBuf>,
+    /// `files` 各々の byte size (`files` と同じ順序・同じ長さ)。epoch wrap の
+    /// たびに `PsvMultiFileLoader::new_range` を呼び直すが、metadata の再読み
+    /// 出しは避けるためここで保持しておく。
+    sizes: Vec<u64>,
+    /// 1 epoch の仮想連結 byte range `[start_offset, end_offset)`。wrap 時に
+    /// `PsvMultiFileLoader::new_range(files, sizes, start, end)` で再 open する。
+    /// `new()` 経路では `(0, total_size)` で全体に等しい。
     start_offset: u64,
     end_offset: u64,
-    loader: PsvFileLoader,
+    loader: PsvMultiFileLoader,
     score_drop_abs: Option<i32>,
     score_clamp_abs: Option<i16>,
     /// 直近の reopen 以降に実際に返した (= drop されなかった) position 数。
@@ -543,19 +675,21 @@ struct PsvEpochReader {
 }
 
 impl PsvEpochReader {
-    /// `path` を `[start_offset, end_offset)` 範囲で epoch wrap させる reader。
-    /// wrap 時の再 open も同 range で行う。`PsvFileLoader::new_range` 同様の
-    /// 範囲・alignment 検証はここでは行わず、`new_range` 内で検証する。
+    /// `files` (仮想連結) を `[start_offset, end_offset)` 範囲で epoch wrap
+    /// させる reader。wrap 時の再 open も同 range で行う。範囲・alignment 検証
+    /// はここでは行わず、`PsvMultiFileLoader::new_range` 内で検証する。
     fn new_range(
-        path: &Path,
+        files: &[PathBuf],
         start_offset: u64,
         end_offset: u64,
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
     ) -> io::Result<Self> {
-        let loader = PsvFileLoader::new_range(path, start_offset, end_offset)?;
+        let sizes = file_sizes(files)?;
+        let loader = PsvMultiFileLoader::new_range(files, &sizes, start_offset, end_offset)?;
         Ok(Self {
-            path: path.to_path_buf(),
+            files: files.to_vec(),
+            sizes,
             start_offset,
             end_offset,
             loader,
@@ -595,10 +729,10 @@ impl PsvEpochReader {
                         self.barren_passes += 1;
                         if self.barren_passes >= MAX_BARREN_PASSES {
                             return Err(io::Error::other(format!(
-                                "data file {} range [{}, {}) yielded no usable positions over {} \
+                                "data ({}) range [{}, {}) yielded no usable positions over {} \
                                  full passes (empty range, or all positions filtered out by \
                                  score-drop-abs)",
-                                self.path.display(),
+                                display_file_list(&self.files),
                                 self.start_offset,
                                 self.end_offset,
                                 self.barren_passes
@@ -608,8 +742,12 @@ impl PsvEpochReader {
                         self.barren_passes = 0;
                     }
                     self.pushed_this_epoch = 0;
-                    self.loader =
-                        PsvFileLoader::new_range(&self.path, self.start_offset, self.end_offset)?;
+                    self.loader = PsvMultiFileLoader::new_range(
+                        &self.files,
+                        &self.sizes,
+                        self.start_offset,
+                        self.end_offset,
+                    )?;
                 }
             }
         }
@@ -692,7 +830,8 @@ pub struct BucketedPrefetchedLoader {
 }
 
 impl BucketedPrefetchedLoader {
-    /// `path` の PSV を `num_workers` 本の worker で読み込む。各 batch は
+    /// `paths` (`--data` を wildcard 展開した 1 file 以上の PSV 群、与えた順序で
+    /// 仮想連結される) を `num_workers` 本の worker で読み込む。各 batch は
     /// `batch_size` 件の有効 position を持つ (epoch wrap するので末尾 partial は
     /// 出ない)。`score_drop_abs` が `Some(t)` なら `|score| >= t` を skip。
     /// `score_clamp_abs` が `Some(c)` なら drop を生き残った position の score を
@@ -704,19 +843,21 @@ impl BucketedPrefetchedLoader {
     /// `num_buckets` は progress mode の bucket 数。`compute_bucket = false` (Simple アーキ) では bucket
     /// 計算自体が skip されるが、worker 側 assertion (`num_buckets >= 1`) は常に
     /// 評価する。
-    /// `train_end_offset` は training stream の上限 byte offset (`[0, train_end_offset)`
-    /// が training に使われる)。file 全体を使うときは file size をそのまま渡す。
-    /// 同 file 内に held-out tail を残す経路 (`--test-tail-positions`) で
-    /// `file_size - N * PSV_RECORD_BYTES` を渡し、training が tail に踏み込まない
-    /// ようにするのが主用途。`train_end_offset` は [`PSV_RECORD_BYTES`] の倍数で
-    /// なければならず、違反は `PsvFileLoader::new_range` 側で error になる。
+    /// `train_end_offset` は training stream の上限 byte offset。`paths` を
+    /// 与えた順に連結した仮想 byte 空間上の offset で、`[0, train_end_offset)`
+    /// が training に使われる。全体を使うときは合計 file size をそのまま渡す。
+    /// 連結末尾に held-out tail を残す経路 (`--test-tail-positions`) で
+    /// `total_size - N * PSV_RECORD_BYTES` を渡し、training が tail に踏み込まない
+    /// ようにするのが主用途 (tail は連結末尾 = 通常は最後の file の末尾)。
+    /// `train_end_offset` は [`PSV_RECORD_BYTES`] の倍数でなければならず、違反は
+    /// `PsvMultiFileLoader::new_range` 側で error になる。
     /// `monitor_active` が `true` のとき、各 position の実 active feature 数を
     /// histogram (`feature_set.max_active() + 1` bins) に集計し [`Self::active_histogram_snapshot`]
     /// で参照できるようにする (`--monitor-active-features`)。`false` では histogram
     /// を確保せず worker のホットパスに計装コードを一切通さない。
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
-        path: &Path,
+        paths: &[PathBuf],
         batch_size: usize,
         score_drop_abs: Option<i32>,
         score_clamp_abs: Option<i16>,
@@ -742,7 +883,7 @@ impl BucketedPrefetchedLoader {
         let n_slots = prefetch_depth + num_workers + 1;
 
         let reader = Arc::new(Mutex::new(PsvEpochReader::new_range(
-            path,
+            paths,
             0,
             train_end_offset,
             score_drop_abs,
@@ -1357,7 +1498,7 @@ mod tests {
 
         // 計装 off: snapshot は None (histogram を確保しない = 集計しない)。
         let mut off = BucketedPrefetchedLoader::spawn(
-            &path,
+            std::slice::from_ref(&path),
             8,
             None,
             None,
@@ -1382,7 +1523,7 @@ mod tests {
         // position 数以上 (worker が先読みで余分に埋め得るため厳密一致は保証
         // しない)。全 active 数は max_active bin 域に収まる。
         let mut on = BucketedPrefetchedLoader::spawn(
-            &path,
+            std::slice::from_ref(&path),
             8,
             None,
             None,
@@ -1522,7 +1663,7 @@ mod tests {
         let path = sample_psv_path();
         let end = full_range_end(&path);
         let mut loader = BucketedPrefetchedLoader::spawn(
-            &path,
+            std::slice::from_ref(&path),
             16,
             None,
             None,
@@ -1580,7 +1721,7 @@ mod tests {
         }
 
         let mut loader = BucketedPrefetchedLoader::spawn(
-            &path,
+            std::slice::from_ref(&path),
             16,
             None,
             None,
@@ -1619,7 +1760,7 @@ mod tests {
         let path = sample_psv_path();
         let end = full_range_end(&path);
         let mut loader = BucketedPrefetchedLoader::spawn(
-            &path,
+            std::slice::from_ref(&path),
             8,
             None,
             None,
@@ -1650,7 +1791,7 @@ mod tests {
         let path = sample_psv_path();
         let end = full_range_end(&path);
         let mut ok_loader = BucketedPrefetchedLoader::spawn(
-            &path,
+            std::slice::from_ref(&path),
             8,
             Some(32000),
             None,
@@ -1672,7 +1813,7 @@ mod tests {
         // どちらでもよい (hang しないことが要点)。ここでは「呼んで返ってくる」ことの
         // み確認 (panic / hang しない)。
         let mut drop_loader = BucketedPrefetchedLoader::spawn(
-            &path,
+            std::slice::from_ref(&path),
             100,
             Some(1),
             None,
@@ -1697,7 +1838,7 @@ mod tests {
         let progress = ShogiProgressKPAbs;
         let path = sample_psv_path();
         let mut loader = BucketedPrefetchedLoader::spawn(
-            &path,
+            std::slice::from_ref(&path),
             8,
             None,
             None,
@@ -1727,7 +1868,7 @@ mod tests {
         // 100 record 分 next() しても barren error にならず (= range 内 wrap が
         // 効いている)、各 record が必ず内容を返すことを確認する。
         let mut reader =
-            PsvEpochReader::new_range(&sample_psv_path(), 2800, 4000, None, None).unwrap();
+            PsvEpochReader::new_range(&[sample_psv_path()], 2800, 4000, None, None).unwrap();
         for i in 0..100 {
             let _psv = reader
                 .next()
@@ -1754,7 +1895,8 @@ mod tests {
         std::fs::write(&tmp, &bytes).expect("write synthetic psv");
 
         let mut reader =
-            PsvEpochReader::new_range(&tmp, 0, bytes.len() as u64, Some(32000), Some(100)).unwrap();
+            PsvEpochReader::new_range(&[tmp.clone()], 0, bytes.len() as u64, Some(32000), Some(100))
+                .unwrap();
         let got: Vec<i16> = (0..5).map(|_| reader.next().unwrap().score()).collect();
         std::fs::remove_file(&tmp).ok();
         assert_eq!(got, vec![0, 50, -50, 100, -100]);
@@ -1769,7 +1911,7 @@ mod tests {
         ));
         std::fs::write(&tmp, b"").expect("write empty psv");
         let mut loader = BucketedPrefetchedLoader::spawn(
-            &tmp,
+            std::slice::from_ref(&tmp),
             8,
             None,
             None,
