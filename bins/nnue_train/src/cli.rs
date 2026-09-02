@@ -793,6 +793,30 @@ impl From<RouterModeArg> for shogi_features::router_kpabs::RouterMode {
     }
 }
 
+impl From<RouterArchArg> for shogi_features::router_ftbyft::RouterArch {
+    fn from(value: RouterArchArg) -> Self {
+        match value {
+            RouterArchArg::Kpabs => Self::Kpabs,
+            RouterArchArg::FtByFt => Self::FtByFt,
+        }
+    }
+}
+
+/// `--router-arch` の選択肢。`router` bucket mode でのみ意味を持つ (`bucket_mode
+/// != router` では無視される)。詳細は [`LayerstackArgs::router_arch`] のドキュ
+/// メントを参照。
+///
+/// `Kpabs` が default であり、既存の `--bucket-mode router` の動作 (FT とは
+/// 独立な KP-absolute 線形 router) と完全互換。`clap` の `value_enum` 表示名は
+/// kebab-case 化されるため `ft-by-ft` はそのまま CLI 上の綴りと一致する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum RouterArchArg {
+    #[default]
+    Kpabs,
+    #[value(name = "ft-by-ft")]
+    FtByFt,
+}
+
 /// `--ft-fp16-out` が `--ft-fp16` を要求する制約を **実効値** (`--all-optim` の含意込み)
 /// で検証する。`true` を返したら制約違反 = error (FT activation FP16 が ON だが
 /// FT weight FP16 が OFF)。
@@ -975,6 +999,35 @@ pub(crate) struct LayerstackArgs {
     /// N = `--num-buckets`, same [2, 9] range as progress8kpabs).
     #[arg(long, default_value = "progress8kpabs")]
     pub(crate) bucket_mode: String,
+
+    /// `router` only: selects the Router Architecture (how the bucket
+    /// selection network relates to the eval net's own Feature
+    /// Transformer).
+    ///
+    /// - `kpabs` (default): the original design. The router is a *separate*
+    ///   `progress8kpabs`-shaped linear model over the KP-absolute sparse
+    ///   input (see `RouterKPAbsWeights`), fully independent from the eval
+    ///   net's FT. Behavior, FT dimensions, and serialization are completely
+    ///   unchanged from before `--router-arch` existed; omitting this flag
+    ///   is 100% back-compat.
+    /// - `ft-by-ft`: the router is folded into the eval net's own Feature
+    ///   Transformer. `--num-buckets` must be a perfect square `N = R*R`
+    ///   with `R` even. The FT gains `R` extra activation-*before* outputs
+    ///   per perspective (so its raw per-perspective width becomes
+    ///   `--ft-out + R`), placed so that after the existing
+    ///   CReLU→pairwise-multiply step the `R`-derived combined outputs land
+    ///   contiguously and can be discarded, leaving the eval net's L1 input
+    ///   at exactly `--ft-out` (unchanged). Router bucket probability is
+    ///   `P(i,j) = softmax(s)[i] * softmax(n)[j]` where `s`/`n` are the STM/
+    ///   NSTM raw (pre-activation) router outputs — mathematically the
+    ///   product of two independent softmaxes, equivalent to a joint
+    ///   softmax over the `R*R` `s[i]+n[j]` scores. There is no separate
+    ///   router FT: the router weights live in the same FT weight matrix as
+    ///   the normal eval-net FT columns (see `docs/decisions/` for the
+    ///   exact column layout), and are saved together as a single combined
+    ///   Feature Transformer.
+    #[arg(long = "router-arch", value_enum, default_value_t = RouterArchArg::Kpabs)]
+    pub(crate) router_arch: RouterArchArg,
 
     /// `router` only: how the router's own weights are trained. `hard-em`
     /// (default) fits the router to an oracle target distribution built from

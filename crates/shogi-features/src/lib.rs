@@ -14,6 +14,7 @@ pub mod kingrank9;
 pub mod progress_kpabs;
 pub mod psqt_material;
 pub mod router_kpabs;
+pub mod router_ftbyft;
 mod simd;
 pub mod threat;
 pub mod threat_exclusion;

@@ -39,6 +39,7 @@ mod kernels;
 mod native_bench;
 #[cfg(feature = "cuda-oxide")]
 mod router_gpu;
+mod router_ftbyft;
 #[cfg(feature = "gpu")]
 mod smoke;
 #[cfg(feature = "gpu")]

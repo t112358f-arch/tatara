@@ -89,7 +89,7 @@ pub fn save_yaneuraou<W: Write>(
     router: Option<&RouterKPAbsWeights>,
 ) -> io::Result<()> {
     let arch = architecture(weights)?;
-    validate_weights(&arch, weights)?;
+    validate_weights(&arch, weights, FtOutAlignment::MustBeMultipleOf32)?;
 
     let ft_out = arch.ft_out;
     let l1_out = arch.l1_out;
@@ -145,6 +145,199 @@ pub fn save_yaneuraou<W: Write>(
         router.write_to(writer)?;
     }
     Ok(())
+}
+
+/// `--router-arch ft-by-ft` の保存: 評価net本体の `weights` (L1/L2/L3 は
+/// **nominal** な `ft_out_nominal` で確定済み、`weights.ft_b`/`weights.ft_w`
+/// も *まだ* `ft_out_nominal` 幅のまま) と、別途学習した router 重み
+/// (`router_w`: `(ft_in, r)` row-major、`router_b`: `(r)`) を
+/// [`shogi_features::router_ftbyft::combine_ft_by_ft_columns`] で列方向に
+/// 結合してから、通常の `save_yaneuraou` と同じ byte layout で書き出す。
+///
+/// [`save_yaneuraou`] との違いは次の 2 点のみ:
+/// - FT 重み/bias ブロックは `ft_out_nominal + layout.r` 幅の**物理**結合
+///   FT (`ft_b`/`ft_w` はこの関数が結合するので、呼び出し側は nominal 幅の
+///   ままでよい)。
+/// - `arch_string`/`network_hash`/`ft_hash` は **nominal** な
+///   `ft_out_nominal` を使う (L1 側が実際に受け取る次元、
+///   `kTransformedFeatureDimensions` と一致させる必要があるため) —
+///   YaneuraOu 側は `kAccumulatorDimensions` (= nominal + R) を FT の物理幅
+///   として別途 architecture header から知るので、ファイル内の
+///   `arch_string`/`ft_hash` に物理幅を出す必要はない (`nnue_architecture.h`
+///   / `nnue_arch_gen.py` 参照)。
+/// - edition suffix は `ls<N>`/`k3k3` ではなく `router_ft{R}ft{R}`
+///   (`R = layout.r`) になる — `_router_kpabs_{N}` 側 (既存 `save_yaneuraou`
+///   がそのまま使われる) と違い、ft-by-ft はネットワーク構造自体が変わる
+///   ため専用の edition が必要 (spec.md 8節)。
+///
+/// `weights.psqt_w` が `Some` の場合や `weights.num_buckets != layout.r *
+/// layout.r` の場合はエラーを返す。
+pub fn save_yaneuraou_combined<W: Write>(
+    writer: &mut W,
+    weights: &LayerStackWeights,
+    layout: &shogi_features::router_ftbyft::FtByFtLayout,
+    router_w: &[f32],
+    router_b: &[f32],
+) -> io::Result<()> {
+    if weights.psqt_w.is_some() {
+        return invalid_input("PSQT models are not representable in YaneuraOu SFNN");
+    }
+    if weights.num_buckets != layout.num_buckets {
+        return invalid_input(format!(
+            "weights.num_buckets ({}) does not match layout.num_buckets ({})",
+            weights.num_buckets, layout.num_buckets
+        ));
+    }
+    let ft_out_nominal = weights.ft_b.len();
+    if ft_out_nominal != layout.ft_out {
+        return invalid_input(format!(
+            "weights.ft_b.len() ({ft_out_nominal}) does not match layout.ft_out ({})",
+            layout.ft_out
+        ));
+    }
+    // spec.md 11節: SIMD 幅の整列チェックは `ft_out` 単体ではなく物理 FT 幅
+    // `ft_out + R` (= `layout.accum_out`、`kAccumulatorDimensions` と対応)
+    // に対して行う — `ft_out` 単体がこれを満たす必要はない
+    // (例: ft_out=2296 は 32 の倍数ではないが、R=8 の ft-by-ft では
+    // 2296+8=2304 が 32 の倍数になっていればよい)。
+    if ft_out_nominal == 0 || ft_out_nominal > MAX_FT_OUT {
+        return invalid_input(format!(
+            "unsupported FT output dimension {ft_out_nominal} (expected a positive value up to \
+             {MAX_FT_OUT})"
+        ));
+    }
+    if !layout.accum_out.is_multiple_of(32) {
+        return invalid_input(format!(
+            "unsupported ft-by-ft physical FT width {} = ft_out ({ft_out_nominal}) + R ({}) \
+             (expected a positive multiple of 32, per spec.md 11節 -- pick a --ft-out/\
+             --num-buckets combination whose sum is 32-aligned)",
+            layout.accum_out, layout.r
+        ));
+    }
+
+    let feature_set = FeatureSet::ALL
+        .into_iter()
+        .find(|feature_set| feature_set.spec() == weights.feature_set)
+        .ok_or_else(|| invalid_input_err("feature set is not representable in YaneuraOu SFNN"))?;
+    let ft_in = weights.feature_set.ft_in();
+    if weights.ft_w.len() != ft_in * ft_out_nominal {
+        return invalid_input(format!(
+            "ft_w length mismatch: expected {}, got {}",
+            ft_in * ft_out_nominal,
+            weights.ft_w.len()
+        ));
+    }
+    if router_w.len() != ft_in * layout.r {
+        return invalid_input(format!(
+            "router_w length mismatch: expected {}, got {}",
+            ft_in * layout.r,
+            router_w.len()
+        ));
+    }
+    if router_b.len() != layout.r {
+        return invalid_input(format!(
+            "router_b length mismatch: expected {}, got {}",
+            layout.r,
+            router_b.len()
+        ));
+    }
+
+    let l1_out = weights.l1f_b.len();
+    let l2_out = weights.l2_b.len().checked_div(weights.num_buckets).unwrap_or(0);
+    let l2_in = (l1_out - 1) * 2;
+    validate_weights(
+        &Architecture {
+            feature_set,
+            ft_out: ft_out_nominal,
+            l1_out,
+            l2_out,
+            num_buckets: weights.num_buckets,
+        },
+        weights,
+        FtOutAlignment::CheckedByCaller,
+    )?;
+
+    let (combined_ft_w, combined_ft_b) = shogi_features::router_ftbyft::combine_ft_by_ft_columns(
+        &weights.ft_w,
+        &weights.ft_b,
+        router_w,
+        router_b,
+        ft_in,
+        layout,
+    );
+
+    write_u32(writer, YO_VERSION)?;
+    write_u32(writer, YO_TOP_HASH)?;
+    let arch = Architecture {
+        feature_set,
+        ft_out: ft_out_nominal,
+        l1_out,
+        l2_out,
+        num_buckets: weights.num_buckets,
+    };
+    let arch_string = ft_by_ft_arch_string(&arch, layout.r);
+    write_u32(
+        writer,
+        u32::try_from(arch_string.len()).expect("architecture string length fits in u32"),
+    )?;
+    writer.write_all(arch_string.as_bytes())?;
+
+    write_u32(writer, YO_FT_HASH)?;
+    write_leb128_tensor_i16(writer, &quantize_i16(&combined_ft_b, QA as f64))?;
+    write_leb128_tensor_i16(writer, &quantize_i16(&combined_ft_w, QA as f64))?;
+
+    for bucket in 0..arch.num_buckets {
+        write_u32(writer, YO_NETWORK_HASH)?;
+
+        let l1_biases = (0..l1_out)
+            .map(|output| weights.l1_b[bucket * l1_out + output] + weights.l1f_b[output]);
+        let l1_weights = (0..l1_out).flat_map(|output| {
+            (0..ft_out_nominal).map(move |input| {
+                weights.l1_w[bucket * l1_out * ft_out_nominal + output * ft_out_nominal + input]
+                    + weights.l1f_w[input * l1_out + output]
+            })
+        });
+        write_affine(writer, l1_biases, l1_weights, ft_out_nominal, l1_out)?;
+
+        let l2_biases = (0..l2_out).map(|output| weights.l2_b[bucket * l2_out + output]);
+        let l2_weights = (0..l2_out).flat_map(|output| {
+            (0..l2_in)
+                .map(move |input| weights.l2_w[bucket * l2_out * l2_in + output * l2_in + input])
+        });
+        write_affine(writer, l2_biases, l2_weights, l2_in, l2_out)?;
+
+        write_affine(
+            writer,
+            std::iter::once(weights.l3_b[bucket]),
+            (0..l2_out).map(|input| weights.l3_w[bucket * l2_out + input]),
+            l2_out,
+            1,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// [`save_yaneuraou_combined`] 用の `arch_string`。`layer_stack_suffix`
+/// (`ls<N>`/`k3k3`) の代わりに `router_ft{r}ft{r}` を使う点だけが
+/// [`arch_string`] と異なる (spec.md 8節、`nnue_arch_gen.py` の
+/// `router_ft<R>ft<R>` 検出ロジックと対応させる)。
+fn ft_by_ft_arch_string(arch: &Architecture, r: usize) -> String {
+    let feature = YO_FEATURES
+        .iter()
+        .find(|feature| feature.feature_set == arch.feature_set)
+        .expect("every FeatureSet has a YaneuraOu mapping");
+    let input_size = arch.feature_set.spec().ft_in();
+    let h1 = arch.l1_out - 1;
+    let network = format!(
+        "SFNN_{}_{}_{}_{}_ROUTER_FT{}FT{}",
+        feature.gen_key, arch.ft_out, h1, arch.l2_out, r, r
+    )
+    .to_ascii_uppercase();
+    format!(
+        "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={}}}",
+        feature.yo_name, arch.ft_out, arch.num_buckets
+    )
 }
 
 #[derive(Debug)]
@@ -224,15 +417,47 @@ fn arch_string(arch: &Architecture) -> String {
     )
 }
 
-fn validate_weights(arch: &Architecture, weights: &LayerStackWeights) -> io::Result<()> {
+/// [`validate_weights`] の FT 出力次元アラインメントチェックの挙動。
+enum FtOutAlignment {
+    /// 通常 (`--router-arch kpabs` 含む): `arch.ft_out` 単体が 32 の倍数で
+    /// あることを要求する (物理 FT 幅 == `arch.ft_out` なので当然)。
+    MustBeMultipleOf32,
+    /// `--router-arch ft-by-ft` 用: `arch.ft_out` (nominal) 単体はチェック
+    /// しない。物理 FT 幅 (`ft_out + R`) のアラインメントは呼び出し側
+    /// (`save_yaneuraou_combined`) が既にチェック済み。
+    CheckedByCaller,
+}
+
+fn validate_weights(
+    arch: &Architecture,
+    weights: &LayerStackWeights,
+    ft_out_alignment: FtOutAlignment,
+) -> io::Result<()> {
     if weights.psqt_w.is_some() {
         return invalid_input("PSQT models are not representable in YaneuraOu SFNN");
     }
-    if arch.ft_out == 0 || arch.ft_out > MAX_FT_OUT || !arch.ft_out.is_multiple_of(32) {
-        return invalid_input(format!(
-            "unsupported FT output dimension {} (expected a positive multiple of 32 up to {MAX_FT_OUT})",
-            arch.ft_out
-        ));
+    match ft_out_alignment {
+        FtOutAlignment::MustBeMultipleOf32 => {
+            if arch.ft_out == 0 || arch.ft_out > MAX_FT_OUT || !arch.ft_out.is_multiple_of(32) {
+                return invalid_input(format!(
+                    "unsupported FT output dimension {} (expected a positive multiple of 32 up to {MAX_FT_OUT})",
+                    arch.ft_out
+                ));
+            }
+        }
+        FtOutAlignment::CheckedByCaller => {
+            // `save_yaneuraou_combined` (`--router-arch ft-by-ft`) 用:
+            // `arch.ft_out` (nominal) 単体は 32 の倍数である必要がない
+            // (spec.md 11節 -- 整列が必要なのは物理 FT 幅 `ft_out + R` の方
+            // で、呼び出し側が既にそちらをチェック済み)。ここでは正の値で
+            // 上限内であることだけを確認する。
+            if arch.ft_out == 0 || arch.ft_out > MAX_FT_OUT {
+                return invalid_input(format!(
+                    "unsupported FT output dimension {} (expected a positive value up to {MAX_FT_OUT})",
+                    arch.ft_out
+                ));
+            }
+        }
     }
     if arch.l1_out < 2 || arch.l1_out > MAX_HIDDEN_DIM {
         return invalid_input(format!(
@@ -554,5 +779,63 @@ mod tests {
         assert!(output[11..40].iter().all(|&byte| byte == 0));
         assert_eq!(&output[40..43], &[255, 254, 253]);
         assert!(output[43..72].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn save_yaneuraou_combined_produces_router_ft_arch_string_and_widened_ft_block() {
+        use shogi_features::router_ftbyft::FtByFtLayout;
+
+        // R=2, ft_out(nominal)=32 (multiple of 32, minimal valid case).
+        let ft_out = 32;
+        let num_buckets = 4; // = R*R, R=2
+        let layout = FtByFtLayout::new(num_buckets, ft_out).unwrap();
+        assert_eq!(layout.r, 2);
+        assert_eq!(layout.accum_out, 34);
+
+        let feature_set = FeatureSet::HalfKaHmMerged;
+        let weights =
+            LayerStackWeights::zeroed(feature_set.spec(), ft_out, 16, 32, num_buckets);
+        let ft_in = feature_set.spec().ft_in();
+        let router_w = vec![0.0f32; ft_in * layout.r];
+        let router_b = vec![0.0f32; layout.r];
+
+        let mut out = Vec::new();
+        save_yaneuraou_combined(&mut out, &weights, &layout, &router_w, &router_b).unwrap();
+
+        // header: version, top_hash, arch_string_len, arch_string, ft_hash, ...
+        let arch_len = u32::from_le_bytes(out[8..12].try_into().unwrap()) as usize;
+        let arch_string = std::str::from_utf8(&out[12..12 + arch_len]).unwrap();
+        assert!(
+            arch_string.contains("ROUTER_FT2FT2"),
+            "arch_string should use the ft-by-ft edition suffix: {arch_string}"
+        );
+        // nominal ft_out (32), not the physical combined width (34), must
+        // appear in the arch string (L1-facing dimension).
+        assert!(arch_string.contains("[73305->32x2]"), "{arch_string}");
+
+        // ft_hash marker follows arch_string, then LEB128 ft_b (34 entries)
+        // and ft_w (ft_in * 34 entries) -- just check it doesn't panic and
+        // produced a non-trivial byte stream longer than the un-combined
+        // baseline would need (sanity, not an exact byte match).
+        assert!(out.len() > 12 + arch_len + 4);
+    }
+
+    #[test]
+    fn save_yaneuraou_combined_rejects_bucket_count_mismatch() {
+        use shogi_features::router_ftbyft::FtByFtLayout;
+
+        let ft_out = 32;
+        let layout = FtByFtLayout::new(4, ft_out).unwrap(); // R=2, num_buckets=4
+        let feature_set = FeatureSet::HalfKaHmMerged;
+        // weights built with a DIFFERENT num_buckets (9) than layout (4).
+        let weights = LayerStackWeights::zeroed(feature_set.spec(), ft_out, 16, 32, 9);
+        let ft_in = feature_set.spec().ft_in();
+        let router_w = vec![0.0f32; ft_in * layout.r];
+        let router_b = vec![0.0f32; layout.r];
+
+        let mut out = Vec::new();
+        let err = save_yaneuraou_combined(&mut out, &weights, &layout, &router_w, &router_b)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }

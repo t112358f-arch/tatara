@@ -210,6 +210,33 @@ pub(crate) fn validate_bucket_mode(
     }
 }
 
+/// `--router-arch` の検証。`bucket_mode != Router` では常に `Ok(None)`
+/// (kpabs/ft-by-ft の区別自体が無意味なので `--router-arch` は無視する).
+///
+/// `Kpabs` (default) は `Ok(None)` — 既存パスは本 module に一切依存しない、
+/// 完全従来互換。`FtByFt` は [`crate::router_ftbyft::FtByFtLayout`] を検証・
+/// 構築して返す (`--num-buckets` が平方数でない/ sqrt が奇数 / `--ft-out` が
+/// 奇数、のいずれかであれば分かりやすいエラーで reject する)。
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn validate_router_arch(
+    bucket_mode: BucketMode,
+    router_arch: RouterArchArg,
+    num_buckets: usize,
+    ft_out: usize,
+) -> Result<Option<crate::router_ftbyft::FtByFtLayout>, Box<dyn std::error::Error>> {
+    if !matches!(bucket_mode, BucketMode::Router) {
+        return Ok(None);
+    }
+    match router_arch {
+        RouterArchArg::Kpabs => Ok(None),
+        RouterArchArg::FtByFt => {
+            let layout = crate::router_ftbyft::FtByFtLayout::new(num_buckets, ft_out)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
+            Ok(Some(layout))
+        }
+    }
+}
+
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn validate_output_format(
     output_format: OutputFormatArg,
@@ -484,6 +511,30 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     let bucket_mode = validate_bucket_mode(layerstack)?;
     validate_output_format(cli.output_format, bucket_mode)?;
+    let ft_by_ft_layout = validate_router_arch(
+        bucket_mode,
+        layerstack.router_arch,
+        layerstack.num_buckets,
+        layerstack.ft_out,
+    )?;
+    if let Some(layout) = ft_by_ft_layout {
+        println!(
+            "[train] router-arch=ft-by-ft: R={}, per-perspective accumulator {} -> {} \
+             (ft-out={} unchanged for the eval net; +{} router outputs, split {}+{} around the \
+             pairwise-multiply midpoint). The router is trained as a SEPARATE (ft_in, R) weight \
+             matrix over the SAME sparse input as the eval net's own FT (see \
+             `shogi_features::router_ftbyft`); it is combined into a single physical FT only at \
+             save time (spec.md 16 節: \"1つのftにまとめる...のはyaneuraouでの推論高速化のための \
+             仕様なので、tataraでは...保存する段階で結合する仕様にしてもよい\").",
+            layout.r,
+            layout.ft_out,
+            layout.accum_out,
+            layout.ft_out,
+            layout.r,
+            layout.half_router,
+            layout.half_router,
+        );
+    }
     // per-group override flags は wd / lr_mult とも (指定時) finite かつ >= 0。lr_mult=0
     // はその group の radam 更新を無効化する opt-in (clamp と norm loss apply は lr_mult
     // 非依存に掛かる)、bias wd=0 と同様に許容する。
@@ -515,12 +566,37 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let fv_scale = layerstack_export_fv_scale(layerstack.fv_scale, loss, cli.scale);
     // FT 出力次元は backward の gather kernel が grid を `ft_out / 128` で launch する
     // ため 128 の倍数でなければ末尾行の勾配が計算されない。
-    if layerstack.ft_out == 0 || !layerstack.ft_out.is_multiple_of(128) {
-        return Err(format!(
-            "--ft-out must be a positive multiple of 128 (got {})",
-            layerstack.ft_out
-        )
-        .into());
+    //
+    // `--router-arch ft-by-ft` では、この 128 の倍数チェックは `--ft-out`
+    // 単体ではなく `--ft-out + R` (`R = sqrt(--num-buckets)`、
+    // `FtByFtLayout::accum_out`) に対して行う (spec.md 11節と同じ考え方 —
+    // 「FT 全体の activation 前 output 数 = ft_out + R」が本来アラインメン
+    // トを気にすべき幅であり、`--ft-out` 単体はその一部でしかない)。学習中
+    // 自体は評価net本体の FT (幅 `--ft-out` のまま) と router (別の
+    // `(ft_in, R)` 行列) を分離して扱う (`docs/decisions/router-ft-by-ft.md`
+    // 3節) が、この検証は「保存時に結合してできる最終的なアーキテクチャ」
+    // が壊れていないかを学習開始前に (fail fast で) 確認するためのもの。
+    let ft_out_alignment_target = ft_by_ft_layout.map(|l| l.accum_out).unwrap_or(layerstack.ft_out);
+    if ft_out_alignment_target == 0 || !ft_out_alignment_target.is_multiple_of(128) {
+        return match ft_by_ft_layout {
+            Some(layout) => Err(format!(
+                "--ft-out + R must be a positive multiple of 128 for --router-arch ft-by-ft \
+                 (--ft-out={}, R=sqrt(--num-buckets={})={}, --ft-out + R = {}, which is not a \
+                 multiple of 128); pick a --ft-out/--num-buckets combination whose sum is \
+                 128-aligned (e.g. --ft-out=2304 with the same --num-buckets, or --ft-out=2296 \
+                 with --num-buckets=64 (R=8, 2296+8=2304))",
+                layerstack.ft_out,
+                layout.num_buckets,
+                layout.r,
+                layout.accum_out,
+            )
+            .into()),
+            None => Err(format!(
+                "--ft-out must be a positive multiple of 128 (got {})",
+                layerstack.ft_out
+            )
+            .into()),
+        };
     }
     // L1 出力次元は skip 1 dim を除いた残りが L2 入力になるので、`l1_effective >= 1`
     // (= `l1_out >= 2`) を要求する。上限 256 は bias backward kernel の shared-mem
@@ -566,12 +642,76 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
 
     // router: process-global の router (progress8kpabs と同じ線形層を
     // N 出力 (N = `--num-buckets`) にしたもの) を用意する。`--router-resume`
-    // 指定時はそのファイル (重み + Adam state) から復元、未指定ならランダム
-    // 初期化する ("MoE のように、ランダム化されたバケット選択ネットワークから
-    // 始める")。`--resume` (main net の raw checkpoint) とは独立: router state
-    // は本 crate の process-global で、main net の raw checkpoint format には
-    // 同居しない。
+    // router: process-global の router を用意する。`--router-arch kpabs`
+    // (default) では従来通り progress8kpabs 形状の線形 N-way router
+    // (`RouterKPAbs`)。`--router-arch ft-by-ft` では、評価net本体の FT と
+    // 同じ sparse 入力上の別の `(ft_in, R)` 重み行列 (`RouterFtByFt`) —
+    // 学習中は両者が完全に独立 (spec.md 16節)、保存時にのみ結合する
+    // (`combine_ft_by_ft_columns`、`net_to_yo` / `save_yaneuraou_combined`)。
+    // `--router-resume` 指定時はそのファイル (重み + Adam state) から復元、
+    // 未指定ならランダム初期化する。`--resume` (main net の raw checkpoint)
+    // とは独立: router state は本 crate の process-global で、main net の
+    // raw checkpoint format には同居しない。
     let router_training_cfg = if matches!(bucket_mode, BucketMode::Router) {
+        match layerstack.router_arch {
+            RouterArchArg::FtByFt => {
+                let layout = ft_by_ft_layout
+                    .expect("validate_router_arch already computed the layout for ft-by-ft");
+                let ft_in = feature_set.ft_in();
+                match &layerstack.router_resume {
+                    Some(p) => {
+                        println!(
+                            "[train] resuming ft-by-ft router weights + Adam state: {}",
+                            p.display()
+                        );
+                        return Err(format!(
+                            "--router-resume is not yet implemented for --router-arch ft-by-ft \
+                             (path given: {}); omit --router-resume to start from a random init",
+                            p.display()
+                        )
+                        .into());
+                    }
+                    None => {
+                        println!(
+                            "[train] router (ft-by-ft): random init, (ft_in={ft_in}, R={}) weight \
+                             matrix over the SAME sparse input as the eval net's FT",
+                            layout.r
+                        );
+                        let seed = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0x1234_5678_9abc_def0);
+                        shogi_features::router_ftbyft::RouterFtByFt::init_random(
+                            ft_in, layout.r, seed,
+                        )
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    }
+                }
+                if layerstack.router_mode == RouterModeArg::Backprop {
+                    return Err(
+                        "--router-mode backprop is not yet implemented for --router-arch \
+                         ft-by-ft (only hard-em's oracle-target M step is wired up); use \
+                         --router-mode hard-em (the default) or --router-arch kpabs"
+                            .into(),
+                    );
+                }
+                validate_router_top_k(layerstack.num_buckets, layerstack.top_k, layerstack.top_k_min)?;
+                Some(RouterTrainingConfig {
+                    arch: shogi_features::router_ftbyft::RouterArch::FtByFt,
+                    lr: layerstack.router_lr as f64,
+                    weight_decay: layerstack.router_weight_decay as f64,
+                    balance_weight: layerstack.router_balance_weight as f64,
+                    mode: layerstack.router_mode.into(),
+                    refresh_interval: layerstack.router_refresh_interval.max(1),
+                    lr_gamma: layerstack.router_lr_gamma as f64,
+                    balance_weight_gamma: layerstack.router_balance_weight_gamma as f64,
+                    balance_weight_min: layerstack.router_balance_weight_min as f64,
+                    top_k: layerstack.top_k,
+                    top_k_reduction_interval: layerstack.top_k_reduction_interval,
+                    top_k_min: layerstack.top_k_min,
+                })
+            }
+            RouterArchArg::Kpabs => {
         match &layerstack.router_resume {
             Some(p) => {
                 println!("[train] resuming router weights + Adam state: {}", p.display());
@@ -621,6 +761,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             );
         }
         Some(RouterTrainingConfig {
+            arch: shogi_features::router_ftbyft::RouterArch::Kpabs,
             lr: layerstack.router_lr as f64,
             weight_decay: layerstack.router_weight_decay as f64,
             balance_weight: layerstack.router_balance_weight as f64,
@@ -633,6 +774,8 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             top_k_reduction_interval: layerstack.top_k_reduction_interval,
             top_k_min: layerstack.top_k_min,
         })
+            }
+        }
     } else {
         None
     };

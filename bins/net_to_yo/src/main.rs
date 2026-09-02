@@ -4,9 +4,10 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use nnue_format::layerstack_weights::{LEGACY_NNUE_VERSION_BUCKETS9, NNUE_VERSION};
-use nnue_format::{LayerStackWeights, save_yaneuraou};
+use nnue_format::{LayerStackWeights, save_yaneuraou, save_yaneuraou_combined};
 use shogi_features::FeatureSet;
 use shogi_features::router_kpabs::RouterKPAbsWeights;
+use shogi_features::router_ftbyft::{FtByFtLayout, RouterFtByFtWeights};
 
 /// legacy (`LEGACY_NNUE_VERSION_BUCKETS9`) tatara `.bin` の暗黙 bucket 数。
 /// 現行 version の入力は header の `num_buckets` field から読む (9 に限らない
@@ -61,6 +62,21 @@ struct Args {
     /// their `*.router.ckpt` sidecar forward through `net_to_yo` explicitly.
     #[arg(long)]
     router: Option<PathBuf>,
+    /// Embed a `--router-arch ft-by-ft` router into the output as a
+    /// **combined single FT** (spec.md 9/16節): the router weights are
+    /// merged into the eval net's own Feature Transformer at this point
+    /// (not before -- training keeps them separate, see
+    /// `shogi_features::router_ftbyft` module docs). Accepts a
+    /// `RouterFtByFtWeights::write_to` weights-only file or a
+    /// `{net_id}-{sb}.router-ftbyft.ckpt` sidecar (weights + Adam state;
+    /// trailing optimizer bytes are ignored). Mutually exclusive with
+    /// `--assume-kingrank9` and `--router` (this *is* the routing network
+    /// for a fundamentally different, wider-FT architecture -- see
+    /// `docs/decisions/router-ft-by-ft.md`). The output's edition name
+    /// becomes `_router_ft{R}ft{R}` (R = sqrt(--num-buckets) recorded in
+    /// the input `.bin`), not `_ls<N>`/`_k3k3`.
+    #[arg(long)]
+    router_ft_by_ft: Option<PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -68,10 +84,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.input == args.output {
         return Err("input and output must be different paths".into());
     }
-    if args.assume_kingrank9 && args.router.is_some() {
-        return Err("--assume-kingrank9 and --router are mutually exclusive (pick one bucket routing mode)".into());
+    let modes_given = [args.assume_kingrank9, args.router.is_some(), args.router_ft_by_ft.is_some()]
+        .iter()
+        .filter(|&&b| b)
+        .count();
+    if modes_given > 1 {
+        return Err(
+            "--assume-kingrank9, --router, and --router-ft-by-ft are mutually exclusive (pick \
+             one bucket routing mode)"
+                .into(),
+        );
     }
-    require_routing_assertion(args.assume_kingrank9, args.router.is_some())?;
+    require_routing_assertion(
+        args.assume_kingrank9,
+        args.router.is_some() || args.router_ft_by_ft.is_some(),
+    )?;
     let router = args
         .router
         .as_ref()
@@ -83,9 +110,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| -> Box<dyn std::error::Error> {
             format!("failed to load --router {}: {e}", args.router.as_ref().unwrap().display()).into()
         })?;
+    let router_ft_by_ft = args
+        .router_ft_by_ft
+        .as_ref()
+        .map(|p| -> io::Result<RouterFtByFtWeights> {
+            let mut f = File::open(p)?;
+            RouterFtByFtWeights::read_from(&mut f)
+        })
+        .transpose()
+        .map_err(|e| -> Box<dyn std::error::Error> {
+            format!(
+                "failed to load --router-ft-by-ft {}: {e}",
+                args.router_ft_by_ft.as_ref().unwrap().display()
+            )
+            .into()
+        })?;
 
     let detect_input = File::open(&args.input)?;
     let arch = detect_arch(&mut BufReader::new(detect_input))?;
+    // FT 出力次元の SIMD 幅アラインメントチェック (spec.md 11節): 通常/kpabs
+    // は `ft_out` 単体が 32 の倍数であることを要求するが、`--router-ft-by-ft`
+    // では物理 FT 幅 `ft_out + R` (`R = sqrt(--num-buckets)`) の方をチェッ
+    // クする (`ft_out` 単体はチェックしない -- 2296 のように 32 の倍数で
+    // なくても、`+R` 後に 32 の倍数になっていればよい)。
+    if let Some(_router_ft_by_ft_path) = args.router_ft_by_ft.as_ref() {
+        let layout = FtByFtLayout::new(arch.num_buckets, arch.ft_out).map_err(
+            |e| -> Box<dyn std::error::Error> {
+                format!(
+                    "input .bin's (--num-buckets={}, ft-out={}) is not a valid ft-by-ft \
+                     configuration: {e}",
+                    arch.num_buckets, arch.ft_out
+                )
+                .into()
+            },
+        )?;
+        if layout.accum_out == 0 || layout.accum_out > MAX_FT_OUT || !layout.accum_out.is_multiple_of(32) {
+            return Err(format!(
+                "unsupported ft-by-ft physical FT width {} = ft_out ({}) + R ({}) (expected a \
+                 positive multiple of 32 up to {MAX_FT_OUT}, per spec.md 11節)",
+                layout.accum_out, arch.ft_out, layout.r
+            )
+            .into());
+        }
+    } else if arch.ft_out == 0 || arch.ft_out > MAX_FT_OUT || !arch.ft_out.is_multiple_of(32) {
+        return Err(format!(
+            "unsupported FT output dimension {} (expected a positive multiple of 32 up to {MAX_FT_OUT})",
+            arch.ft_out
+        )
+        .into());
+    }
 
     let input = File::open(&args.input)?;
     let mut reader = BufReader::new(input);
@@ -101,7 +174,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let output = File::create(&args.output)?;
     let mut writer = BufWriter::new(output);
-    save_yaneuraou(&mut writer, &weights, router.as_ref())?;
+    if let Some(router_ftbyft_weights) = router_ft_by_ft {
+        let layout = FtByFtLayout::new(arch.num_buckets, arch.ft_out).map_err(
+            |e| -> Box<dyn std::error::Error> {
+                format!(
+                    "input .bin's (--num-buckets={}, ft-out={}) is not a valid ft-by-ft \
+                     configuration: {e}",
+                    arch.num_buckets, arch.ft_out
+                )
+                .into()
+            },
+        )?;
+        if router_ftbyft_weights.r() != layout.r {
+            return Err(format!(
+                "--router-ft-by-ft weights have R={} but the input .bin implies R={} \
+                 (sqrt(--num-buckets={}))",
+                router_ftbyft_weights.r(),
+                layout.r,
+                arch.num_buckets
+            )
+            .into());
+        }
+        if router_ftbyft_weights.ft_in() != arch.feature_set.spec().ft_in() {
+            return Err(format!(
+                "--router-ft-by-ft weights have ft_in={} but the input .bin's feature set has \
+                 ft_in={}",
+                router_ftbyft_weights.ft_in(),
+                arch.feature_set.spec().ft_in()
+            )
+            .into());
+        }
+        let (router_w, router_b) = router_ftbyft_weights.to_f32();
+        save_yaneuraou_combined(&mut writer, &weights, &layout, &router_w, &router_b)?;
+    } else {
+        save_yaneuraou(&mut writer, &weights, router.as_ref())?;
+    }
     writer.flush()?;
     Ok(())
 }
@@ -109,7 +216,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn require_routing_assertion(assume_kingrank9: bool, has_router: bool) -> io::Result<()> {
     if !assume_kingrank9 && !has_router {
         return invalid_input(
-            "tatara .bin files do not record bucket routing; pass --assume-kingrank9 only after confirming the net was trained with --bucket-mode kingrank9, or pass --router <path> for a net trained with --bucket-mode router",
+            "tatara .bin files do not record bucket routing; pass --assume-kingrank9 only after confirming the net was trained with --bucket-mode kingrank9, or --router <path> (--router-arch kpabs) / --router-ft-by-ft <path> (--router-arch ft-by-ft) for a net trained with --bucket-mode router",
         );
     }
     Ok(())
@@ -180,10 +287,13 @@ fn parse_arch_str(arch_str: &str) -> io::Result<DetectedArch> {
     let ft_out = between(arch_str, "->", "x2")
         .ok_or_else(|| invalid_input_err("arch string has no `-><ft>x2` token".to_string()))
         .and_then(parse_usize)?;
-    // YaneuraOu は kTransformedFeatureDimensions % kMaxSimdWidth(32) == 0 を要求する。
-    if ft_out == 0 || ft_out > MAX_FT_OUT || ft_out % 32 != 0 {
+    // 32 の倍数チェックは `detect_arch` の呼び出し元 (`main`) で行う —
+    // `--router-ft-by-ft` のときは `ft_out` 単体ではなく `ft_out + R` に対
+    // して行う必要があり (spec.md 11節)、`R` は `num_buckets` (この関数の
+    // 外側で読まれる) から決まるため、ここでは範囲チェックだけに留める。
+    if ft_out == 0 || ft_out > MAX_FT_OUT {
         return invalid_input(format!(
-            "unsupported FT output dimension {ft_out} (expected a positive multiple of 32 up to {MAX_FT_OUT})"
+            "unsupported FT output dimension {ft_out} (expected a positive value up to {MAX_FT_OUT})"
         ));
     }
 

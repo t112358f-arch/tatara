@@ -62,6 +62,9 @@ use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::router_kpabs::{RouterAdamState, RouterKPAbs, RouterMode};
+use shogi_features::router_ftbyft::{
+    RouterArch, RouterFtByFt, RouterFtByFtAdamState,
+};
 
 use crate::dataloader::{Batch, BucketMode, BucketedPrefetchedLoader, PSV_RECORD_BYTES};
 use crate::experiment::{ExperimentLogger, RouterHistoryEntry};
@@ -478,6 +481,13 @@ pub enum OutputFormat {
 /// 初期化は呼び出し側の責務)。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RouterTrainingConfig {
+    /// `--router-arch`。`Kpabs` (default) では本 struct の意味・挙動は
+    /// `--router-arch` 追加前と完全に同じ。`FtByFt` では M step が
+    /// [`shogi_features::router_ftbyft::RouterFtByFt`] (評価net本体の FT と
+    /// 同じ sparse 入力上の別の重み行列) を使う。`balance_weight` /
+    /// [`RouterMode::Backprop`] は現状 `FtByFt` では未サポート (`run()` が
+    /// 検証、`docs/decisions/router-ft-by-ft.md` 参照) — `HardEm` のみ対応。
+    pub arch: RouterArch,
     /// router Adam の learning rate (`--router-lr`)。`RouterKPAbsWeights` は
     /// `progress.bin` と同じ f64 精度で持つため、この学習率も f64。
     pub lr: f64,
@@ -1017,11 +1027,26 @@ where
     // (`router_adam = None`)。`RouterKPAbs` の重み自体は process-global なので
     // 呼び出し前に `init_random` / `init_with_weights` / `load_full` 済であること
     // (`run()` 自身はランダム初期化しない)。
-    let mut router_adam: Option<RouterAdamState> = if resolved_bucket_mode == BucketMode::Router {
+    let mut router_adam: Option<RouterAdamState> = if resolved_bucket_mode == BucketMode::Router
+        && matches!(cfg.router.map(|rc| rc.arch), Some(RouterArch::Kpabs))
+    {
         Some(RouterAdamState::zeros(cfg.num_buckets))
     } else {
         None
     };
+    // `--router-arch ft-by-ft` の Adam state。`RouterFtByFtWeights` は
+    // process-global (`RouterFtByFt`、`training.rs` が学習開始前に
+    // `init_random` 済) だが、Adam の m/v/t は `RouterAdamState` と同じ理由で
+    // 呼び出し側 (この `run()`) が持ち回る (checkpoint 保存用)。
+    let mut router_ftbyft_adam: Option<RouterFtByFtAdamState> =
+        if resolved_bucket_mode == BucketMode::Router
+            && matches!(cfg.router.map(|rc| rc.arch), Some(RouterArch::FtByFt))
+        {
+            let snapshot = RouterFtByFt::snapshot();
+            Some(RouterFtByFtAdamState::zeros(snapshot.ft_in(), snapshot.r()))
+        } else {
+            None
+        };
     // `RouterTrainingConfig::lr` / `balance_weight` / `top_k` の実効値。1
     // superbatch 終える度に減衰・anneal させる (`--router-lr-gamma` /
     // `--router-balance-weight-gamma` / `--top-k-reduction-interval`)。
@@ -1043,6 +1068,10 @@ where
     // なかった batch では前回の値がそのまま残る (= その sb 最後の refresh 時点の
     // スナップショット)。
     let mut last_router_stats: Option<shogi_features::router_kpabs::RouterTrainStats> = None;
+    // `--router-arch ft-by-ft` の診断情報 (直近の M step の統計)。
+    let mut last_router_ftbyft_stats: Option<
+        shogi_features::router_ftbyft::RouterFtByFtTrainStats,
+    > = None;
 
     // sb 内 batch 進捗 print の頻度 (env var で可変、`0` で disable)。stderr が
     // TTY なら `\r` で同 line を上書き、それ以外 (pipe / `tee` ファイル等) なら
@@ -1103,6 +1132,7 @@ where
             // 従来通り CPU (`RouterKPAbs::train_oracle_batch`/`train_backprop_batch`)
             // に fall back する。
             if let (Some(rc), Some(adam)) = (cfg.router, router_adam.as_mut())
+                && matches!(rc.arch, RouterArch::Kpabs)
                 && batch_idx % rc.refresh_interval.max(1) == 0
             {
                 let pred_scale = oracle_pred_scale(cfg.loss);
@@ -1191,6 +1221,71 @@ where
                     },
                 };
                 last_router_stats = Some(stats);
+            }
+
+            // `--router-arch ft-by-ft`: 評価net本体の FT と同じ sparse 入力
+            // (`batch.stm_indices`/`nstm_indices`) 上で、独立な `(ft_in, R)`
+            // 重み行列を CPU 上で学習する (kpabs の `router_indices` は使わ
+            // ない)。E step (oracle sweep で N=`cfg.num_buckets` 個の bucket
+            // 誤差を求める部分) は kpabs と全く同じロジック — bucket の
+            // "意味" に依存しないため丸ごと再利用できる。M step だけが
+            // 異なる (`RouterFtByFtWeights::train_oracle_batch`、
+            // `shogi_features::router_ftbyft::loss::soft_target_grad` による
+            // STM/NSTM 独立 softmax cross entropy)。
+            if let (Some(rc), Some(adam)) = (cfg.router, router_ftbyft_adam.as_mut())
+                && matches!(rc.arch, RouterArch::FtByFt)
+                && batch_idx % rc.refresh_interval.max(1) == 0
+            {
+                let pred_scale = oracle_pred_scale(cfg.loss);
+                let target_scale = oracle_target_scale(cfg.loss);
+                let mut errs: Vec<Vec<f64>> = Vec::with_capacity(cfg.num_buckets);
+                for k in 0..cfg.num_buckets {
+                    let k_buckets = vec![k as i32; n_pos];
+                    let out = if k == 0 {
+                        backend.validate_step(&batch, &k_buckets, wdl, cfg.loss)?
+                    } else {
+                        backend.validate_step_reuse_ft(&batch, &k_buckets, wdl, cfg.loss)?
+                    };
+                    let mut err_k = Vec::with_capacity(n_pos);
+                    for i in 0..n_pos {
+                        let pred = sigmoid(out.net_output[i] * pred_scale);
+                        let target =
+                            wdl * batch.wdl[i] + (1.0 - wdl) * sigmoid(batch.score[i] * target_scale);
+                        err_k.push(((pred - target) * (pred - target)) as f64);
+                    }
+                    errs.push(err_k);
+                }
+                let errs_by_position: Vec<Vec<f64>> = (0..n_pos)
+                    .map(|i| (0..cfg.num_buckets).map(|k| errs[k][i]).collect())
+                    .collect();
+                // `oracle_targets_from_errors` は N (= R*R) 個の候補に対する
+                // top-k soft-EM ターゲット分布を作るだけの汎用ロジックで、
+                // bucket の "意味" (kpabs の N-way router か、ft-by-ft の
+                // R x R グリッドか) に依存しない — kpabs と共用できる。
+                let oracle_targets: Vec<Vec<f64>> = errs_by_position
+                    .iter()
+                    .map(|errs_i| {
+                        shogi_features::router_kpabs::oracle_targets_from_errors(
+                            errs_i,
+                            current_top_k,
+                        )
+                    })
+                    .collect();
+                let stats = RouterFtByFt::snapshot();
+                let mut weights = stats;
+                let batch_stats = weights.train_oracle_batch(
+                    &batch.stm_indices,
+                    &batch.nstm_indices,
+                    batch.max_active,
+                    n_pos,
+                    &oracle_targets,
+                    adam,
+                    current_router_lr,
+                    rc.weight_decay,
+                    current_router_balance_weight,
+                );
+                RouterFtByFt::overwrite_weights(weights.w().to_vec(), weights.b().to_vec());
+                last_router_ftbyft_stats = Some(batch_stats);
             }
 
             let loss = backend.train_step(&batch, &buckets, lr, wdl, cfg.loss)?;
@@ -1331,6 +1426,27 @@ where
             );
         }
 
+        if let Some(stats) = last_router_ftbyft_stats.as_ref() {
+            let usage_stm = stats
+                .bucket_usage_stm
+                .iter()
+                .map(|u| format!("{:.2}", u))
+                .collect::<Vec<_>>()
+                .join(",");
+            let usage_nstm = stats
+                .bucket_usage_nstm
+                .iter()
+                .map(|u| format!("{:.2}", u))
+                .collect::<Vec<_>>()
+                .join(",");
+            eprintln!(
+                "[router] sb={sb} loss={:.4} balance_loss={:.4} arch=ft-by-ft mode=hard-em \
+                 top_k={current_top_k} usage_stm=[{usage_stm}] usage_nstm=[{usage_nstm}]",
+                stats.cross_entropy_loss,
+                stats.balance_loss,
+            );
+        }
+
         if cfg.monitor_fp16_clamps {
             // dft FP16 書き込みで `±65504` cap が当たった要素数 (累積) と処理要素数
             // (累積) を device から読み、当 sb の delta + ratio を出す。`--ft-fp16-out`
@@ -1407,6 +1523,51 @@ where
                     println!("[train] router checkpoint saved: {}", router_path.display());
                 }
             }
+            // `--router-arch ft-by-ft`: 重み + Adam state を sidecar file に
+            // 保存する (kpabs と同じ役割だが、独自フォーマット;
+            // `--router-resume` からの読み戻しは未実装 — `training.rs` が
+            // `--router-arch ft-by-ft --router-resume` を明示的に reject する)。
+            if let Some(adam) = router_ftbyft_adam.as_ref() {
+                let weights = RouterFtByFt::snapshot();
+                let router_path = cfg
+                    .output_dir
+                    .join(format!("{}-{}.router-ftbyft.ckpt", cfg.net_id, sb));
+                match std::fs::File::create(&router_path) {
+                    Ok(mut f) => {
+                        let write_result = (|| -> io::Result<()> {
+                            weights.write_to(&mut f)?;
+                            f.write_all(&adam.t.to_le_bytes())?;
+                            for &v in &adam.m_w {
+                                f.write_all(&v.to_le_bytes())?;
+                            }
+                            for &v in &adam.v_w {
+                                f.write_all(&v.to_le_bytes())?;
+                            }
+                            for &v in &adam.m_b {
+                                f.write_all(&v.to_le_bytes())?;
+                            }
+                            for &v in &adam.v_b {
+                                f.write_all(&v.to_le_bytes())?;
+                            }
+                            Ok(())
+                        })();
+                        match write_result {
+                            Ok(()) => println!(
+                                "[train] router (ft-by-ft) checkpoint saved: {}",
+                                router_path.display()
+                            ),
+                            Err(e) => eprintln!(
+                                "[train] warning: failed to save ft-by-ft router checkpoint {}: {e}",
+                                router_path.display()
+                            ),
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[train] warning: failed to create ft-by-ft router checkpoint {}: {e}",
+                        router_path.display()
+                    ),
+                }
+            }
         }
 
         // superbatch の処理 (checkpoint 保存を含む) をすべて終えてから
@@ -1430,6 +1591,22 @@ where
                     ce_loss: stats.cross_entropy_loss,
                     balance_loss: stats.balance_loss,
                     usage: stats.bucket_usage.clone(),
+                    lr: current_router_lr,
+                    balance_weight: current_router_balance_weight,
+                });
+            }
+            if let Some(stats) = last_router_ftbyft_stats.as_ref() {
+                // `--router-arch ft-by-ft` も kpabs と全く同じ
+                // `RouterHistoryEntry` (`experiment.json` の `router_history`)
+                // に記録する。`usage` は STM/NSTM の独立性を仮定しない実測の
+                // joint 分布 (`RouterFtByFtTrainStats::joint_bucket_usage`、
+                // 長さ `num_buckets = R*R` — kpabs の `bucket_usage` と同じ
+                // 形) を使う。
+                log.record_router(RouterHistoryEntry {
+                    superbatch: sb,
+                    ce_loss: stats.cross_entropy_loss,
+                    balance_loss: stats.balance_loss,
+                    usage: stats.joint_bucket_usage.clone(),
                     lr: current_router_lr,
                     balance_weight: current_router_balance_weight,
                 });
@@ -2817,6 +2994,7 @@ mod tests {
 
     fn sample_router_cfg() -> RouterTrainingConfig {
         RouterTrainingConfig {
+            arch: RouterArch::Kpabs,
             lr: 1.0,
             weight_decay: 0.0,
             balance_weight: 1.0,
