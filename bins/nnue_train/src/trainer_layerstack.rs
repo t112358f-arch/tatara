@@ -280,7 +280,8 @@ pub(crate) struct GpuTrainer {
     /// `--bucket-mode router` の GPU-resident 学習 state
     /// (`bins/nnue_train::router_gpu::RouterGpuState`)。`cuda-oxide` backend
     /// のみ (router 用 GPU kernel は `native-cuda` の `.cu` 側に未実装)。
-    /// `bucket_mode != BucketMode::Router` では常に `None`。`Router` でも、
+    /// `--bucket-mode` にrouter成分 (`routerkpabs<N>`) が無ければ常に `None`。
+    /// あっても、
     /// `TrainerBackend::router_train_oracle_batch`/`router_train_backprop_batch`
     /// の初回呼び出しまでは `None` (`ctx`/`stream`/`module` を保持していない
     /// `GpuTrainer::new` 時点では作らず、初回呼出時に process-global
@@ -494,10 +495,7 @@ impl GpuWorkspace {
         tf32: bool,
         feature_set: FeatureSetSpec,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        assert!(
-            (1..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
-            "GpuWorkspace requires num_buckets in [1, {MAX_SUPPORTED_NUM_BUCKETS}]"
-        );
+        assert!(num_buckets >= 1, "GpuWorkspace requires num_buckets >= 1");
         let ft_in = feature_set.ft_in();
         let max_active = feature_set.max_active();
         // L1 出力のうち skip 1 dim を除いた main 次元と、その平方 + main を連結した
@@ -792,10 +790,7 @@ impl GpuTrainer {
         psqt_init: Option<&[f32]>,
         init_spec: &LayerStackInit,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        assert!(
-            (2..=MAX_SUPPORTED_NUM_BUCKETS).contains(&num_buckets),
-            "GpuTrainer requires num_buckets in [2, {MAX_SUPPORTED_NUM_BUCKETS}]"
-        );
+        assert!(num_buckets >= 2, "GpuTrainer requires num_buckets >= 2");
         // `precision.ft_fp16_out` は `precision.ft_fp16` を必要とする。CLI validation は
         // 無効な組み合わせを拒否するが、smoke/test は constructor を直接呼べるため、ここでも検査する。
         if precision.ft_fp16_out && !precision.ft_fp16 {
@@ -1409,13 +1404,14 @@ impl GpuTrainer {
         let topo5 =
             layerstack_topology_with_psqt(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
         let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
+        let bucket_mode_name = self.bucket_mode.canonical_token();
         save_raw_checkpoint_file(
             path,
             &self.stream,
             &RawCkptArch {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
-                bucket_mode: Some(self.bucket_mode.canonical_name()),
+                bucket_mode: Some(&bucket_mode_name),
                 ft_out: ft_out as u64,
                 topology,
             },
@@ -1454,6 +1450,7 @@ impl GpuTrainer {
         let topo5 =
             layerstack_topology_with_psqt(ft_out, self.ws.l1_out, self.ws.l2_out, self.num_buckets);
         let topology: &[u64] = if self.psqt.is_some() { &topo5 } else { &topo4 };
+        let bucket_mode_name = self.bucket_mode.canonical_token();
         let expected_groups: Vec<(&'static str, usize)> = self
             .raw_ckpt_group_sources()
             .iter()
@@ -1464,7 +1461,7 @@ impl GpuTrainer {
             &RawCkptArch {
                 feature_set: self.feature_set,
                 arch_kind: ArchKind::LayerStack,
-                bucket_mode: Some(self.bucket_mode.canonical_name()),
+                bucket_mode: Some(&bucket_mode_name),
                 ft_out: ft_out as u64,
                 topology,
             },
@@ -4218,6 +4215,18 @@ impl GpuTrainer {
 // (`shogi_features::router_kpabs::RouterKPAbs::train_oracle_batch` /
 // `train_backprop_batch`) にそのまま fall back する。
 // ===========================================================================
+
+impl GpuTrainer {
+    /// `trainer_backend_impl!` マクロの `save_checkpoint` から呼ばれる
+    /// (マクロの `expr` フラグメントとして直接 `self.bucket_mode` を渡すと
+    /// hygiene の関係でマクロ呼び出し site (impl の外、`self` が無い場所) の
+    /// スコープで名前解決されてしまい `self` が見えないので、メソッド呼び出し
+    /// にして回避している)。`cuda-oxide` の有無に関わらず常に使えるよう、
+    /// router GPU hook (`cuda-oxide` feature 限定) とは別の impl block に置く。
+    fn save_bucket_mode(&self) -> nnue_train::dataloader::BucketMode {
+        self.bucket_mode
+    }
+}
 
 #[cfg(feature = "cuda-oxide")]
 impl GpuTrainer {

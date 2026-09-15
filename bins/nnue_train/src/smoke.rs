@@ -422,7 +422,10 @@ pub(crate) fn smoke_test(arch_kind: ArchKind) -> Result<(), Box<dyn std::error::
         DEFAULT_L1_OUT,
         DEFAULT_L2_OUT,
         DEFAULT_NUM_BUCKETS,
-        nnue_train::dataloader::BucketMode::Progress8KpAbs,
+        nnue_train::dataloader::BucketMode {
+            king: Some(shogi_features::bucket_mode::KingSubMode::K3K3),
+            ..nnue_train::dataloader::BucketMode::NONE
+        },
         PrecisionFlags::default(),
         feature_set,
         OptimizerKind::Ranger,

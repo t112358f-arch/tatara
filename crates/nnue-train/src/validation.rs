@@ -188,7 +188,7 @@ impl HeldoutSet {
             }
             let pushed = cur.push_decoded(&board)?;
             debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
-            cur_buckets.push(i32::from(bucket_mode.bucket_board(&board, num_buckets)));
+            cur_buckets.push(crate::dataloader::bucket_board(bucket_mode, &board, None) as i32);
             if cur.n_positions == batch_size {
                 let full =
                     std::mem::replace(&mut cur, Batch::with_capacity(batch_size, feature_set));
@@ -297,6 +297,14 @@ mod tests {
         FeatureSet::HalfKaHmMerged.spec()
     }
 
+    /// 旧 `BucketMode::KingRank9` 相当 (k3k3 のみの複合バケット)。
+    fn k3k3_bucket_mode() -> BucketMode {
+        BucketMode {
+            king: Some(shogi_features::bucket_mode::KingSubMode::K3K3),
+            ..BucketMode::NONE
+        }
+    }
+
     /// shogi-format crate test fixture (100 records × 40 bytes)。
     fn sample_psv_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -317,7 +325,7 @@ mod tests {
             None,
             None,
             128,
-            &BucketMode::KingRank9,
+            &k3k3_bucket_mode(),
             test_spec(),
             9,
         )
@@ -357,7 +365,7 @@ mod tests {
             None,
             None,
             8,
-            &BucketMode::KingRank9,
+            &k3k3_bucket_mode(),
             test_spec(),
             9,
         )

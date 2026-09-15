@@ -472,10 +472,10 @@ pub enum OutputFormat {
 
 /// 1 回の [`run`] に渡す training hyper-parameter 一式。
 ///
-/// `BucketMode::Router` 用の hard-EM router 学習パラメータ
-/// (`bins/nnue_train --router-*` CLI 由来)。
+/// `bucket_mode` にrouter成分 (`routerkpabs<N>`/`routerft<R>ft<R>`) がある
+/// ときの hard-EM router 学習パラメータ (`bins/nnue_train --router-*` CLI 由来)。
 ///
-/// `run()` は `bucket_mode` が `Router` のときだけこれを参照する。
+/// `run()` は `bucket_mode.router` が `Some` のときだけこれを参照する。
 /// `router_kpabs::RouterKPAbs` は呼び出し前に `init_random` / `init_with_weights`
 /// 済であること (`run()` はランダム初期化しない — resume との対称性のため
 /// 初期化は呼び出し側の責務)。
@@ -562,6 +562,14 @@ pub struct RouterTrainingConfig {
     /// 止まってしまう (`top_k` の doc 参照) ため、`2` 以上を指定すること。
     /// `[1, top_k]` の範囲でなければならない (`run()` が検証する)。
     pub top_k_min: usize,
+    /// router自身のバケット数 (kpabsならN、ft-by-ftならR*R)。`bucket_mode`が
+    /// hand/king/progressと複合されている場合、`TrainingConfig::num_buckets`
+    /// (合成後の総バケット数) とは異なる — この値は router の重み行列
+    /// (`RouterKPAbsWeights`/`RouterFtByFtWeights`) 自体の列数、および
+    /// oracle sweep で router の候補を振る幅 (= 「router を最後に合成する」
+    /// の「最後」の桁の基数) を表す。`bucket_mode`にrouter成分が無いときは
+    /// このconfig自体が`None`なので参照されない。
+    pub router_n: usize,
 }
 
 /// `rc` (CLI で指定された router の base 値) から、`start_superbatch` の直前
@@ -868,14 +876,14 @@ where
 {
     cfg.validate()?;
     let resolved_bucket_mode: BucketMode = (*bucket_mode).into();
-    if resolved_bucket_mode == BucketMode::Router && cfg.router.is_none() {
+    if resolved_bucket_mode.router.is_some() && cfg.router.is_none() {
         return Err(io::Error::other(
-            "TrainingConfig::router must be Some(..) when bucket_mode is Router",
+            "TrainingConfig::router must be Some(..) when bucket_mode has a router component",
         ));
     }
-    if resolved_bucket_mode != BucketMode::Router && cfg.router.is_some() {
+    if resolved_bucket_mode.router.is_none() && cfg.router.is_some() {
         return Err(io::Error::other(
-            "TrainingConfig::router must be None unless bucket_mode is Router",
+            "TrainingConfig::router must be None unless bucket_mode has a router component",
         ));
     }
 
@@ -1023,23 +1031,25 @@ where
     // 完了を保証する)。同期 backend では実害なしだが、async backend を含めて統一形。
     let mut prev_pending: Option<(Batch, Vec<i32>, Vec<Vec<u32>>)> = None;
 
-    // `Router` の hard-EM router 学習 state。他 bucket mode では未使用
-    // (`router_adam = None`)。`RouterKPAbs` の重み自体は process-global なので
-    // 呼び出し前に `init_random` / `init_with_weights` / `load_full` 済であること
-    // (`run()` 自身はランダム初期化しない)。
-    let mut router_adam: Option<RouterAdamState> = if resolved_bucket_mode == BucketMode::Router
+    // router成分 (routerkpabs<N>) の hard-EM router 学習 state。他 bucket mode
+    // では未使用 (`router_adam = None`)。`RouterKPAbs` の重み自体は
+    // process-global なので呼び出し前に `init_random` / `init_with_weights` /
+    // `load_full` 済であること (`run()` 自身はランダム初期化しない)。
+    let mut router_adam: Option<RouterAdamState> = if resolved_bucket_mode.router.is_some()
         && matches!(cfg.router.map(|rc| rc.arch), Some(RouterArch::Kpabs))
     {
-        Some(RouterAdamState::zeros(cfg.num_buckets))
+        Some(RouterAdamState::zeros(
+            cfg.router.expect("checked above").router_n,
+        ))
     } else {
         None
     };
-    // `--router-arch ft-by-ft` の Adam state。`RouterFtByFtWeights` は
+    // `routerft<R>ft<R>` の Adam state。`RouterFtByFtWeights` は
     // process-global (`RouterFtByFt`、`training.rs` が学習開始前に
     // `init_random` 済) だが、Adam の m/v/t は `RouterAdamState` と同じ理由で
     // 呼び出し側 (この `run()`) が持ち回る (checkpoint 保存用)。
     let mut router_ftbyft_adam: Option<RouterFtByFtAdamState> =
-        if resolved_bucket_mode == BucketMode::Router
+        if resolved_bucket_mode.router.is_some()
             && matches!(cfg.router.map(|rc| rc.arch), Some(RouterArch::FtByFt))
         {
             let snapshot = RouterFtByFt::snapshot();
@@ -1137,21 +1147,31 @@ where
             {
                 let pred_scale = oracle_pred_scale(cfg.loss);
                 let target_scale = oracle_target_scale(cfg.loss);
-                // `errs[k][i]` = bucket k に固定して forward したときの position
-                // i の誤差。Top-K/soft-EM ターゲットを作るには N 個すべての
-                // bucket の誤差が要る (hard-EM の argmin だけでは足りない)。
+                // `errs[k][i]` = このpositionの合成bucketのうち router 成分だけを
+                // 候補 k に固定し、hand/king/progress由来のprefixはそのpositionの
+                // 実際の値のまま (= `buckets[i] / rc.router_n`) forward したときの
+                // 誤差。router は必ず最後 (最下位桁) に合成するので、
+                // `full_bucket = prefix * rc.router_n + k`。Top-K/soft-EM
+                // ターゲットを作るには router_n 個すべての候補の誤差が要る
+                // (hard-EM の argmin だけでは足りない)。
                 //
                 // FT forward (疎な特徴量埋め込みの読み出し、この sweep の中で
                 // 最も計算・転送コストが大きい段) は bucket に依存しない値。
                 // k=0 では通常の `validate_step` (FT forward あり) を呼び、
-                // k=1..N は `validate_step_reuse_ft` (対応 backend では FT
+                // k=1..router_n は `validate_step_reuse_ft` (対応 backend では FT
                 // forward を再計算せず前回の結果を使い回す) を呼ぶことで、
-                // N 回の bucket sweep で FT forward を 1 回だけに減らす
+                // router_n 回の bucket sweep で FT forward を 1 回だけに減らす
                 // (対応しない backend ではデフォルト実装が `validate_step` に
                 // そのまま委譲するので、数値結果は常に同一)。
-                let mut errs: Vec<Vec<f64>> = Vec::with_capacity(cfg.num_buckets);
-                for k in 0..cfg.num_buckets {
-                    let k_buckets = vec![k as i32; n_pos];
+                let router_n = rc.router_n;
+                let prefixes: Vec<i32> = buckets[..n_pos]
+                    .iter()
+                    .map(|&b| b / router_n as i32)
+                    .collect();
+                let mut errs: Vec<Vec<f64>> = Vec::with_capacity(router_n);
+                for k in 0..router_n {
+                    let k_buckets: Vec<i32> =
+                        prefixes.iter().map(|&p| p * router_n as i32 + k as i32).collect();
                     let out = if k == 0 {
                         backend.validate_step(&batch, &k_buckets, wdl, cfg.loss)?
                     } else {
@@ -1167,7 +1187,7 @@ where
                     errs.push(err_k);
                 }
                 let errs_by_position: Vec<Vec<f64>> = (0..n_pos)
-                    .map(|i| (0..cfg.num_buckets).map(|k| errs[k][i]).collect())
+                    .map(|i| (0..router_n).map(|k| errs[k][i]).collect())
                     .collect();
                 let stats = match rc.mode {
                     RouterMode::HardEm => {
@@ -1238,9 +1258,15 @@ where
             {
                 let pred_scale = oracle_pred_scale(cfg.loss);
                 let target_scale = oracle_target_scale(cfg.loss);
-                let mut errs: Vec<Vec<f64>> = Vec::with_capacity(cfg.num_buckets);
-                for k in 0..cfg.num_buckets {
-                    let k_buckets = vec![k as i32; n_pos];
+                let router_n = rc.router_n;
+                let prefixes: Vec<i32> = buckets[..n_pos]
+                    .iter()
+                    .map(|&b| b / router_n as i32)
+                    .collect();
+                let mut errs: Vec<Vec<f64>> = Vec::with_capacity(router_n);
+                for k in 0..router_n {
+                    let k_buckets: Vec<i32> =
+                        prefixes.iter().map(|&p| p * router_n as i32 + k as i32).collect();
                     let out = if k == 0 {
                         backend.validate_step(&batch, &k_buckets, wdl, cfg.loss)?
                     } else {
@@ -1256,7 +1282,7 @@ where
                     errs.push(err_k);
                 }
                 let errs_by_position: Vec<Vec<f64>> = (0..n_pos)
-                    .map(|i| (0..cfg.num_buckets).map(|k| errs[k][i]).collect())
+                    .map(|i| (0..router_n).map(|k| errs[k][i]).collect())
                     .collect();
                 // `oracle_targets_from_errors` は N (= R*R) 個の候補に対する
                 // top-k soft-EM ターゲット分布を作るだけの汎用ロジックで、

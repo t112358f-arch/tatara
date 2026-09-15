@@ -5,7 +5,8 @@
 // FT input dim (`ft_in`) and active-feature count (`max_active`) depend on the
 // input feature set chosen at startup (see `FeatureSetSpec`). The FT output dim
 // is chosen from `--ft-out`, the L1 output dim from `--l1`, the L2 output dim
-// from `--l2`, and the per-bucket dimension from `--num-buckets`. Those
+// from `--l2`, and the per-bucket dimension from `--bucket-mode`'s composed
+// total (`BucketMode::total_buckets()`). Those
 // runtime dims, plus `ft_in` / `max_active`, are carried as fields on
 // `GpuWorkspace`. The constants below are the defaults for the configurable
 // dims.
@@ -34,27 +35,12 @@ pub(crate) const DEFAULT_L1_OUT: usize = 16;
 /// the per-bucket bias-gradient kernel.
 pub(crate) const DEFAULT_L2_OUT: usize = 32;
 
-/// Default LayerStack output bucket count, used when `--num-buckets` is not
-/// given. progress-kpabs assigns each position to `floor(p * num_buckets)`,
-/// so the default 9 keeps the binning + weight-buffer shape identical to the
-/// historical layout and resume-compatible with existing checkpoints. The
-/// trainer accepts `[2, MAX_SUPPORTED_NUM_BUCKETS]`.
+/// Default LayerStack output bucket count for fixtures/benchmarks that don't
+/// go through `--bucket-mode` parsing (the CLI itself derives this from
+/// `BucketMode::total_buckets()` and has no default of its own). Kept at 9
+/// (matching `k3k3`'s 9 buckets) so it stays resume-compatible with existing
+/// checkpoints.
 pub(crate) const DEFAULT_NUM_BUCKETS: usize = 9;
-
-/// Sanity ceiling for `--num-buckets`, **not** a kernel-imposed hard limit.
-/// The per-bucket weight backward kernels
-/// (`dense_mm_bwd_weight_bucket_tiled_{l2,l3}`) used to hold a fixed
-/// `num_buckets <= 9` register accumulator; both were rewritten to
-/// accumulate via direct per-row `atomicAdd` instead (see
-/// `crates/cuda-native-runtime/kernels/native_kernels.cu`), so they now
-/// support any `num_buckets` with no compile-time cap. This constant only
-/// exists to reject obviously-wrong CLI input (e.g. a typo'd `--num-buckets`)
-/// before it turns into a huge, slow, accidental allocation; raise it freely
-/// if you legitimately need more buckets than this.
-/// kernel の容量仕様だが、CLI validation (test 含む) が非 GPU build でも参照するため
-/// gpu module の外に置く。参照元と同じ cfg で非 GPU の bin 単体 build では消える。
-#[cfg(any(feature = "gpu", test))]
-pub(crate) const MAX_SUPPORTED_NUM_BUCKETS: usize = 256;
 
 #[cfg(feature = "gpu")]
 mod gpu {

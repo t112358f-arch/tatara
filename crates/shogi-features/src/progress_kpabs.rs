@@ -170,6 +170,15 @@ impl ShogiProgressKPAbs {
         let raw = (p * num_buckets as f32).floor() as i32;
         raw.clamp(0, n_i32 - 1) as u8
     }
+    /// 現在ロードされている重み (`SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS` 個、
+    /// `[sq][piece]` の行優先フラット化、`sq_bk`/`sq_wk` どちらの視点でも
+    /// 同じテーブルを引く) をそのまま返す。yaneuraou 形式への export
+    /// (`nnue_format::save_yaneuraou`) が `Progress::Parameters` の
+    /// `weights_q16_[SQ_NB][fe_end]` へQ16.16量子化する際に使う。
+    /// 未ロードなら全 0 (`progress_board` が常に 0.5 を返すのと同じ既定)。
+    pub fn snapshot_weights() -> &'static [f32] {
+        Self::weights()
+    }
 }
 
 /// `ShogiProgressKPAbs::bucket{,_board}` が受け付ける `num_buckets` の上限。

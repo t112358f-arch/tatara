@@ -387,9 +387,15 @@ impl Drop for SimpleGpuTrainer {
 }
 
 impl SimpleGpuTrainer {
-    /// `--bucket-mode router` は LayerStack アーキ (`GpuTrainer`) 専用
-    /// (`crates/nnue-train::dataloader::BucketMode::Router` は `--arch simple`
-    /// では CLI 側で拒否される)。そのため `SimpleGpuTrainer` は
+    /// `trainer_backend_impl!` マクロの `save_checkpoint` から呼ばれる。
+    /// Simple アーキに LayerStack bucket の概念は無いので常に `BucketMode::NONE`。
+    fn save_bucket_mode(&self) -> nnue_train::dataloader::BucketMode {
+        nnue_train::dataloader::BucketMode::NONE
+    }
+
+    /// `--bucket-mode` の router 成分 (`routerkpabs<N>`/`routerft<R>ft<R>`) は
+    /// LayerStack アーキ (`GpuTrainer`) 専用 (`--arch simple` では CLI 側で
+    /// 拒否される)。そのため `SimpleGpuTrainer` は
     /// `trainer_backend_impl!` マクロが要求する router GPU hook 3 種を
     /// トレイト既定 (`None`/no-op) と同じ stub で満たすだけでよい。
     fn router_train_oracle_batch_gpu(

@@ -10,6 +10,7 @@ pub(crate) trait SaveQuantisedExport {
         writer: &mut W,
         fv_scale: Option<i32>,
         output_format: nnue_train::trainer::OutputFormat,
+        bucket_mode: nnue_train::dataloader::BucketMode,
     ) -> std::io::Result<()>;
 }
 
@@ -19,18 +20,18 @@ impl SaveQuantisedExport for nnue_format::LayerStackWeights {
         writer: &mut W,
         fv_scale: Option<i32>,
         output_format: nnue_train::trainer::OutputFormat,
+        bucket_mode: nnue_train::dataloader::BucketMode,
     ) -> std::io::Result<()> {
         match output_format {
             nnue_train::trainer::OutputFormat::Tatara => self.save_quantised(writer, fv_scale),
             nnue_train::trainer::OutputFormat::Yaneuraou => {
                 // router で学習中なら process-global に重みが乗っている。
-                // `--router-arch kpabs` (default) では `RouterKPAbs`、
-                // `--router-arch ft-by-ft` では `RouterFtByFt` に重みが乗る
-                // — 学習開始時に `training.rs` がどちらか一方だけを排他的
-                // に初期化する契約 (`docs/decisions/router-ft-by-ft.md`)。
-                // kingrank9 など他 bucket mode ではどちらも一度も初期化さ
-                // れないため常に `None` になり、従来通り router 無しの
-                // export になる。
+                // どちらの実装 (kpabs / ft-by-ft) を使うかは `bucket_mode` の
+                // routerトークン (`routerkpabs<N>` か `routerft<R>ft<R>` か)
+                // 自体が決める — training.rs が学習開始時にそのどちらか一方
+                // だけを排他的に初期化する契約 (`docs/decisions/router-ft-by-ft.md`)。
+                // hand/king/progressのみなど router無しの bucket mode では
+                // どちらも一度も初期化されないため常に `None` になる。
                 if let Some(ftbyft) = shogi_features::router_ftbyft::RouterFtByFt::try_snapshot() {
                     // ft-by-ft: 評価net本体の FT (`self`, nominal `ft_out`
                     // のまま) と router 重みを、保存するこの瞬間にだけ列方向
@@ -43,22 +44,23 @@ impl SaveQuantisedExport for nnue_format::LayerStackWeights {
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
                     let (router_w, router_b) = ftbyft.to_f32();
                     return nnue_format::save_yaneuraou_combined(
-                        writer, self, &layout, &router_w, &router_b,
+                        writer, self, bucket_mode, &layout, &router_w, &router_b,
                     );
                 }
                 let router = shogi_features::router_kpabs::RouterKPAbs::try_snapshot();
                 if router.is_none() {
-                    // ここに来るのは通常 kingrank9 export (想定内、静かに続行)。
-                    // ただし呼び出し順序の事故 (router のはずが global 未初期化)
-                    // を早期発見できるよう、stderr にだけ note を出しておく。
+                    // ここに来るのは通常 router 無し (hand/king/progressのみ) の
+                    // export (想定内、静かに続行)。ただし呼び出し順序の事故
+                    // (router のはずが global 未初期化) を早期発見できるよう、
+                    // stderr にだけ note を出しておく。
                     eprintln!(
                         "[train] note: exporting yaneuraou without an embedded router \
                          block (RouterKPAbs/RouterFtByFt global not initialized in this \
-                         process — expected for kingrank9, but if you intended router this \
-                         net will fall back to kingrank9 in the engine)"
+                         process — expected when --bucket-mode has no router component, \
+                         but if you intended a router this net will be missing it)"
                     );
                 }
-                nnue_format::save_yaneuraou(writer, self, router.as_ref())
+                nnue_format::save_yaneuraou(writer, self, bucket_mode, router.as_ref())
             }
         }
     }
@@ -70,6 +72,7 @@ impl SaveQuantisedExport for nnue_format::SimpleWeights {
         writer: &mut W,
         _fv_scale: Option<i32>,
         output_format: nnue_train::trainer::OutputFormat,
+        _bucket_mode: nnue_train::dataloader::BucketMode,
     ) -> std::io::Result<()> {
         match output_format {
             nnue_train::trainer::OutputFormat::Tatara => self.save_quantised(writer),
@@ -435,7 +438,7 @@ macro_rules! trainer_backend_impl {
                     std::fs::create_dir_all(parent)?;
                 }
                 let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
-                weights.save_quantised_export(&mut writer, fv_scale, output_format)?;
+                weights.save_quantised_export(&mut writer, fv_scale, output_format, self.save_bucket_mode())?;
                 std::io::Write::flush(&mut writer)?;
                 Ok(())
             }

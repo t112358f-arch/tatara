@@ -236,9 +236,10 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "checkpoints", global = true)]
     pub(crate) output: PathBuf,
 
-    /// Inference checkpoint format. `yaneuraou` is available only for a
-    /// LayerStack trained with `--bucket-mode kingrank9` and writes an SFNN
-    /// evaluation file directly.
+    /// Inference checkpoint format. `yaneuraou` is available for any
+    /// LayerStack trained with a non-empty `--bucket-mode` (e.g. `k3k3`,
+    /// `progress8`, `routerkpabs9`, or a composite like
+    /// `hand64z_k9k9_progress4`) and writes an SFNN evaluation file directly.
     #[arg(long, value_enum, default_value_t = OutputFormatArg::Tatara, global = true)]
     pub(crate) output_format: OutputFormatArg,
 
@@ -771,8 +772,7 @@ impl From<OutputFormatArg> for nnue_train::trainer::OutputFormat {
     }
 }
 
-/// `--router-mode` の選択肢。`router` bucket mode でのみ意味を持つ (`bucket_mode
-/// != router` では無視される)。
+/// `--router-mode` の選択肢。`--bucket-mode`にrouter成分がなければ無視される。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub(crate) enum RouterModeArg {
     /// oracle ターゲット分布 (`--top-k` で hard-EM / soft-EM / Top-K Hard
@@ -791,30 +791,6 @@ impl From<RouterModeArg> for shogi_features::router_kpabs::RouterMode {
             RouterModeArg::Backprop => Self::Backprop,
         }
     }
-}
-
-impl From<RouterArchArg> for shogi_features::router_ftbyft::RouterArch {
-    fn from(value: RouterArchArg) -> Self {
-        match value {
-            RouterArchArg::Kpabs => Self::Kpabs,
-            RouterArchArg::FtByFt => Self::FtByFt,
-        }
-    }
-}
-
-/// `--router-arch` の選択肢。`router` bucket mode でのみ意味を持つ (`bucket_mode
-/// != router` では無視される)。詳細は [`LayerstackArgs::router_arch`] のドキュ
-/// メントを参照。
-///
-/// `Kpabs` が default であり、既存の `--bucket-mode router` の動作 (FT とは
-/// 独立な KP-absolute 線形 router) と完全互換。`clap` の `value_enum` 表示名は
-/// kebab-case 化されるため `ft-by-ft` はそのまま CLI 上の綴りと一致する。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
-pub(crate) enum RouterArchArg {
-    #[default]
-    Kpabs,
-    #[value(name = "ft-by-ft")]
-    FtByFt,
 }
 
 /// `--ft-fp16-out` が `--ft-fp16` を要求する制約を **実効値** (`--all-optim` の含意込み)
@@ -982,52 +958,49 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, allow_hyphen_values = true, value_parser = parse_positive_i32)]
     pub(crate) fv_scale: Option<i32>,
 
-    /// progress8kpabs coefficient file (`progress.bin`; f64 LE x 125388 = 81
-    /// king squares x 1548 KP-abs piece inputs). When omitted in progress8kpabs
-    /// mode, every position falls in bucket 4 (zero weights → `sigmoid(0) =
-    /// 0.5`). Do not specify this option in kingrank9 mode.
+    /// progress<N> bucket component coefficient file (`progress.bin`; f64 LE
+    /// x 125388 = 81 king squares x 1548 KP-abs piece inputs). Only used when
+    /// `--bucket-mode` includes a `progress<N>` token (progress2/3/4/8/16/32).
+    /// When omitted, every position falls in the middle progress bucket
+    /// (zero weights -> `sigmoid(0) = 0.5`).
     #[arg(long)]
     pub(crate) progress_coeff: Option<PathBuf>,
 
-    /// Bucket assignment: `progress8kpabs` uses the KP-absolute progress model;
-    /// `kingrank9` uses YaneuraOu KingRank9 and requires exactly 9 buckets;
-    /// `router` trains a `progress8kpabs`-shaped linear KP-absolute model
-    /// (random init, no hidden layer) with `--num-buckets` outputs jointly
-    /// with the eval net, treating the outputs as a softmax multi-class
-    /// bucket-selection network (MoE-style router; equivalent to N
-    /// progress8kpabs-sized linear models sharing the same sparse input,
-    /// N = `--num-buckets`, same [2, 9] range as progress8kpabs).
-    #[arg(long, default_value = "progress8kpabs")]
-    pub(crate) bucket_mode: String,
-
-    /// `router` only: selects the Router Architecture (how the bucket
-    /// selection network relates to the eval net's own Feature
-    /// Transformer).
+    /// LayerStack bucket assignment: a composable, YaneuraOu-compatible DSL
+    /// (mirrors `architectures/nnue_arch_gen.py`'s SFNN layer-stack token
+    /// grammar exactly). `_`-separated tokens, at most one per category, in
+    /// any order (the actual bucket-index digit order is always
+    /// hand -> king -> progress -> router, router last):
     ///
-    /// - `kpabs` (default): the original design. The router is a *separate*
-    ///   `progress8kpabs`-shaped linear model over the KP-absolute sparse
-    ///   input (see `RouterKPAbsWeights`), fully independent from the eval
-    ///   net's FT. Behavior, FT dimensions, and serialization are completely
-    ///   unchanged from before `--router-arch` existed; omitting this flag
-    ///   is 100% back-compat.
-    /// - `ft-by-ft`: the router is folded into the eval net's own Feature
-    ///   Transformer. `--num-buckets` must be a perfect square `N = R*R`
-    ///   with `R` even. The FT gains `R` extra activation-*before* outputs
-    ///   per perspective (so its raw per-perspective width becomes
-    ///   `--ft-out + R`), placed so that after the existing
-    ///   CReLU→pairwise-multiply step the `R`-derived combined outputs land
-    ///   contiguously and can be discarded, leaving the eval net's L1 input
-    ///   at exactly `--ft-out` (unchanged). Router bucket probability is
-    ///   `P(i,j) = softmax(s)[i] * softmax(n)[j]` where `s`/`n` are the STM/
-    ///   NSTM raw (pre-activation) router outputs — mathematically the
-    ///   product of two independent softmaxes, equivalent to a joint
-    ///   softmax over the `R*R` `s[i]+n[j]` scores. There is no separate
-    ///   router FT: the router weights live in the same FT weight matrix as
-    ///   the normal eval-net FT columns (see `docs/decisions/` for the
-    ///   exact column layout), and are saved together as a single combined
-    ///   Feature Transformer.
-    #[arg(long = "router-arch", value_enum, default_value_t = RouterArchArg::Kpabs)]
-    pub(crate) router_arch: RouterArchArg,
+    /// - hand: `hand4`/`hand16`/`hand64`/`hand64z`/`hand256`/`hand1024`
+    /// - king: `k3k3`/`k9k9`/`k9k9z`/`k13k13z`/`k21k21`/`k29k29` (`k3k3` is
+    ///   the old `kingrank9`: both kings' rank normalized to the side to
+    ///   move, 3x3 = 9 buckets)
+    /// - progress: `progress2`/`progress3`/`progress4`/`progress8`/
+    ///   `progress16`/`progress32` (the old `progress8kpabs` is `progress8`
+    ///   used alone; needs `--progress-coeff`)
+    /// - router (at most one of the two, mutually exclusive): `routerkpabs<N>`
+    ///   trains a `progress8kpabs`-shaped linear KP-absolute model (random
+    ///   init, no hidden layer) with N outputs jointly with the eval net,
+    ///   treating the outputs as a softmax multi-class bucket-selection
+    ///   network (MoE-style router). `routerft<R>ft<R>` instead folds the
+    ///   router into the eval net's own Feature Transformer: the FT gains
+    ///   `R` extra per-perspective outputs, and the bucket is
+    ///   `stm_argmax * R + nstm_argmax` over the two independent `R`-way
+    ///   softmaxes (see the `nnue_feature_transformer.h`
+    ///   `TANUKI_ROUTER_ARCH_FTBYFT` doc comment on the engine side for the
+    ///   exact column layout). Which of the two implementations is used is
+    ///   determined entirely by which token appears here -- there is no
+    ///   separate `--router-arch` flag.
+    ///
+    /// Composing categories multiplies their bucket counts (e.g.
+    /// `hand64z_k9k9_progress4` = 64*81*4 = 20736 buckets); there is no upper
+    /// bound on the total (the per-bucket weight backward kernels accumulate
+    /// via `atomicAdd`, not a fixed-size register file, so they support any
+    /// bucket count). Empty string (or `none`) means a single bucket (no
+    /// LayerStack selection at all).
+    #[arg(long, default_value = "progress8")]
+    pub(crate) bucket_mode: String,
 
     /// `router` only: how the router's own weights are trained. `hard-em`
     /// (default) fits the router to an oracle target distribution built from
@@ -1067,7 +1040,7 @@ pub(crate) struct LayerstackArgs {
     /// `router` only: coefficient `λ` for the Switch-Transformer-style
     /// load-balancing auxiliary loss (`L_balance = N * Σ_i f_i * P_i`, added to
     /// the router's cross-entropy loss) that discourages the router from
-    /// collapsing onto a small subset of the `--num-buckets` buckets. `0.0`
+    /// collapsing onto a small subset of the router's own buckets (`--bucket-mode ...routerkpabs<N>`/`routerft<R>ft<R>`). `0.0`
     /// disables it (cross-entropy only, matching the earlier behavior). On
     /// `--resume` / `--router-resume`, the effective starting value has
     /// `--router-balance-weight-gamma` decay (and the
@@ -1092,7 +1065,7 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = 0.0)]
     pub(crate) router_balance_weight_min: f32,
 
-    /// `router` only: run the hard-EM oracle sweep (`--num-buckets` extra
+    /// Only used when `--bucket-mode` has a router component: run the hard-EM oracle sweep (extra
     /// forward passes per refreshed batch, one per candidate bucket) and
     /// update the router every N batches. `1` refreshes every batch (closest
     /// to training "jointly" with the eval net, but slowest); larger N trades
@@ -1100,12 +1073,12 @@ pub(crate) struct LayerstackArgs {
     #[arg(long, default_value_t = 1)]
     pub(crate) router_refresh_interval: usize,
 
-    /// `router` only: of the `--num-buckets` E-step candidate buckets (ranked
+    /// Only used when `--bucket-mode` has a router component: of the router's own E-step candidate buckets (ranked
     /// by error, smallest first), only the `top_k` best are used by the M
     /// step; the meaning of "used" depends on `--router-mode`:
     /// - `hard-em` (default `top_k=1`): the selected buckets are weighted by
     ///   `softmax(-error)` to form the router's soft training target (`1`
-    ///   reduces to the previous one-hot hard-EM oracle; `--num-buckets`
+    ///   reduces to the previous one-hot hard-EM oracle; the router's own bucket count
     ///   gives the classic Jacobs & Jordan 1991 soft-EM responsibility over
     ///   every bucket).
     /// - `backprop`: softmax is restricted to the selected buckets (mirroring
@@ -1118,7 +1091,7 @@ pub(crate) struct LayerstackArgs {
     /// Inference in YaneuraOu always picks a single bucket via argmax
     /// regardless of this setting — Top-K/soft routing only slows down
     /// search with no benefit there, so it stays a training-only technique.
-    /// Must be in `[1, --num-buckets]`. On `--resume` / `--router-resume`,
+    /// Must be in `[1, router_n]` (the router's own bucket count). On `--resume` / `--router-resume`,
     /// the effective starting value has `--top-k-reduction-interval`
     /// annealing fast-forwarded by the number of superbatches already
     /// completed, matching an uninterrupted run. Ignored for other bucket
@@ -1177,20 +1150,6 @@ pub(crate) struct LayerstackArgs {
     /// argument, so non-default widths are not penalized.
     #[arg(long, default_value_t = DEFAULT_L2_OUT)]
     pub(crate) l2: usize,
-
-    /// LayerStack output bucket count. In progress8kpabs mode, each position is
-    /// routed to `min(N-1, floor(p * N))` and N must be in `[2, 9]`. In
-    /// kingrank9 mode this value must be 9. The upper bound is the fixed 9-register accumulator
-    /// in the per-bucket weight backward kernels. The default 9 keeps the
-    /// binning and weight-buffer shape identical to the standard layout and
-    /// resume-compatible with existing checkpoints. The historical 8-bucket
-    /// progress emission used `floor(p * 8)` on a 9-slot layout, leaving slot 8
-    /// unused; the unified design here means setting `--num-buckets 9` (the
-    /// default) actually emits index 8 — existing 9-bucket distributed nets
-    /// have an untrained slot 8 and may see a short-term eval shift on the
-    /// `p in [8/9, 1]` tail until continued training catches up.
-    #[arg(long, default_value_t = DEFAULT_NUM_BUCKETS)]
-    pub(crate) num_buckets: usize,
 
     /// Opt-in flag to use Ampere+ Tensor Cores in TF32 mode. `true` calls cuBLAS
     /// `cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH)`, rounding the

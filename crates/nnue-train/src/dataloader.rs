@@ -30,7 +30,9 @@ use std::thread;
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 use shogi_features::router_kpabs::RouterKPAbs;
 use shogi_features::router_ftbyft::{RouterFtByFt, RouterFtByFtWeights};
-use shogi_features::{FeatureSetSpec, kingrank9_bucket_board};
+use shogi_features::FeatureSetSpec;
+#[cfg(test)]
+use shogi_features::kingrank9_bucket_board;
 use shogi_format::{HCPE_RECORD_BYTES, HuffmanCodedPosAndEval, PackedSfenValue, ShogiBoard};
 
 /// PSV record size in bytes (`shogi_format::PackedSfenValue` is a fixed
@@ -75,52 +77,71 @@ impl HcpeFileLoader {
     }
 }
 
-/// LayerStack の position bucket 算出方式。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum BucketMode {
-    /// KP-absolute progress 推定値を `num_buckets` 等分する。
-    #[default]
-    Progress8KpAbs,
-    /// 双方の玉段を手番視点に正規化した固定 9 bucket を使う。
-    KingRank9,
-    /// `router_kpabs::RouterKPAbs` — ランダム初期化から評価関数と一緒に学習する
-    /// N-way 多クラス分類バケット選択ネットワーク (N は任意、`--num-buckets`
-    /// で指定した値、`RouterKPAbs::bucket_board` は呼び出し時の `num_buckets`
-    /// とロード済み router の bucket 数が食い違うと panic する)。
-    Router,
+/// LayerStack の position bucket 算出方式。`hand{4,16,64,64z,256,1024}` ×
+/// `k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29` × `progress{2,3,4,8,16,32}` ×
+/// `routerkpabs<N>|routerft<R>ft<R>` を自由に複合できる
+/// [`shogi_features::bucket_mode::BucketMode`] をそのまま使う (router は必ず
+/// 最後=最下位桁に合成される)。旧 `Progress8KpAbs`/`KingRank9`/`Router` の
+/// 3値排他 enum はこの型の特殊ケース (それぞれ `progress8`/`k3k3`/
+/// `routerkpabs<N>` 1個だけを持つ `BucketMode`) として表現できる。
+pub type BucketMode = shogi_features::bucket_mode::BucketMode;
+
+/// `bucket_mode` に `routerft<R>ft<R>` 成分があるときだけ必要な、その
+/// position の評価net本体sparse入力 (stm/nstm active indices) と、現在の
+/// ft-by-ft router重みsnapshotへの参照。kpabs router / router無しでは
+/// `bucket_board` に `None` を渡してよい。
+pub struct RouterFtByFtContext<'a> {
+    pub snapshot: &'a RouterFtByFtWeights,
+    pub stm_row: &'a [i32],
+    pub nstm_row: &'a [i32],
 }
 
-impl BucketMode {
-    /// checkpoint / experiment metadata に記録する canonical 名。
-    pub const fn canonical_name(self) -> &'static str {
-        match self {
-            Self::Progress8KpAbs => "progress8kpabs",
-            Self::KingRank9 => "kingrank9",
-            Self::Router => "router",
-        }
-    }
-
-    /// decode 済み局面の bucket index を返す。
-    ///
-    /// `Router` は process-global (`RouterKPAbs::init_random` /
-    /// `init_with_weights` 済) の重みを参照する。呼び出し前に未初期化だと
-    /// `RouterKPAbs::state()` が panic する (`ShogiProgressKPAbs` が未ロード時に
-    /// bucket 4 へ静かに fallback するのとは対照的 — router の重みは学習対象の
-    /// state そのものなので、未初期化のまま黙って進めるのは事故の元)。
-    #[inline]
-    pub fn bucket_board(self, board: &ShogiBoard, num_buckets: usize) -> u8 {
-        match self {
-            Self::Progress8KpAbs => ShogiProgressKPAbs.bucket_board(board, num_buckets),
-            Self::KingRank9 => kingrank9_bucket_board(board),
-            Self::Router => RouterKPAbs.bucket_board(board, num_buckets),
-        }
-    }
+/// checkpoint / experiment metadata に記録する canonical 名
+/// (`hand64z_k9k9_progress4_routerkpabs5` のような複合トークン列、
+/// バケット無しなら `"NONE"`)。
+pub fn bucket_mode_canonical_name(mode: BucketMode) -> String {
+    mode.canonical_token()
 }
 
-impl From<ShogiProgressKPAbs> for BucketMode {
-    fn from(_: ShogiProgressKPAbs) -> Self {
-        Self::Progress8KpAbs
-    }
+/// decode 済み局面の合成バケットindex (`0..mode.total_buckets()`) を返す。
+///
+/// - progress 成分: `ShogiProgressKPAbs` (係数未ロード時は `progress_board` が
+///   bucket 4 相当へ静かに fallback する既存契約のまま)
+/// - router (kpabs) 成分: process-global `RouterKPAbs` を読む。未初期化だと
+///   `RouterKPAbs::state()` が panic する (router の重みは学習対象の state its
+///   なので、未初期化のまま黙って進めるのは事故の元 — 既存契約のまま)
+/// - router (ft-by-ft) 成分: `ftbyft_ctx` が必須。`mode` に routerft<R>ft<R>
+///   成分があるのに `ftbyft_ctx` が `None` なら呼び出し側のバグとして panic
+///   する
+#[inline]
+pub fn bucket_board(
+    mode: BucketMode,
+    board: &ShogiBoard,
+    ftbyft_ctx: Option<RouterFtByFtContext<'_>>,
+) -> u32 {
+    use shogi_features::bucket_mode::{RouterSubMode, combine_bucket_index};
+
+    let progress_bucket = mode
+        .progress
+        .map(|n| u32::from(ShogiProgressKPAbs.bucket_board(board, n as usize)));
+
+    let router_bucket = mode.router.map(|router| match router {
+        RouterSubMode::Kpabs { n } => u32::from(RouterKPAbs.bucket_board(board, n as usize)),
+        RouterSubMode::FtByFt { r } => {
+            let ctx = ftbyft_ctx.as_ref().expect(
+                "bucket_mode has a routerft<R>ft<R> component but bucket_board() was called \
+                 without a RouterFtByFtContext (dataloader worker bug: ft-by-ft needs this \
+                 position's stm/nstm active indices + the current router-ftbyft snapshot)",
+            );
+            let s = ctx.snapshot.forward_logits(ctx.stm_row);
+            let n = ctx.snapshot.forward_logits(ctx.nstm_row);
+            let combined = shogi_features::router_ftbyft::loss::predict_bucket(&s, &n) as u32;
+            debug_assert!(combined < r * r, "ft-by-ft predict_bucket out of range");
+            combined
+        }
+    });
+
+    combine_bucket_index(&mode, board, progress_bucket, router_bucket)
 }
 
 // =============================================================================
@@ -906,7 +927,7 @@ impl BucketedPrefetchedLoader {
             let slot = (
                 Batch::with_capacity(batch_size, feature_set),
                 Vec::with_capacity(batch_size),
-                Vec::with_capacity(if bucket_mode == BucketMode::Router {
+                Vec::with_capacity(if bucket_mode.router.is_some() {
                     batch_size
                 } else {
                     0
@@ -987,13 +1008,16 @@ impl BucketedPrefetchedLoader {
                     // ので、position ごとではなく **この batch 1 回だけ**
                     // 取得する (ft_in が数万〜十数万になりうるため、
                     // per-position で clone すると極めて遅くなる)。
+                    // どちらの router 実装 (kpabs / ft-by-ft) を使うかは
+                    // `bucket_mode` の router 成分自体 (`routerkpabs<N>` か
+                    // `routerft<R>ft<R>` か) が決める — DSL の token がその
+                    // まま実装の選択になる。
+                    let is_ftbyft_router = matches!(
+                        bucket_mode.router,
+                        Some(shogi_features::bucket_mode::RouterSubMode::FtByFt { .. })
+                    );
                     let router_ftbyft_snapshot: Option<RouterFtByFtWeights> =
-                        if bucket_mode == BucketMode::Router && RouterKPAbs::num_buckets().is_none()
-                        {
-                            Some(RouterFtByFt::snapshot())
-                        } else {
-                            None
-                        };
+                        if is_ftbyft_router { Some(RouterFtByFt::snapshot()) } else { None };
 
                     let mut overflow: Option<io::Error> = None;
                     for (row_idx, psv) in scratch.iter().enumerate() {
@@ -1015,37 +1039,31 @@ impl BucketedPrefetchedLoader {
                             }
                         }
                         if compute_bucket {
-                            let bucket: u8 = match (bucket_mode, router_ftbyft_snapshot.as_ref()) {
-                                (BucketMode::Router, Some(ftbyft)) => {
-                                    // ft-by-ft: この position の (直前の
-                                    // `push_decoded_counting` で積んだばかりの)
-                                    // stm/nstm active indices から、router 自身の
-                                    // "現在の" 重みで argmax ベースの bucket を
-                                    // 求める (kpabs の `bucket_board` と同じ役割 —
-                                    // 学習ループが forward に使う「今この瞬間の
-                                    // router の選択」を反映する)。
-                                    let max_active = batch.max_active;
-                                    let stm_row = &batch.stm_indices
-                                        [row_idx * max_active..(row_idx + 1) * max_active];
-                                    let nstm_row = &batch.nstm_indices
-                                        [row_idx * max_active..(row_idx + 1) * max_active];
-                                    let s = ftbyft.forward_logits(stm_row);
-                                    let n = ftbyft.forward_logits(nstm_row);
-                                    shogi_features::router_ftbyft::loss::predict_bucket(&s, &n) as u8
+                            let ftbyft_ctx = router_ftbyft_snapshot.as_ref().map(|snapshot| {
+                                // この position の (直前の `push_decoded_counting` で
+                                // 積んだばかりの) stm/nstm active indices を使う —
+                                // 学習ループが forward に使う「今この瞬間の router の
+                                // 選択」を反映する (kpabs の process-global 参照と同じ役割)。
+                                let max_active = batch.max_active;
+                                RouterFtByFtContext {
+                                    snapshot,
+                                    stm_row: &batch.stm_indices
+                                        [row_idx * max_active..(row_idx + 1) * max_active],
+                                    nstm_row: &batch.nstm_indices
+                                        [row_idx * max_active..(row_idx + 1) * max_active],
                                 }
-                                _ => bucket_mode.bucket_board(&board, num_buckets),
-                            };
-                            buckets.push(i32::from(bucket));
+                            });
+                            let bucket: u32 = bucket_board(bucket_mode, &board, ftbyft_ctx);
+                            buckets.push(bucket as i32);
                             // kpabs の M step (`RouterKPAbs::train_oracle_batch` 等)
                             // は KP-absolute 疎入力上の active index 列
                             // (`RouterKPAbs::active_indices_board`) を別途必要と
                             // する。ft-by-ft の M step は評価net本体の FT と同じ
                             // `batch.stm_indices`/`nstm_indices` を直接使うので、
                             // ここでの `router_indices` は不要 (空のままでよい)。
-                            if bucket_mode == BucketMode::Router && router_ftbyft_snapshot.is_none()
-                            {
+                            if bucket_mode.router.is_some() && !is_ftbyft_router {
                                 router_indices.push(RouterKPAbs::active_indices_board(&board));
-                            } else if bucket_mode == BucketMode::Router {
+                            } else if bucket_mode.router.is_some() {
                                 router_indices.push(Vec::new());
                             }
                         }
@@ -1060,7 +1078,7 @@ impl BucketedPrefetchedLoader {
                     debug_assert_eq!(batch.n_positions, batch_size);
                     debug_assert!(!compute_bucket || buckets.len() == batch_size);
                     debug_assert!(
-                        bucket_mode != BucketMode::Router
+                        bucket_mode.router.is_none()
                             || !compute_bucket
                             || router_indices.len() == batch_size
                     );
@@ -1773,7 +1791,10 @@ mod tests {
             None,
             None,
             1,
-            BucketMode::KingRank9,
+            BucketMode {
+                king: Some(shogi_features::bucket_mode::KingSubMode::K3K3),
+                ..BucketMode::NONE
+            },
             test_spec(),
             true,
             9,

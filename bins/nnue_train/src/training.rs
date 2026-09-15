@@ -32,16 +32,12 @@ use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 #[cfg(feature = "gpu")]
 use shogi_features::{EffectBucketConfig, FtFactorizeMode, ThreatProfile};
 #[cfg(any(feature = "gpu", test))]
-use shogi_features::{FeatureSet, FeatureSetSpec, KINGRANK9_NUM_BUCKETS};
+use shogi_features::{FeatureSet, FeatureSetSpec};
 
 #[cfg(any(feature = "gpu", test))]
 use crate::cli::*;
 #[cfg(feature = "gpu")]
 use crate::{trainer_common::PrecisionFlags, trainer_layerstack::*, trainer_simple::*};
-
-#[cfg(any(feature = "gpu", test))]
-// kernel の per-bucket backward 容量 (arch.rs) が正典。値の乖離を防ぐため再輸出する。
-const MAX_LAYERSTACK_BUCKETS: usize = crate::arch::MAX_SUPPORTED_NUM_BUCKETS;
 
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn layerstack_export_fv_scale(
@@ -157,80 +153,44 @@ fn parse_effect_bucket_config(
 pub(crate) fn validate_bucket_mode(
     args: &LayerstackArgs,
 ) -> Result<BucketMode, Box<dyn std::error::Error>> {
-    match args.bucket_mode.as_str() {
-        "progress8kpabs" => {
-            if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
-                return Err(format!(
-                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for progress8kpabs (got {}); \
-                     this is just a sanity ceiling (typo guard), not a kernel-imposed limit -- raise \
-                     arch::MAX_SUPPORTED_NUM_BUCKETS if you legitimately need more",
-                    args.num_buckets
-                )
-                .into());
-            }
-            Ok(BucketMode::Progress8KpAbs)
-        }
-        "kingrank9" => {
-            if args.num_buckets != KINGRANK9_NUM_BUCKETS {
-                return Err(format!(
-                    "--num-buckets must be {KINGRANK9_NUM_BUCKETS} when --bucket-mode kingrank9 is used (got {}); KingRank9 has a fixed 3x3 bucket layout",
-                    args.num_buckets,
-                )
-                .into());
-            }
-            if args.progress_coeff.is_some() {
-                return Err(
-                    "--progress-coeff is not used with --bucket-mode kingrank9; remove it".into(),
-                );
-            }
-            Ok(BucketMode::KingRank9)
-        }
-        "router" => {
-            if !(2..=MAX_LAYERSTACK_BUCKETS).contains(&args.num_buckets) {
-                return Err(format!(
-                    "--num-buckets must be in [2, {MAX_LAYERSTACK_BUCKETS}] for router (got {}); \
-                     this is just a sanity ceiling (typo guard), not a kernel-imposed limit -- raise \
-                     arch::MAX_SUPPORTED_NUM_BUCKETS if you legitimately need more",
-                    args.num_buckets
-                )
-                .into());
-            }
-            if args.progress_coeff.is_some() {
-                return Err(
-                    "--progress-coeff is not used with --bucket-mode router; remove it"
-                        .into(),
-                );
-            }
-            Ok(BucketMode::Router)
-        }
-        other => Err(format!(
-            "--bucket-mode '{other}' is unknown (expected 'progress8kpabs', 'kingrank9', or 'router')"
-        )
-        .into()),
+    let mode = BucketMode::parse(&args.bucket_mode).map_err(|e| -> Box<dyn std::error::Error> {
+        format!("--bucket-mode {:?} is invalid: {e}", args.bucket_mode).into()
+    })?;
+    // 総バケット数 (`BucketMode::total_buckets()`) に上限は設けていない
+    // (per-bucket weight backward kernel は `atomicAdd` ベースになっており
+    // コンパイル時の bucket 数上限が無い、`crates/cuda-native-runtime/kernels/
+    // native_kernels.cu` 参照)。hand/king/progress/router の各サブモード自体が
+    // それぞれ正の bucket 数しか返さないため、`total_buckets() >= 1` は常に
+    // 成り立つ。
+    if mode.progress.is_none() && args.progress_coeff.is_some() {
+        return Err(
+            "--progress-coeff is only used when --bucket-mode includes a progress<N> component \
+             (progress2/3/4/8/16/32); remove it, or add e.g. `_progress8` to --bucket-mode"
+                .into(),
+        );
     }
+    Ok(mode)
 }
 
-/// `--router-arch` の検証。`bucket_mode != Router` では常に `Ok(None)`
-/// (kpabs/ft-by-ft の区別自体が無意味なので `--router-arch` は無視する).
-///
-/// `Kpabs` (default) は `Ok(None)` — 既存パスは本 module に一切依存しない、
-/// 完全従来互換。`FtByFt` は [`crate::router_ftbyft::FtByFtLayout`] を検証・
-/// 構築して返す (`--num-buckets` が平方数でない/ sqrt が奇数 / `--ft-out` が
-/// 奇数、のいずれかであれば分かりやすいエラーで reject する)。
+/// `--router-arch` は廃止 (router実装の選択は `--bucket-mode` のDSLトークン
+/// (`routerkpabs<N>` か `routerft<R>ft<R>` か) 自体が決める)。`bucket_mode` に
+/// router成分が無ければ常に `Ok(None)`。`routerkpabs<N>` は `Ok(None)`
+/// (既存パスは本 module に一切依存しない、完全従来互換)。`routerft<R>ft<R>`
+/// は [`crate::router_ftbyft::FtByFtLayout`] を検証・構築して返す
+/// (`--ft-out` が奇数であれば分かりやすいエラーで reject する)。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn validate_router_arch(
     bucket_mode: BucketMode,
-    router_arch: RouterArchArg,
-    num_buckets: usize,
     ft_out: usize,
 ) -> Result<Option<crate::router_ftbyft::FtByFtLayout>, Box<dyn std::error::Error>> {
-    if !matches!(bucket_mode, BucketMode::Router) {
-        return Ok(None);
-    }
-    match router_arch {
-        RouterArchArg::Kpabs => Ok(None),
-        RouterArchArg::FtByFt => {
-            let layout = crate::router_ftbyft::FtByFtLayout::new(num_buckets, ft_out)
+    match bucket_mode.router {
+        None => Ok(None),
+        Some(shogi_features::bucket_mode::RouterSubMode::Kpabs { .. }) => Ok(None),
+        Some(shogi_features::bucket_mode::RouterSubMode::FtByFt { r }) => {
+            // `FtByFtLayout::new` は num_buckets(=R*R) を受けて内部で sqrt して
+            // R を復元する既存の contract — `--bucket-mode routerft<R>ft<R>` の
+            // R は文字列から直接わかっているので `r*r` を渡すだけでよい。
+            let layout = crate::router_ftbyft::FtByFtLayout::new((r * r) as usize, ft_out)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })?;
             Ok(Some(layout))
         }
@@ -242,12 +202,12 @@ pub(crate) fn validate_output_format(
     output_format: OutputFormatArg,
     bucket_mode: BucketMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if output_format == OutputFormatArg::Yaneuraou
-        && !matches!(bucket_mode, BucketMode::KingRank9 | BucketMode::Router)
-    {
+    if output_format == OutputFormatArg::Yaneuraou && bucket_mode == BucketMode::NONE {
         return Err(
-            "--output-format yaneuraou requires LayerStack --bucket-mode kingrank9 or \
-             router; progress8kpabs routing is not representable in YaneuraOu SFNN"
+            "--output-format yaneuraou requires a non-empty LayerStack --bucket-mode (e.g. \
+             k3k3, progress8, routerkpabs9, or a composite like hand64z_k9k9_progress4); \
+             --bucket-mode \"\" (single-bucket, no LayerStack selection) is not representable \
+             as a multi-bucket YaneuraOu SFNN net"
                 .into(),
         );
     }
@@ -255,17 +215,20 @@ pub(crate) fn validate_output_format(
 }
 
 /// `--top-k` / `--top-k-min` の範囲検証 (`--router-mode hard-em` / `backprop`
-/// 共通)。`num_buckets` は `--num-buckets`、`top_k` は `--top-k`、`top_k_min`
-/// は `--top-k-min`。
+/// 共通)。`router_n` は router自身のバケット数 (kpabsならN、ft-by-ftならR*R —
+/// `bucket_mode`がhand/king/progressと複合されている場合、合成後の総バケット
+/// 数 (`--bucket-mode`全体の`total_buckets()`) とは異なる点に注意)、`top_k`
+/// は `--top-k`、`top_k_min` は `--top-k-min`。
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn validate_router_top_k(
-    num_buckets: usize,
+    router_n: usize,
     top_k: usize,
     top_k_min: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !(1..=num_buckets).contains(&top_k) {
+    if !(1..=router_n).contains(&top_k) {
         return Err(format!(
-            "--top-k must be in [1, --num-buckets] (num-buckets={num_buckets}, got --top-k={top_k})"
+            "--top-k must be in [1, router_n] (router's own bucket count, = {router_n}, got \
+             --top-k={top_k})"
         )
         .into());
     }
@@ -510,13 +473,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     };
 
     let bucket_mode = validate_bucket_mode(layerstack)?;
+    let num_buckets = bucket_mode.total_buckets() as usize;
     validate_output_format(cli.output_format, bucket_mode)?;
-    let ft_by_ft_layout = validate_router_arch(
-        bucket_mode,
-        layerstack.router_arch,
-        layerstack.num_buckets,
-        layerstack.ft_out,
-    )?;
+    let ft_by_ft_layout = validate_router_arch(bucket_mode, layerstack.ft_out)?;
     if let Some(layout) = ft_by_ft_layout {
         println!(
             "[train] router-arch=ft-by-ft: R={}, per-perspective accumulator {} -> {} \
@@ -622,9 +581,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     }
     std::fs::create_dir_all(&cli.output)?;
 
-    // progress8kpabs のみ process-global coefficient を使う。KingRank9 は玉位置から
-    // 直接求めるため file I/O も progress model 初期化も行わない。
-    if matches!(bucket_mode, BucketMode::Progress8KpAbs) {
+    // progress<N> 成分がある bucket_mode のみ process-global coefficient を使う。
+    // hand/king のみのbucket_modeは玉位置・持ち駒から直接求めるため file I/O も
+    // progress model 初期化も行わない。
+    if bucket_mode.progress.is_some() {
         match &layerstack.progress_coeff {
             Some(p) => {
                 println!("[train] loading progress8kpabs coeff: {}", p.display());
@@ -640,11 +600,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         }
     }
 
-    // router: process-global の router (progress8kpabs と同じ線形層を
-    // N 出力 (N = `--num-buckets`) にしたもの) を用意する。`--router-resume`
-    // router: process-global の router を用意する。`--router-arch kpabs`
-    // (default) では従来通り progress8kpabs 形状の線形 N-way router
-    // (`RouterKPAbs`)。`--router-arch ft-by-ft` では、評価net本体の FT と
+    // router: process-global の router を用意する。bucket_mode の router
+    // トークン (`routerkpabs<N>` か `routerft<R>ft<R>` か) が実装を決める。
+    // `routerkpabs<N>` では従来通り progress8kpabs 形状の線形 N-way router
+    // (`RouterKPAbs`)。`routerft<R>ft<R>` では、評価net本体の FT と
     // 同じ sparse 入力上の別の `(ft_in, R)` 重み行列 (`RouterFtByFt`) —
     // 学習中は両者が完全に独立 (spec.md 16節)、保存時にのみ結合する
     // (`combine_ft_by_ft_columns`、`net_to_yo` / `save_yaneuraou_combined`)。
@@ -652,9 +611,10 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // 未指定ならランダム初期化する。`--resume` (main net の raw checkpoint)
     // とは独立: router state は本 crate の process-global で、main net の
     // raw checkpoint format には同居しない。
-    let router_training_cfg = if matches!(bucket_mode, BucketMode::Router) {
-        match layerstack.router_arch {
-            RouterArchArg::FtByFt => {
+    let router_training_cfg = if let Some(router_sub) = bucket_mode.router {
+        match router_sub {
+            shogi_features::bucket_mode::RouterSubMode::FtByFt { r } => {
+                let router_n_value = (r * r) as usize;
                 let layout = ft_by_ft_layout
                     .expect("validate_router_arch already computed the layout for ft-by-ft");
                 let ft_in = feature_set.ft_in();
@@ -665,8 +625,9 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                             p.display()
                         );
                         return Err(format!(
-                            "--router-resume is not yet implemented for --router-arch ft-by-ft \
-                             (path given: {}); omit --router-resume to start from a random init",
+                            "--router-resume is not yet implemented for --bucket-mode \
+                             routerft<R>ft<R> (path given: {}); omit --router-resume to start \
+                             from a random init",
                             p.display()
                         )
                         .into());
@@ -689,13 +650,13 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 }
                 if layerstack.router_mode == RouterModeArg::Backprop {
                     return Err(
-                        "--router-mode backprop is not yet implemented for --router-arch \
-                         ft-by-ft (only hard-em's oracle-target M step is wired up); use \
-                         --router-mode hard-em (the default) or --router-arch kpabs"
+                        "--router-mode backprop is not yet implemented for --bucket-mode \
+                         routerft<R>ft<R> (only hard-em's oracle-target M step is wired up); use \
+                         --router-mode hard-em (the default) or --bucket-mode routerkpabs<N>"
                             .into(),
                     );
                 }
-                validate_router_top_k(layerstack.num_buckets, layerstack.top_k, layerstack.top_k_min)?;
+                validate_router_top_k(router_n_value, layerstack.top_k, layerstack.top_k_min)?;
                 Some(RouterTrainingConfig {
                     arch: shogi_features::router_ftbyft::RouterArch::FtByFt,
                     lr: layerstack.router_lr as f64,
@@ -709,71 +670,79 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                     top_k: layerstack.top_k,
                     top_k_reduction_interval: layerstack.top_k_reduction_interval,
                     top_k_min: layerstack.top_k_min,
+                    router_n: router_n_value,
                 })
             }
-            RouterArchArg::Kpabs => {
-        match &layerstack.router_resume {
-            Some(p) => {
-                println!("[train] resuming router weights + Adam state: {}", p.display());
-                shogi_features::router_kpabs::RouterKPAbs::load_full(p).map_err(
-                    |e| -> Box<dyn std::error::Error> {
-                        format!("failed to load --router-resume {}: {e}", p.display()).into()
-                    },
-                )?;
-                let loaded_buckets = shogi_features::router_kpabs::RouterKPAbs::num_buckets()
-                    .expect("router weights were just loaded via load_full");
-                if loaded_buckets != layerstack.num_buckets {
-                    return Err(format!(
-                        "--router-resume {} has {loaded_buckets} buckets but --num-buckets={} was given",
-                        p.display(),
-                        layerstack.num_buckets
-                    )
-                    .into());
+            shogi_features::bucket_mode::RouterSubMode::Kpabs { n } => {
+                let router_n_value = n as usize;
+                match &layerstack.router_resume {
+                    Some(p) => {
+                        println!("[train] resuming router weights + Adam state: {}", p.display());
+                        shogi_features::router_kpabs::RouterKPAbs::load_full(p).map_err(
+                            |e| -> Box<dyn std::error::Error> {
+                                format!("failed to load --router-resume {}: {e}", p.display())
+                                    .into()
+                            },
+                        )?;
+                        let loaded_buckets =
+                            shogi_features::router_kpabs::RouterKPAbs::num_buckets()
+                                .expect("router weights were just loaded via load_full");
+                        if loaded_buckets != router_n_value {
+                            return Err(format!(
+                                "--router-resume {} has {loaded_buckets} buckets but \
+                                 --bucket-mode ...routerkpabs{router_n_value} was given",
+                                p.display()
+                            )
+                            .into());
+                        }
+                    }
+                    None => {
+                        println!(
+                            "[train] router: random init (progress8kpabs-shaped linear model x{})",
+                            router_n_value
+                        );
+                        let seed = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(0x1234_5678_9abc_def0);
+                        shogi_features::router_kpabs::RouterKPAbs::init_random(
+                            router_n_value,
+                            seed,
+                        )
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    }
                 }
-            }
-            None => {
-                println!(
-                    "[train] router: random init (progress8kpabs-shaped linear model x{})",
-                    layerstack.num_buckets
-                );
-                let seed = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0x1234_5678_9abc_def0);
-                shogi_features::router_kpabs::RouterKPAbs::init_random(layerstack.num_buckets, seed)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            }
-        }
-        // `--top-k` / `--top-k-reduction-interval` / `--top-k-min` now apply
-        // to both `--router-mode` values (see the `top_k` doc on
-        // `LayerstackArgs` for how the meaning differs by mode).
-        validate_router_top_k(layerstack.num_buckets, layerstack.top_k, layerstack.top_k_min)?;
-        if layerstack.router_mode == RouterModeArg::Backprop
-            && layerstack.top_k_reduction_interval > 0
-            && layerstack.top_k_min < 2
-        {
-            eprintln!(
-                "[train] warning: --router-mode backprop with --top-k-reduction-interval \
-                 annealing down to --top-k-min={} — once top_k reaches 1 the router's \
-                 softmax gradient is identically zero and training stalls; consider \
-                 --top-k-min=2 or higher",
-                layerstack.top_k_min
-            );
-        }
-        Some(RouterTrainingConfig {
-            arch: shogi_features::router_ftbyft::RouterArch::Kpabs,
-            lr: layerstack.router_lr as f64,
-            weight_decay: layerstack.router_weight_decay as f64,
-            balance_weight: layerstack.router_balance_weight as f64,
-            mode: layerstack.router_mode.into(),
-            refresh_interval: layerstack.router_refresh_interval.max(1),
-            lr_gamma: layerstack.router_lr_gamma as f64,
-            balance_weight_gamma: layerstack.router_balance_weight_gamma as f64,
-            balance_weight_min: layerstack.router_balance_weight_min as f64,
-            top_k: layerstack.top_k,
-            top_k_reduction_interval: layerstack.top_k_reduction_interval,
-            top_k_min: layerstack.top_k_min,
-        })
+                // `--top-k` / `--top-k-reduction-interval` / `--top-k-min` now apply
+                // to both `--router-mode` values (see the `top_k` doc on
+                // `LayerstackArgs` for how the meaning differs by mode).
+                validate_router_top_k(router_n_value, layerstack.top_k, layerstack.top_k_min)?;
+                if layerstack.router_mode == RouterModeArg::Backprop
+                    && layerstack.top_k_reduction_interval > 0
+                    && layerstack.top_k_min < 2
+                {
+                    eprintln!(
+                        "[train] warning: --router-mode backprop with --top-k-reduction-interval \
+                         annealing down to --top-k-min={} — once top_k reaches 1 the router's \
+                         softmax gradient is identically zero and training stalls; consider \
+                         --top-k-min=2 or higher",
+                        layerstack.top_k_min
+                    );
+                }
+                Some(RouterTrainingConfig {
+                    arch: shogi_features::router_ftbyft::RouterArch::Kpabs,
+                    lr: layerstack.router_lr as f64,
+                    weight_decay: layerstack.router_weight_decay as f64,
+                    balance_weight: layerstack.router_balance_weight as f64,
+                    mode: layerstack.router_mode.into(),
+                    refresh_interval: layerstack.router_refresh_interval.max(1),
+                    lr_gamma: layerstack.router_lr_gamma as f64,
+                    balance_weight_gamma: layerstack.router_balance_weight_gamma as f64,
+                    balance_weight_min: layerstack.router_balance_weight_min as f64,
+                    top_k: layerstack.top_k,
+                    top_k_reduction_interval: layerstack.top_k_reduction_interval,
+                    top_k_min: layerstack.top_k_min,
+                    router_n: router_n_value,
+                })
             }
         }
     } else {
@@ -795,7 +764,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             layerstack.ft_out,
             layerstack.l1,
             layerstack.l2,
-            layerstack.num_buckets,
+            num_buckets,
             layerstack.psqt,
         )?;
         crate::threat_ablate::norm_dump(&weights, layerstack.ft_out);
@@ -834,7 +803,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     // domain、PSQT も同 scale で寄与する)、無効時は `scale` (= sigmoid 経路の cp → logit
     // 変換係数)。
     let psqt_init_vec: Option<Vec<f32>> = if layerstack.psqt {
-        let n = feature_set.ft_in() * layerstack.num_buckets;
+        let n = feature_set.ft_in() * num_buckets;
         let vec = match layerstack.psqt_init {
             PsqtInit::Zeroed => vec![0.0_f32; n],
             PsqtInit::Material => {
@@ -858,7 +827,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                 }
                 shogi_features::psqt_material_values(
                     &feature_set,
-                    layerstack.num_buckets,
+                    num_buckets,
                     out_scaling,
                 )
             }
@@ -911,7 +880,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         layerstack.ft_out,
         layerstack.l1,
         layerstack.l2,
-        layerstack.num_buckets,
+        num_buckets,
         bucket_mode,
         PrecisionFlags {
             tf32,
@@ -962,7 +931,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
             layerstack.ft_out,
             layerstack.l1,
             layerstack.l2,
-            layerstack.num_buckets,
+            num_buckets,
             layerstack.psqt,
         )?;
         if let Some(spec) = cli.threat_ablate.as_deref() {
@@ -1035,7 +1004,7 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
         test_positions: cli.test_positions,
         test_tail_positions: cli.test_tail_positions,
         compute_bucket: true,
-        num_buckets: layerstack.num_buckets,
+        num_buckets,
         monitor_fp16_clamps: cli.monitor_fp16_clamps,
         monitor_active_features: cli.monitor_active_features,
         router: router_training_cfg,
@@ -1721,12 +1690,15 @@ pub(crate) fn build_experiment_logger(
         cli.dense_lr_mult,
         cli.bias_lr_mult,
     );
+    let num_buckets = shogi_features::bucket_mode::BucketMode::parse(&layerstack.bucket_mode)
+        .map(|m| m.total_buckets() as usize)
+        .unwrap_or(1);
     let params = Params {
         architecture: layerstack_architecture(
             layerstack.ft_out,
             layerstack.l1,
             layerstack.l2,
-            layerstack.num_buckets,
+            num_buckets,
         ),
         feature_set: feature_set.canonical_name().to_string(),
         ft_in: feature_set.ft_in(),
@@ -1734,7 +1706,7 @@ pub(crate) fn build_experiment_logger(
         l0: layerstack.ft_out,
         l1: layerstack.l1,
         l2: layerstack.l2,
-        num_buckets: Some(layerstack.num_buckets),
+        num_buckets: Some(num_buckets),
         optimizer: cli.optimizer.to_ascii_lowercase(),
         bucket_mode: Some(layerstack.bucket_mode.clone()),
         activation: None,
@@ -2135,10 +2107,9 @@ pub(crate) fn run_simple_training(
 
     std::fs::create_dir_all(&cli.output)?;
 
-    // Simple は bucket-aware progress を持たない: dataloader に渡す
-    // `ShogiProgressKPAbs` は zero-weight default (全 position が bucket 4)、
-    // TrainerBackend::train_step 内で bucket index は無視される。
-    let progress = ShogiProgressKPAbs;
+    // Simple は bucket-less アーキ: `nnue_train::trainer::run` に渡す
+    // bucket_mode は `BucketMode::NONE` (常に compute_bucket=false と組で使う
+    // ので、この値自体は一切参照されない placeholder)。
 
     let ctx = CudaContext::new(0)?;
     println!("[train] CUDA context ready, building SimpleGpuTrainer...");
@@ -2294,7 +2265,7 @@ pub(crate) fn run_simple_training(
     let result = nnue_train::trainer::run(
         &mut trainer,
         data,
-        &progress,
+        &nnue_train::dataloader::BucketMode::NONE,
         &lr_scheduler,
         &wdl_scheduler,
         &cfg,

@@ -569,8 +569,9 @@ fn native_kernels_do_not_reintroduce_a_fixed_bucket_capacity() {
         "native_kernels.cu should not define a fixed per-bucket accumulator capacity again \
          (dense_mm_bwd_weight_bucket_tiled_l2/l3 must stay unbounded via direct atomicAdd); \
          if you're intentionally reintroducing a cap, make sure it can't silently drop \
-         gradients for num_buckets beyond that cap, and keep bins/nnue_train/src/arch.rs's \
-         MAX_SUPPORTED_NUM_BUCKETS in sync"
+         gradients for num_buckets beyond that cap (there is no host-side \
+         MAX_SUPPORTED_NUM_BUCKETS anymore to keep in sync -- bucket-mode composition has no \
+         upper bound by design)"
     );
 }
 

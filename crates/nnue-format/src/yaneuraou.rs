@@ -3,6 +3,7 @@
 use std::io::{self, Write};
 
 use shogi_features::FeatureSet;
+use shogi_features::bucket_mode::BucketMode;
 use shogi_features::router_kpabs::RouterKPAbsWeights;
 
 use crate::LayerStackWeights;
@@ -19,6 +20,90 @@ const YO_NETWORK_HASH: u32 = 0x6333_718a;
 /// この 4 byte を peek し、一致すれば router block を読み、不一致なら読み戻して
 /// 既存の EOF 検査に進む — 後方互換 (router 無しの既存ファイルはそのまま読める)。
 pub const YO_ROUTER9KPABS_HASH: u32 = 0x526f_3944; // "Ro9D" (Router9kpabs Data) 由来
+
+/// 新形式 (yaneuraou本家の慣習): router (kpabs) の重み block を示す magic。
+/// FeatureTransformerの直後・Network群の**前**にだけ現れる
+/// (`evaluate_nnue.h`の`RouterKPAbs::Parameters::GetHashValue()`と同じ値)。
+/// 旧形式の [`YO_ROUTER9KPABS_HASH`] (Network群の**後ろ**) とは非互換 —
+/// `tools/convert_router_bucket_layout.py` で変換すること。
+pub const YO_ROUTER_KPABS_HASH: u32 = 0x6f52_544b; // "oRTK"
+
+/// progress<N> バケットの重み block を示す magic。FeatureTransformerの直後・
+/// [`YO_ROUTER_KPABS_HASH`]/Network群の**前**にだけ現れる
+/// (`evaluate_nnue.h`の`Progress::Parameters::GetHashValue()`と同じ値)。
+pub const YO_PROGRESS_HASH: u32 = 0x6f50_524f; // "oPRO"
+
+/// KP-absolute 特徴の次元数 (`Eval::fe_end`)。`Progress::Parameters`/
+/// `RouterKPAbs::Parameters` の重み行列の列数と対応する
+/// (`shogi_features::progress_kpabs::SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS` =
+/// `SQ_NB * FE_END`)。
+const SQ_NB: usize = 81;
+const FE_END: usize = shogi_features::progress_kpabs::SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS / SQ_NB;
+
+/// `f32` の重み1個を `Progress::Parameters`/`RouterKPAbs::Parameters` の
+/// Q16.16 固定小数点 (`std::int32_t`) に量子化する
+/// (`evaluate_nnue.cpp` の `bias_q16_`/`weights_q16_` と同じスケール)。
+fn quantize_q16(w: f64) -> i32 {
+    let scaled = (w * 65536.0).round();
+    scaled.clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+}
+
+/// `--bucket-mode` に progress<N> 成分があるときだけ、FTの直後に
+/// `Progress::Parameters` (bias_q16_=0 固定 + weights_q16_[SQ_NB][FE_END]) を
+/// 書く。tatara の `ShogiProgressKPAbs` にはbias項が無い (常に0) ため、
+/// `bias_q16_` は常に0を書く。
+fn write_progress_block<W: Write>(writer: &mut W, bucket_mode: BucketMode) -> io::Result<()> {
+    if bucket_mode.progress.is_none() {
+        return Ok(());
+    }
+    let weights = shogi_features::progress_kpabs::ShogiProgressKPAbs::snapshot_weights();
+    if weights.len() != SQ_NB * FE_END {
+        return invalid_input(format!(
+            "progress weights have {} entries but SQ_NB*FE_END is {} (feature table mismatch)",
+            weights.len(),
+            SQ_NB * FE_END
+        ));
+    }
+    write_u32(writer, YO_PROGRESS_HASH)?;
+    write_u32(writer, 0u32)?; // bias_q16_ = 0 (tatara's progress model has no bias term)
+    for &w in weights {
+        writer.write_all(&quantize_q16(f64::from(w)).to_le_bytes())?;
+    }
+    Ok(())
+}
+
+/// `RouterKPAbsWeights` (bias無し、`w[idx * num_buckets + bucket]`、
+/// `idx = sq * FE_END + piece` の f64 flat 配列) を、C++側
+/// `RouterKPAbs::Parameters::ReadParameters` が期待する生の
+/// `weights_q16_[SQ_NB][FE_END][num_buckets]` (Q16.16固定小数点、bias無し)
+/// 形式で書く。
+///
+/// **注意**: [`RouterKPAbsWeights::write_to`] はこれとは別物 — tatara 独自の
+/// resume用チェックポイント形式 (専用magic + `num_weights`/`num_buckets`
+/// ヘッダ + f64 flat配列そのまま) であり、yaneuraou側は読めない。以前
+/// `save_yaneuraou`/`save_yaneuraou_combined` が誤って `write_to` を直接
+/// 呼んでいたため、出力ファイルのrouterセクションが期待より大きくなり
+/// (ヘッダ12バイト分 + f64(8byte/値) と i32(4byte/値) の差分)、末尾で
+/// `stream.peek() != EOF` となって `FileCloseError` になるバグがあった。
+fn write_router_kpabs_block<W: Write>(
+    writer: &mut W,
+    router: &RouterKPAbsWeights,
+) -> io::Result<()> {
+    let n = router.num_buckets;
+    let expected_len = SQ_NB * FE_END * n;
+    if router.w.len() != expected_len {
+        return invalid_input(format!(
+            "router weights have {} entries but SQ_NB*FE_END*num_buckets is {}",
+            router.w.len(),
+            expected_len
+        ));
+    }
+    for &w in &router.w {
+        writer.write_all(&quantize_q16(w).to_le_bytes())?;
+    }
+    Ok(())
+}
+
 
 /// YaneuraOu SFNN の KingRank9 (kingrank9 bucket-mode) LayerStack 数。
 ///
@@ -82,12 +167,58 @@ const YO_FEATURES: [YoFeature; 5] = [
 ///
 /// `router` が `Some` のとき、全 `weights.num_buckets` 個の network を書いた
 /// 直後に `router` の重み ([`YO_ROUTER9KPABS_HASH`] + `RouterKPAbsWeights::write_to`)
-/// を追記する。`None` (kingrank9 export 等) では従来通り network 群で終わる。
+/// を追記する。`None` (routerを使わない export 等) では router block を出力しない。
+///
+/// **保存形式 (yaneuraou本家の慣習に合わせた新形式)**: router (kpabs) の重み
+/// block は FeatureTransformerの直後・Network群の**前**に置く
+/// (`evaluate_nnue.h`/`.cpp` の `RouterKPAbs::Parameters` と対応する読み順)。
+/// これは旧tatara/yaneuraou-private形式 (router blockがNetwork群の**後ろ**)
+/// とは非互換 — 旧形式のファイルは `tools/convert_router_bucket_layout.py`
+/// で変換すること。
 pub fn save_yaneuraou<W: Write>(
     writer: &mut W,
     weights: &LayerStackWeights,
+    bucket_mode: BucketMode,
     router: Option<&RouterKPAbsWeights>,
 ) -> io::Result<()> {
+    if bucket_mode.total_buckets() as usize != weights.num_buckets {
+        return invalid_input(format!(
+            "bucket_mode {:?} composes to {} total buckets but weights.num_buckets is {}",
+            bucket_mode.canonical_token(),
+            bucket_mode.total_buckets(),
+            weights.num_buckets
+        ));
+    }
+    let router_n_from_mode = match bucket_mode.router {
+        Some(shogi_features::bucket_mode::RouterSubMode::Kpabs { n }) => Some(n as usize),
+        Some(shogi_features::bucket_mode::RouterSubMode::FtByFt { .. }) => {
+            return invalid_input(
+                "bucket_mode has a routerft<R>ft<R> component; use save_yaneuraou_combined \
+                 instead of save_yaneuraou for ft-by-ft nets",
+            );
+        }
+        None => None,
+    };
+    match (router_n_from_mode, router) {
+        (Some(n), Some(r)) if r.num_buckets != n => {
+            return invalid_input(format!(
+                "bucket_mode ...routerkpabs{n} but the given router has {} buckets",
+                r.num_buckets
+            ));
+        }
+        (None, Some(_)) => {
+            return invalid_input(
+                "a router was given but bucket_mode has no routerkpabs<N> component",
+            );
+        }
+        (Some(_), None) => {
+            return invalid_input(
+                "bucket_mode has a routerkpabs<N> component but no router weights were given",
+            );
+        }
+        _ => {}
+    }
+
     let arch = architecture(weights)?;
     validate_weights(&arch, weights, FtOutAlignment::MustBeMultipleOf32)?;
 
@@ -98,7 +229,7 @@ pub fn save_yaneuraou<W: Write>(
 
     write_u32(writer, YO_VERSION)?;
     write_u32(writer, YO_TOP_HASH)?;
-    let arch_string = arch_string(&arch);
+    let arch_string = arch_string(&arch, bucket_mode);
     write_u32(
         writer,
         u32::try_from(arch_string.len()).expect("architecture string length fits in u32"),
@@ -108,6 +239,13 @@ pub fn save_yaneuraou<W: Write>(
     write_u32(writer, YO_FT_HASH)?;
     write_leb128_tensor_i16(writer, &quantize_i16(&weights.ft_b, QA as f64))?;
     write_leb128_tensor_i16(writer, &quantize_i16(&weights.ft_w, QA as f64))?;
+
+    write_progress_block(writer, bucket_mode)?;
+
+    if let Some(router) = router {
+        write_u32(writer, YO_ROUTER_KPABS_HASH)?;
+        write_router_kpabs_block(writer, router)?;
+    }
 
     for bucket in 0..arch.num_buckets {
         write_u32(writer, YO_NETWORK_HASH)?;
@@ -140,10 +278,6 @@ pub fn save_yaneuraou<W: Write>(
         )?;
     }
 
-    if let Some(router) = router {
-        write_u32(writer, YO_ROUTER9KPABS_HASH)?;
-        router.write_to(writer)?;
-    }
     Ok(())
 }
 
@@ -175,10 +309,34 @@ pub fn save_yaneuraou<W: Write>(
 pub fn save_yaneuraou_combined<W: Write>(
     writer: &mut W,
     weights: &LayerStackWeights,
+    bucket_mode: BucketMode,
     layout: &shogi_features::router_ftbyft::FtByFtLayout,
     router_w: &[f32],
     router_b: &[f32],
 ) -> io::Result<()> {
+    match bucket_mode.router {
+        Some(shogi_features::bucket_mode::RouterSubMode::FtByFt { r }) if r as usize == layout.r => {}
+        Some(shogi_features::bucket_mode::RouterSubMode::FtByFt { r }) => {
+            return invalid_input(format!(
+                "bucket_mode ...routerft{r}ft{r} does not match layout.r ({})",
+                layout.r
+            ));
+        }
+        _ => {
+            return invalid_input(
+                "save_yaneuraou_combined requires bucket_mode to have a routerft<R>ft<R> \
+                 component",
+            );
+        }
+    }
+    if bucket_mode.total_buckets() as usize != weights.num_buckets {
+        return invalid_input(format!(
+            "bucket_mode {:?} composes to {} total buckets but weights.num_buckets is {}",
+            bucket_mode.canonical_token(),
+            bucket_mode.total_buckets(),
+            weights.num_buckets
+        ));
+    }
     if weights.psqt_w.is_some() {
         return invalid_input("PSQT models are not representable in YaneuraOu SFNN");
     }
@@ -275,7 +433,7 @@ pub fn save_yaneuraou_combined<W: Write>(
         l2_out,
         num_buckets: weights.num_buckets,
     };
-    let arch_string = ft_by_ft_arch_string(&arch, layout.r);
+    let arch_string = ft_by_ft_arch_string(&arch, bucket_mode);
     write_u32(
         writer,
         u32::try_from(arch_string.len()).expect("architecture string length fits in u32"),
@@ -285,6 +443,8 @@ pub fn save_yaneuraou_combined<W: Write>(
     write_u32(writer, YO_FT_HASH)?;
     write_leb128_tensor_i16(writer, &quantize_i16(&combined_ft_b, QA as f64))?;
     write_leb128_tensor_i16(writer, &quantize_i16(&combined_ft_w, QA as f64))?;
+
+    write_progress_block(writer, bucket_mode)?;
 
     for bucket in 0..arch.num_buckets {
         write_u32(writer, YO_NETWORK_HASH)?;
@@ -318,26 +478,12 @@ pub fn save_yaneuraou_combined<W: Write>(
     Ok(())
 }
 
-/// [`save_yaneuraou_combined`] 用の `arch_string`。`layer_stack_suffix`
-/// (`ls<N>`/`k3k3`) の代わりに `router_ft{r}ft{r}` を使う点だけが
-/// [`arch_string`] と異なる (spec.md 8節、`nnue_arch_gen.py` の
-/// `router_ft<R>ft<R>` 検出ロジックと対応させる)。
-fn ft_by_ft_arch_string(arch: &Architecture, r: usize) -> String {
-    let feature = YO_FEATURES
-        .iter()
-        .find(|feature| feature.feature_set == arch.feature_set)
-        .expect("every FeatureSet has a YaneuraOu mapping");
-    let input_size = arch.feature_set.spec().ft_in();
-    let h1 = arch.l1_out - 1;
-    let network = format!(
-        "SFNN_{}_{}_{}_{}_ROUTER_FT{}FT{}",
-        feature.gen_key, arch.ft_out, h1, arch.l2_out, r, r
-    )
-    .to_ascii_uppercase();
-    format!(
-        "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={}}}",
-        feature.yo_name, arch.ft_out, arch.num_buckets
-    )
+/// [`save_yaneuraou_combined`] 用の `arch_string`。`bucket_mode` の
+/// `routerft<R>ft<R>` トークン (`canonical_token()`が既に含む) を使う点以外は
+/// [`arch_string`] と同じ (`nnue_arch_gen.py` の `routerft<R>ft<R>` 検出ロジック
+/// と対応させる)。
+fn ft_by_ft_arch_string(arch: &Architecture, bucket_mode: BucketMode) -> String {
+    arch_string(arch, bucket_mode)
 }
 
 #[derive(Debug)]
@@ -372,28 +518,26 @@ fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
     })
 }
 
-/// `arch.num_buckets` の layout を表す edition suffix (`architectures/*.h` の
-/// 生成元 edition 名末尾トークンと合わせる)。`YANEURAOU_LAYER_STACKS` (9,
-/// KingRank9 の固定レイアウト) は既存配布 net との互換のため従来どおり
-/// `k3k3` を使い、それ以外の N は
-/// `docs/progress-sfnn-1536-build.md` が推奨する `ls<N>` 命名に従う (router
-/// bucket-mode 等、選択方式に依らず LayerStacks 数だけを表す)。
-fn layer_stack_suffix(num_buckets: usize) -> String {
-    if num_buckets == YANEURAOU_LAYER_STACKS {
-        "k3k3".to_string()
-    } else {
-        format!("ls{num_buckets}")
-    }
-}
-
-fn arch_string(arch: &Architecture) -> String {
+/// `bucket_mode` の layout を表す edition suffix
+/// (`architectures/nnue_arch_gen.py` の `hand.../k.../progress.../router...`
+/// トークン列と対応させる)。空 (`BucketMode::NONE`、単一バケット) のときは
+/// `bucket_mode.canonical_token()` が `"NONE"` を返す — 呼び出し元
+/// (`arch_string`) 側で `arch.num_buckets == 1` の特殊ケースとして扱う。
+fn arch_string(arch: &Architecture, bucket_mode: BucketMode) -> String {
     let feature = YO_FEATURES
         .iter()
         .find(|feature| feature.feature_set == arch.feature_set)
         .expect("every FeatureSet has a YaneuraOu mapping");
     let input_size = arch.feature_set.spec().ft_in();
     let h1 = arch.l1_out - 1;
+    // 旧来の配布net (kingrank9 / k3k3 単体、halfkahm2 1536-15-32) は
+    // "SFNN-1536" という特別短縮名を使う互換性維持。
     let network = if arch.num_buckets == YANEURAOU_LAYER_STACKS
+        && bucket_mode
+            == (BucketMode {
+                king: Some(shogi_features::bucket_mode::KingSubMode::K3K3),
+                ..BucketMode::NONE
+            })
         && arch.feature_set == FeatureSet::HalfKaHmMerged
         && arch.ft_out == 1536
         && arch.l1_out == 16
@@ -407,12 +551,13 @@ fn arch_string(arch: &Architecture) -> String {
             arch.ft_out,
             h1,
             arch.l2_out,
-            layer_stack_suffix(arch.num_buckets)
+            bucket_mode.canonical_token()
         )
         .to_ascii_uppercase()
     };
     format!(
         "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={}}}",
+
         feature.yo_name, arch.ft_out, arch.num_buckets
     )
 }

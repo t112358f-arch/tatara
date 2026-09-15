@@ -181,8 +181,8 @@ impl RawCkptGroupSource<'_> {
 /// LayerStack アーキの topology header (v4+、PSQT 無し): FT 出力次元・L1 出力次元・
 /// L2 出力次元・bucket 数。`load_raw_checkpoint` がこの並びを checkpoint と照合する。
 /// FT 出力次元は `--ft-out`、L1 出力次元は `--l1`、L2 出力次元は `--l2`、bucket
-/// 数は `--num-buckets` で可変 (resume 時に topology dim 列がそのまま照合され、
-/// 不一致は load 時に reject される)。
+/// 数は `--bucket-mode` の合成結果 (`total_buckets()`) で可変 (resume 時に
+/// topology dim 列がそのまま照合され、不一致は load 時に reject される)。
 pub(crate) const fn layerstack_topology(
     ft_out: usize,
     l1_out: usize,
