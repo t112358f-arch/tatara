@@ -169,6 +169,20 @@ pub(crate) fn validate_bucket_mode(
                 .into(),
         );
     }
+    if mode.shared_bucket && args.psqt {
+        // wsb (共有bucketの平均) と --psqt (per-bucket PSQT shortcut) の組合せは、
+        // PSQT側にも共有bucket分のforward/backwardを追加実装する必要があり未対応
+        // (docs/decisions/2026-09-16-wsb-shared-bucket.md はLayerStack本体 (L1/L1f/
+        // L2/L3) のみを扱う)。黙って共有bucket側のPSQT寄与を欠落させたまま学習
+        // しないよう、ここで明示的に reject する。
+        return Err(
+            "--bucket-mode has a trailing `wsb` (WithSharedBucket) together with --psqt is not \
+             supported yet: the shared-bucket averaging is only implemented for the L1/L1f/L2/L3 \
+             LayerStack path, not the PSQT shortcut (see \
+             docs/decisions/2026-09-16-wsb-shared-bucket.md); drop --psqt or drop `wsb`"
+                .into(),
+        );
+    }
     Ok(mode)
 }
 

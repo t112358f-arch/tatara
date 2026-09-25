@@ -2091,6 +2091,58 @@ extern "C" __global__ void elementwise_add(
     }
 }
 
+// WSB (WithSharedBucket) 用の in-place 版3個。`elementwise_add` は出力が
+// 入力と別 buffer である前提 (cuda-oxide 版の `DisjointSlice` も host 側で
+// 同時に別 borrow を要求するため、`a` を読みながら同じ `a` に書く in-place
+// 更新には使えない)。こちらは書き込み先 `a` 自身を読むだけなので in-place
+// 更新に使える。Rust 側 (`bins/nnue_train/src/kernels/layerstack.rs`) の
+// `#[kernel] fn average_inplace/add_inplace/scale_inplace` と同一シグネチャ・
+// 同一セマンティクス (native-cuda-host バックエンドはこちらを使う)。
+
+// `a[i] = 0.5 * (a[i] + b[i])`。WSB forward 末尾の
+// `net_output = 0.5 * (net_output_selected + net_output_shared)` に使う。
+extern "C" __global__ void average_inplace(
+    float* a,
+    unsigned long long,
+    const float* b,
+    unsigned long long,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        a[i] = 0.5F * (a[i] + b[i]);
+    }
+}
+
+// `a[i] += b[i]`。WSB backward で、選択bucket branch の `dcombined_from_l1`
+// に共有bucket branch の `dcombined_from_l1_shared` を畳み込むのに使う。
+extern "C" __global__ void add_inplace(
+    float* a,
+    unsigned long long,
+    const float* b,
+    unsigned long long,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        a[i] += b[i];
+    }
+}
+
+// `a[i] *= scale`。WSB backward で、loss kernel が書いた `dy_net_output` を
+// 選択bucket・共有bucket両branchの初期勾配として使う前に `0.5` 倍するのに使う。
+extern "C" __global__ void scale_inplace(
+    float* a,
+    unsigned long long,
+    float scale,
+    unsigned int n
+) {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        a[i] *= scale;
+    }
+}
+
 extern "C" __global__ void slice_extract_2d(
     const float* source,
     unsigned long long,

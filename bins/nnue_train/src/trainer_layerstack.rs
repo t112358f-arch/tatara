@@ -427,6 +427,52 @@ pub(crate) struct GpuWorkspace {
     dft_stm_out: DeviceBuffer<f32>,          // b × ft_out
     dft_nstm_out: DeviceBuffer<f32>,         // b × ft_out
 
+    // -- WSB (WithSharedBucket) 用の共有bucket branch buffer --
+    // `bucket_mode.shared_bucket` が true のときのみ確保する (`Some`、それ以外は
+    // 常に `None` で既存 baseline と完全に同じメモリ使用量・挙動)。共有bucketの
+    // `bucket_idx` (`shared_bucket_idx_dev`) は全行が同じ定数
+    // (`BucketMode::shared_bucket_index()`) なので、選択bucket側のような bucket
+    // sort/tile scratch (`bucket_counts_dev` 等) は使わず、L1 も L2/L3 と同じ plain
+    // per-bucket kernel (`dense_mm_fwd_bucket` 系) をそのまま使う
+    // (docs/decisions/2026-09-16-wsb-shared-bucket.md §2b の実装レシピ)。
+    /// batch: 全行 `BucketMode::shared_bucket_index()` の定数。`new` 時に1回だけ
+    /// host → device 転送する (学習中ずっと不変)。
+    shared_bucket_idx_dev: Option<DeviceBuffer<i32>>,
+    l1_bucket_shared: Option<DeviceBuffer<f32>>, // b × l1_out
+    l1_total_shared: Option<DeviceBuffer<f32>>, // b × l1_out
+    l1_main_shared: Option<DeviceBuffer<f32>>, // b × l1_effective
+    l1_skip_shared: Option<DeviceBuffer<f32>>, // b × L1_SKIP
+    l1_sqr_shared: Option<DeviceBuffer<f32>>,  // b × l1_effective
+    l2_pre_shared: Option<DeviceBuffer<f32>>,  // b × l2_in
+    l2_input_shared: Option<DeviceBuffer<f32>>, // b × l2_in
+    l2_dense_out_shared: Option<DeviceBuffer<f32>>, // b × l2_out
+    l2_acted_shared: Option<DeviceBuffer<f32>>, // b × l2_out
+    l3_out_shared: Option<DeviceBuffer<f32>>,  // b
+    /// `l3_out_shared + l1_skip_shared` ([+ psqtは非対応、`--psqt`との併用は
+    /// `training.rs::validate_bucket_mode` で reject 済み])。forward 末尾で
+    /// `net_output = 0.5 * (net_output_selected + net_output_shared)` に使う。
+    net_output_shared: Option<DeviceBuffer<f32>>, // b
+    dl2_acted_shared: Option<DeviceBuffer<f32>>, // b × l2_out
+    dl2_out_shared: Option<DeviceBuffer<f32>>, // b × l2_out
+    dl2_input_shared: Option<DeviceBuffer<f32>>, // b × l2_in
+    dl2_pre_shared: Option<DeviceBuffer<f32>>, // b × l2_in
+    dl1_sqr_shared: Option<DeviceBuffer<f32>>, // b × l1_effective
+    dl1_main_from_concat_shared: Option<DeviceBuffer<f32>>, // b × l1_effective
+    dl1_main_from_sqr_shared: Option<DeviceBuffer<f32>>, // b × l1_effective
+    dl1_main_shared: Option<DeviceBuffer<f32>>, // b × l1_effective
+    dl1_total_shared: Option<DeviceBuffer<f32>>, // b × l1_out
+    /// 共有bucket分の L1 (per-bucket) input backward 出力。選択branchの
+    /// `dcombined_from_l1` に `add_inplace` で畳み込んでから FT backward に渡す
+    /// (`Network::PropagatePairFromAccumulator` 側のコメントと同じ「複数branchから
+    /// 読まれる activation の勾配は和になる」原則)。
+    dcombined_from_l1_shared: Option<DeviceBuffer<f32>>, // b × ft_out
+    /// `dl1_total + dl1_total_shared` (elementwise)。`l1_total = l1_bucket + l1f_out`
+    /// はどちらのbranchでも恒等写像なので、`l1f_w`/`l1f_b` の勾配と
+    /// `dcombined_from_l1f` は選択branch単独ではなく**両branchの`dl1_total`の和**
+    /// から1回だけ計算する (`l1f`は選択/共有どちらのbranchでも同じ値
+    /// `l1f_out`を使う、bucket非依存の共有headのため)。
+    dl1_total_summed: Option<DeviceBuffer<f32>>, // b × l1_out
+
     // FT activation の FP16 版。`ft_fp16_out` (`--ft-fp16-out`) が true のときだけ
     // b × ft_out で確保され、`ft_*_out` / `dft_*_out` (f32) の代わりに使われる
     // (f32 版はそのとき placeholder size でしか確保しない)。false なら全て `None`。
@@ -494,6 +540,7 @@ impl GpuWorkspace {
         ft_fp16_out: bool,
         tf32: bool,
         feature_set: FeatureSetSpec,
+        shared_bucket_index: Option<usize>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(num_buckets >= 1, "GpuWorkspace requires num_buckets >= 1");
         let ft_in = feature_set.ft_in();
@@ -595,6 +642,39 @@ impl GpuWorkspace {
                 z(0)?
             },
             dl2_out_sorted: z(padded_sort_batch(batch, num_buckets) * l2_out)?,
+            shared_bucket_idx_dev: match shared_bucket_index {
+                Some(idx) => Some(DeviceBuffer::<i32>::from_host(
+                    stream,
+                    &vec![idx as i32; batch],
+                )?),
+                None => None,
+            },
+            l1_bucket_shared: shared_bucket_index.map(|_| z(batch * l1_out)).transpose()?,
+            l1_total_shared: shared_bucket_index.map(|_| z(batch * l1_out)).transpose()?,
+            l1_main_shared: shared_bucket_index.map(|_| z(batch * l1_effective)).transpose()?,
+            l1_skip_shared: shared_bucket_index.map(|_| z(batch * L1_SKIP)).transpose()?,
+            l1_sqr_shared: shared_bucket_index.map(|_| z(batch * l1_effective)).transpose()?,
+            l2_pre_shared: shared_bucket_index.map(|_| z(batch * l2_in)).transpose()?,
+            l2_input_shared: shared_bucket_index.map(|_| z(batch * l2_in)).transpose()?,
+            l2_dense_out_shared: shared_bucket_index.map(|_| z(batch * l2_out)).transpose()?,
+            l2_acted_shared: shared_bucket_index.map(|_| z(batch * l2_out)).transpose()?,
+            l3_out_shared: shared_bucket_index.map(|_| z(batch)).transpose()?,
+            net_output_shared: shared_bucket_index.map(|_| z(batch)).transpose()?,
+            dl2_acted_shared: shared_bucket_index.map(|_| z(batch * l2_out)).transpose()?,
+            dl2_out_shared: shared_bucket_index.map(|_| z(batch * l2_out)).transpose()?,
+            dl2_input_shared: shared_bucket_index.map(|_| z(batch * l2_in)).transpose()?,
+            dl2_pre_shared: shared_bucket_index.map(|_| z(batch * l2_in)).transpose()?,
+            dl1_sqr_shared: shared_bucket_index.map(|_| z(batch * l1_effective)).transpose()?,
+            dl1_main_from_concat_shared: shared_bucket_index
+                .map(|_| z(batch * l1_effective))
+                .transpose()?,
+            dl1_main_from_sqr_shared: shared_bucket_index
+                .map(|_| z(batch * l1_effective))
+                .transpose()?,
+            dl1_main_shared: shared_bucket_index.map(|_| z(batch * l1_effective)).transpose()?,
+            dl1_total_shared: shared_bucket_index.map(|_| z(batch * l1_out)).transpose()?,
+            dcombined_from_l1_shared: shared_bucket_index.map(|_| z(batch * ft_out)).transpose()?,
+            dl1_total_summed: shared_bucket_index.map(|_| z(batch * l1_out)).transpose()?,
         })
     }
 
@@ -1014,6 +1094,7 @@ impl GpuTrainer {
                 precision.ft_fp16_out,
                 precision.tf32,
                 feature_set,
+                bucket_mode.shared_bucket_index().map(|v| v as usize),
             )?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
@@ -2580,6 +2661,267 @@ impl GpuTrainer {
             }
         }?;
 
+        // -- WSB (WithSharedBucket): 共有bucket branch の forward --
+        // 選択bucket側 (Forward step 4〜14) と全く同じ計算を、bucket_idx だけ
+        // `shared_bucket_idx_dev` (全行同じ定数 = `BucketMode::shared_bucket_index()`)
+        // に差し替えて行う。共有bucketのbucket_idxは全行同一で sort する意味が
+        // 無いので、L1もL2/L3と同じ plain `dense_mm_fwd_bucket` をそのまま使う
+        // (選択branch側の bucket sort/tile scratch には一切触れない)。`l1f_out`
+        // (bucket非依存の共有dense head) は選択branchで既に計算済みの
+        // `self.ws.l1f_out` をそのまま再利用する (再計算不要 — combinedのみに
+        // 依存しbucketに依らないため)。詳細設計は
+        // docs/decisions/2026-09-16-wsb-shared-bucket.md §2b 参照。
+        if self.bucket_mode.shared_bucket {
+            // -- WSB L1: L2/L3と同じ plain per-bucket kernel (共有bucket用にsort不要) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_fwd_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_out),
+                    args: [
+                        slice(self.ws.combined),
+                        slice(self.l1_w),
+                        slice(self.l1_b),
+                        slice(self.ws.shared_bucket_idx_dev.as_ref()
+                            .expect("shared_bucket_idx_dev is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.l1_bucket_shared.as_mut()
+                            .expect("l1_bucket_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: l1_total_shared = l1_bucket_shared + l1f_out --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: elementwise_add,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_out),
+                    args: [
+                        slice(self.ws.l1_bucket_shared.as_ref()
+                            .expect("l1_bucket_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.ws.l1f_out),
+                        slice_mut(self.ws.l1_total_shared.as_mut()
+                            .expect("l1_total_shared is Some when bucket_mode.shared_bucket")),
+                        (b * l1_out) as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: slice l1_total_shared → l1_main_shared + l1_skip_shared --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: slice_extract_2d,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.l1_total_shared.as_ref()
+                            .expect("l1_total_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.l1_main_shared.as_mut()
+                            .expect("l1_main_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, l1_out as u32, 0_u32, l1_effective as u32
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: slice_extract_2d,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * L1_SKIP),
+                    args: [
+                        slice(self.ws.l1_total_shared.as_ref()
+                            .expect("l1_total_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.l1_skip_shared.as_mut()
+                            .expect("l1_skip_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, l1_out as u32, l1_effective as u32, L1_SKIP as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: l1_sqr_shared = l1_main_shared^2 * scale --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: abs_pow2_scale_fwd,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.l1_main_shared.as_ref()
+                            .expect("l1_main_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.l1_sqr_shared.as_mut()
+                            .expect("l1_sqr_shared is Some when bucket_mode.shared_bucket")),
+                        L1_SQR_SCALE,
+                        (b * l1_effective) as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: l2_pre_shared = concat(l1_sqr_shared, l1_main_shared) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: concat_l1sqr_main_fwd,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_in),
+                    args: [
+                        slice(self.ws.l1_sqr_shared.as_ref()
+                            .expect("l1_sqr_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.ws.l1_main_shared.as_ref()
+                            .expect("l1_main_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.l2_pre_shared.as_mut()
+                            .expect("l2_pre_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, l1_effective as u32, l1_effective as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: l2_input_shared = CReLU(l2_pre_shared) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_fwd,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_in),
+                    args: [
+                        slice(self.ws.l2_pre_shared.as_ref()
+                            .expect("l2_pre_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.l2_input_shared.as_mut()
+                            .expect("l2_input_shared is Some when bucket_mode.shared_bucket")),
+                        (b * l2_in) as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: L2 per-bucket dense → l2_dense_out_shared --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_fwd_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_out),
+                    args: [
+                        slice(self.ws.l2_input_shared.as_ref()
+                            .expect("l2_input_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.l2_w),
+                        slice(self.l2_b),
+                        slice(self.ws.shared_bucket_idx_dev.as_ref()
+                            .expect("shared_bucket_idx_dev is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.l2_dense_out_shared.as_mut()
+                            .expect("l2_dense_out_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: l2_acted_shared = CReLU(l2_dense_out_shared) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_fwd,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_out),
+                    args: [
+                        slice(self.ws.l2_dense_out_shared.as_ref()
+                            .expect("l2_dense_out_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.l2_acted_shared.as_mut()
+                            .expect("l2_acted_shared is Some when bucket_mode.shared_bucket")),
+                        (b * l2_out) as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: L3 per-bucket dense → l3_out_shared --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_fwd_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice(self.ws.l2_acted_shared.as_ref()
+                            .expect("l2_acted_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.l3_w),
+                        slice(self.l3_b),
+                        slice(self.ws.shared_bucket_idx_dev.as_ref()
+                            .expect("shared_bucket_idx_dev is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.l3_out_shared.as_mut()
+                            .expect("l3_out_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: net_output_shared = l3_out_shared + l1_skip_shared --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: elementwise_add,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice(self.ws.l3_out_shared.as_ref()
+                            .expect("l3_out_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.ws.l1_skip_shared.as_ref()
+                            .expect("l1_skip_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.net_output_shared.as_mut()
+                            .expect("net_output_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: net_output ← 0.5 * (net_output_selected + net_output_shared) --
+            // `net_output` (選択branch、Forward step 14で計算済) に対する
+            // in-place 更新なので、`elementwise_add` (出力 `DisjointSlice` が
+            // 入力と host 側で同時に別 borrow を要求し、`net_output` を読みながら
+            // 同じ `net_output` に書く形にできない) ではなく、書き込み先自身を
+            // 読む `average_inplace` (1 mutable borrow で完結) を使う。
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: average_inplace,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice_mut(self.ws.net_output),
+                        slice(self.ws.net_output_shared.as_ref()
+                            .expect("net_output_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32
+                    ]
+                }
+            }?;
+        }
+
+        prof_tick!("fwd_wsb_shared");
+
         // -- Forward step 14.5 (optional): PSQT shortcut を net_output に in-place 加算 --
         // 各 thread が 1 batch の delta を計算して `net_output[b] += 0.5*(stm-nstm)`。
         // factorizer 有効時は畳み込み済み comb (`psqt.w_fold`、base 形状) を読む
@@ -2692,6 +3034,31 @@ impl GpuTrainer {
             }
         }
         prof_tick!("forward");
+
+        // -- WSB (WithSharedBucket): dy_net_output を 0.5 倍する --
+        // 選択bucket branch・共有bucket branch はどちらも `net_output` の平均への
+        // 寄与が 0.5 なので、backward の初期勾配 (`dy_net_output`) も両branchとも
+        // 0.5倍が正しい。ここで in-place に 0.5 倍しておけば、既存の選択branch側
+        // backwardコード (`self.ws.dy_net_output` をそのまま読む) は無変更のまま
+        // 正しい値を読める。新規追加する共有branch側backwardコードも同じ
+        // (この時点で既に0.5倍された) `self.ws.dy_net_output` をそのまま使う。
+        if self.bucket_mode.shared_bucket {
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: scale_inplace,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice_mut(self.ws.dy_net_output),
+                        0.5_f32,
+                        b_u32
+                    ]
+                }
+            }?;
+        }
 
         // held-out validation: backward / optimizer をスキップし、loss kernel が
         // 書いた `loss_acc` (batch の Σ err²) と `net_output` (position ごとの net
@@ -3140,17 +3507,348 @@ impl GpuTrainer {
 
         prof_tick!("bwd_L1eff");
 
+        // -- WSB (WithSharedBucket): 共有bucket branch の backward (L3 → L2 → L1eff) --
+        // 選択branch側 (この直前までの Backward 14〜6 reverse) と対称な計算を、
+        // `bucket_idx` だけ `shared_bucket_idx_dev` に、各種 activation を対応する
+        // `*_shared` buffer に差し替えて行う。初期勾配は forward 直後に 0.5倍済の
+        // `self.ws.dy_net_output` を選択branchとそのまま共有する (両branchとも
+        // 平均への寄与は0.5で対称)。共有bucketのbucket_idxは全行同一で sort する
+        // 意味が無いので、選択branch側の bucket sort/tile scratch
+        // (`bucket_perm_dev`等) には一切触れず、L3/L2 は既存のまま
+        // `dense_mm_bwd_weight_bucket_tiled_l3`/`_l2` (atomicAdd accumulate、
+        // bucket数上限無し) をそのまま再利用し、L1 (per-bucket) だけは
+        // sort前提の `_tiled_l1_sorted` (9-bucket固定accumulatorの旧
+        // `_tiled_l1`とは別物だが、こちらもsorted-scratch前提) を避けて cuBLAS の
+        // 単一bucket matmul (全行が同じbucketなのでbucket分岐が原理的に不要) で
+        // 計算する。詳細設計は docs/decisions/2026-09-16-wsb-shared-bucket.md
+        // §2b 参照。
+        if self.bucket_mode.shared_bucket {
+            let shared_bucket_idx = self.ws.shared_bucket_idx_dev.as_ref()
+                .expect("shared_bucket_idx_dev is Some when bucket_mode.shared_bucket");
+
+            // -- WSB Backward 13 reverse: L3 per-bucket dense grad --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_bwd_input_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_out),
+                    args: [
+                        slice(self.ws.dy_net_output),
+                        slice(self.l3_w),
+                        slice(shared_bucket_idx),
+                        slice_mut(self.ws.dl2_acted_shared.as_mut()
+                            .expect("dl2_acted_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+            // L3 weight/bias grad: 既存 (選択branch用) の `l3_w_grad`/`l3_b_grad` は
+            // atomicAdd accumulate 契約 (host は backward先頭で1回zero化済) なので、
+            // 同じ buffer にこの共有branch分をもう1回 accumulate してよい
+            // (選択branchの bucket集合 (`0..selectable_buckets()`) と共有bucket
+            // index (`selectable_buckets()`) は互いに素なので、書き込み先セルが
+            // 重複することはない)。
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_bwd_weight_bucket_tiled_l3,
+                    stream: self.stream,
+                    module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (self.device_occupancy.fill_blocks(l3_block), 1, 1),
+                        block_dim: (l3_block, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.l2_acted_shared.as_ref()
+                            .expect("l2_acted_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.ws.dy_net_output),
+                        slice(shared_bucket_idx),
+                        slice(self.l3_w_grad),
+                        b_u32, l2_out as u32, 1_u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: bias_grad_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b),
+                    args: [
+                        slice(self.ws.dy_net_output),
+                        slice(shared_bucket_idx),
+                        slice(self.l3_b_grad),
+                        b_u32, 1_u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB Backward 12 reverse: crelu_grad on l2_dense_out_shared --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_grad,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_out),
+                    args: [
+                        slice(self.ws.l2_dense_out_shared.as_ref()
+                            .expect("l2_dense_out_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.ws.dl2_acted_shared.as_ref()
+                            .expect("dl2_acted_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.dl2_out_shared.as_mut()
+                            .expect("dl2_out_shared is Some when bucket_mode.shared_bucket")),
+                        (b * l2_out) as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB Backward 11 reverse: L2 per-bucket dense grad --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_bwd_input_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_in),
+                    args: [
+                        slice(self.ws.dl2_out_shared.as_ref()
+                            .expect("dl2_out_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.l2_w),
+                        slice(shared_bucket_idx),
+                        slice_mut(self.ws.dl2_input_shared.as_mut()
+                            .expect("dl2_input_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_bwd_weight_bucket_tiled_l2,
+                    stream: self.stream,
+                    module: self.module,
+                    config: LaunchConfig {
+                        grid_dim: (
+                            (l2_out * l2_in).div_ceil(256) as u32,
+                            self.device_occupancy.fill_blocks(256),
+                            1,
+                        ),
+                        block_dim: (256, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    args: [
+                        slice(self.ws.l2_input_shared.as_ref()
+                            .expect("l2_input_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.ws.dl2_out_shared.as_ref()
+                            .expect("dl2_out_shared is Some when bucket_mode.shared_bucket")),
+                        slice(shared_bucket_idx),
+                        slice(self.l2_w_grad),
+                        b_u32, l2_in as u32, l2_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: bias_grad_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_out),
+                    args: [
+                        slice(self.ws.dl2_out_shared.as_ref()
+                            .expect("dl2_out_shared is Some when bucket_mode.shared_bucket")),
+                        slice(shared_bucket_idx),
+                        slice(self.l2_b_grad),
+                        b_u32, l2_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB Backward 10 reverse: crelu_grad on l2_pre_shared --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: crelu_grad,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l2_in),
+                    args: [
+                        slice(self.ws.l2_pre_shared.as_ref()
+                            .expect("l2_pre_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.ws.dl2_input_shared.as_ref()
+                            .expect("dl2_input_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.dl2_pre_shared.as_mut()
+                            .expect("dl2_pre_shared is Some when bucket_mode.shared_bucket")),
+                        (b * l2_in) as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB Backward 9 reverse: split dl2_pre_shared → dl1_sqr_shared + dl1_main_from_concat_shared --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: concat_l1sqr_main_grad,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.dl2_pre_shared.as_ref()
+                            .expect("dl2_pre_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.dl1_sqr_shared.as_mut()
+                            .expect("dl1_sqr_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.dl1_main_from_concat_shared.as_mut()
+                            .expect("dl1_main_from_concat_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, l1_effective as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB Backward 8 reverse: abs_pow2_scale_grad (l1_sqr_shared 経由) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: abs_pow2_scale_grad,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.l1_main_shared.as_ref()
+                            .expect("l1_main_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.ws.dl1_sqr_shared.as_ref()
+                            .expect("dl1_sqr_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.dl1_main_from_sqr_shared.as_mut()
+                            .expect("dl1_main_from_sqr_shared is Some when bucket_mode.shared_bucket")),
+                        L1_SQR_SCALE,
+                        (b * l1_effective) as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: dl1_main_shared = dl1_main_from_concat_shared + dl1_main_from_sqr_shared --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: elementwise_add,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.dl1_main_from_concat_shared.as_ref()
+                            .expect("dl1_main_from_concat_shared is Some when bucket_mode.shared_bucket")),
+                        slice(self.ws.dl1_main_from_sqr_shared.as_ref()
+                            .expect("dl1_main_from_sqr_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.dl1_main_shared.as_mut()
+                            .expect("dl1_main_shared is Some when bucket_mode.shared_bucket")),
+                        (b * l1_effective) as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB Backward 7 reverse: assemble dl1_total_shared from dl1_main_shared
+            //    (offset 0) + dl1_skip_shared = dy_net_output (offset l1_effective) --
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: slice_scatter_2d,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_effective),
+                    args: [
+                        slice(self.ws.dl1_main_shared.as_ref()
+                            .expect("dl1_main_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.dl1_total_shared.as_mut()
+                            .expect("dl1_total_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, l1_effective as u32, l1_out as u32, 0_u32
+                    ]
+                }
+            }?;
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: slice_scatter_2d,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * L1_SKIP),
+                    args: [
+                        slice(self.ws.dy_net_output),
+                        slice_mut(self.ws.dl1_total_shared.as_mut()
+                            .expect("dl1_total_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, L1_SKIP as u32, l1_out as u32, l1_effective as u32
+                    ]
+                }
+            }?;
+
+            // -- WSB: dl1_total_summed = dl1_total (選択branch) + dl1_total_shared --
+            // `l1_total = l1_bucket + l1f_out` はどちらのbranchでも恒等写像なので、
+            // `l1f` (bucket非依存の共有head) の勾配は両branchの `dl1_total` の和に
+            // なる (直後の Backward 5 reverse (L1f) がこの `dl1_total_summed` を
+            // 読むよう書き換えてある)。
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: elementwise_add,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_out),
+                    args: [
+                        slice(self.ws.dl1_total),
+                        slice(self.ws.dl1_total_shared.as_ref()
+                            .expect("dl1_total_shared is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.dl1_total_summed.as_mut()
+                            .expect("dl1_total_summed is Some when bucket_mode.shared_bucket")),
+                        (b * l1_out) as u32
+                    ]
+                }
+            }?;
+
+            prof_tick!("bwd_wsb_shared_l1eff");
+        }
+
         // -- Backward 5 reverse: L1f shared dense grad --
-        // L1f input bwd: `dcombined[b][i] = sum_o dl1_total[b][o] * l1f_w[i][o]`
+        // `l1_total = l1_bucket + l1f_out` はどちらのbranchでも恒等写像なので、wsb
+        // (WithSharedBucket) 有効時は l1f の勾配 (`dcombined_from_l1f` /
+        // `l1f_w_grad` / `l1f_b_grad`) を選択branch単独の `dl1_total` ではなく
+        // **両branchの `dl1_total` の和** (`dl1_total_summed`、直前の WSB backward
+        // ブロックで計算済) から計算する。wsb 無効時は従来通り `dl1_total` を使う
+        // (`dl1_total_summed` は wsb有効時のみ確保されるので `None`)。
+        let dl1_total_for_l1f: &DeviceBuffer<f32> = if self.bucket_mode.shared_bucket {
+            self.ws
+                .dl1_total_summed
+                .as_ref()
+                .expect("dl1_total_summed is Some when bucket_mode.shared_bucket")
+        } else {
+            &self.ws.dl1_total
+        };
+        // L1f input bwd: `dcombined[b][i] = sum_o dl1_total_for_l1f[b][o] * l1f_w[i][o]`
         // (in_dim=ft_out, out_dim=l1_out)。`self.tf32` で cuBLAS Sgemm (X @ Y^T、beta=0
         // overwrite) と手書き tiled kernel を分岐する。手書き kernel は 16×16 tile
         // (block=256 = 16 batch × 16 in_dim cell、grid=batch/16 × in_dim/16)、out_dim は
         // reduction 軸で kernel 内 16 幅 out-tile loop で消化するため grid に現れない。
         debug_assert!(b.is_multiple_of(16) && ft_out.is_multiple_of(16));
         if self.tf32 {
-            // C[b, ft_out] = dl1_total[b, l1_out] @ l1f_w[ft_out, l1_out]^T (reduce 軸 l1_out)。
-            // SAFETY: dl1_total / l1f_w / dcombined_from_l1f は cudaMalloc 由来、長さは arch
-            // 上 invariant (`dl1_total.len() == b*l1_out`、`l1f_w.len() == ft_out*l1_out`、
+            // C[b, ft_out] = dl1_total_for_l1f[b, l1_out] @ l1f_w[ft_out, l1_out]^T (reduce 軸 l1_out)。
+            // SAFETY: dl1_total_for_l1f / l1f_w / dcombined_from_l1f は cudaMalloc 由来、長さは arch
+            // 上 invariant (`dl1_total_for_l1f.len() == b*l1_out`、`l1f_w.len() == ft_out*l1_out`、
             // `dcombined_from_l1f.len() == b*ft_out`)、`self.cublas` は `self.stream` に bind
             // 済で同 stream 内 in-order 実行。beta=0 overwrite は手書き kernel の write
             // semantics (`*dx = acc`) と一致。
@@ -3159,7 +3857,7 @@ impl GpuTrainer {
                     b_u32 as i32,  // m = batch
                     ft_out as i32, // n = in_dim
                     l1_out as i32, // k = out_dim (reduce)
-                    self.ws.dl1_total.cu_deviceptr() as *const f32,
+                    dl1_total_for_l1f.cu_deviceptr() as *const f32,
                     self.l1f_w.cu_deviceptr() as *const f32,
                     self.ws.dcombined_from_l1f.cu_deviceptr() as *mut f32,
                 )?;
@@ -3178,7 +3876,7 @@ impl GpuTrainer {
                         shared_mem_bytes: 0,
                     },
                     args: [
-                        slice(self.ws.dl1_total),
+                        slice(dl1_total_for_l1f),
                         slice(self.l1f_w),
                         slice_mut(self.ws.dcombined_from_l1f),
                         b_u32, ft_out as u32, l1_out as u32
@@ -3186,13 +3884,13 @@ impl GpuTrainer {
                 }
             }?;
         }
-        // L1f weight backward: row-major `grad_w[ft_out, l1_out] = combined^T @ dl1_total`。
-        // combined[batch, ft_out] row-major、dl1_total[batch, l1_out] row-major、reduce 軸は
+        // L1f weight backward: row-major `grad_w[ft_out, l1_out] = combined^T @ dl1_total_for_l1f`。
+        // combined[batch, ft_out] row-major、dl1_total_for_l1f[batch, l1_out] row-major、reduce 軸は
         // batch。M = l1_out と細いが K が大きい reduce-bound shape は cuBLAS Sgemm の
         // split-K + tensor pipeline 最適化が効きやすい (cuBLAS は任意の n を受けるので分岐不要)。
         //
-        // SAFETY: combined / dl1_total / l1f_w_grad は cudaMalloc 由来、長さは arch 上
-        // invariant (`combined.len() == b*ft_out`、`dl1_total.len() == b*l1_out`、
+        // SAFETY: combined / dl1_total_for_l1f / l1f_w_grad は cudaMalloc 由来、長さは arch 上
+        // invariant (`combined.len() == b*ft_out`、`dl1_total_for_l1f.len() == b*l1_out`、
         // `l1f_w_grad.len() == ft_out*l1_out`)、`self.cublas` は `self.stream` に bind 済で
         // 同 stream 内 in-order 実行 (先行 kernel 完了後に Sgemm が走り、結果は後続 kernel
         // が観測する)。
@@ -3202,7 +3900,7 @@ impl GpuTrainer {
                 l1_out as i32, // n = out_dim
                 b_u32 as i32,  // k = batch
                 self.ws.combined.cu_deviceptr() as *const f32,
-                self.ws.dl1_total.cu_deviceptr() as *const f32,
+                dl1_total_for_l1f.cu_deviceptr() as *const f32,
                 self.l1f_w_grad.cu_deviceptr() as *mut f32,
             )?;
         }
@@ -3224,7 +3922,7 @@ impl GpuTrainer {
                 module: self.module,
                 config: cfg_1d(b * l1_out),
                 args: [
-                    slice(self.ws.dl1_total),
+                    slice(dl1_total_for_l1f),
                     slice(self.l1f_b_grad),
                     b_u32, l1_out as u32
                 ]
@@ -3421,6 +4119,117 @@ impl GpuTrainer {
         }?;
 
         prof_tick!("bwd_L1");
+
+        // -- WSB (WithSharedBucket): 共有bucket branch の L1 (per-bucket) backward --
+        // 共有bucketの bucket_idx は全行同一なので、選択branch側のような
+        // sort/tile 前提の kernel (`dense_mm_bwd_weight_bucket_tiled_l1_sorted` や、
+        // 9-bucket固定accumulatorを持つ旧 `dense_mm_bwd_weight_bucket_tiled_l1`)
+        // は使わず、全行が同じ1個のbucketであることを直接利用した cuBLAS の
+        // 単純な matmul (l1f と同じパターン) で計算する — bucket分岐が原理的に
+        // 不要なため、bucket数に一切依存しない。書き込み先は `l1_w_grad`/
+        // `l1_b_grad`/`l1f_w_grad` 等とは異なる、共有bucket専用のセル
+        // (`self.l1_w_grad` の `shared_bucket_index() * l1_out * ft_out` 以降)
+        // なので、選択branch側の書き込みとは衝突しない。
+        if self.bucket_mode.shared_bucket {
+            let shared_idx = self
+                .bucket_mode
+                .shared_bucket_index()
+                .expect("shared_bucket_index() is Some when bucket_mode.shared_bucket")
+                as usize;
+            let dl1_total_shared = self.ws.dl1_total_shared.as_ref()
+                .expect("dl1_total_shared is Some when bucket_mode.shared_bucket");
+
+            // L1 weight backward (共有bucket分のみ、他bucketのcellには一切触れない):
+            // `l1_w_grad[shared_idx][o][i] = Σ_b dl1_total_shared[b][o] * combined[b][i]`
+            // = `dl1_total_shared^T[l1_out,batch] @ combined[batch,ft_out]`
+            // (l1_w の per-bucket layout は `[l1_out, ft_out]` = [out, in]、l1f_w の
+            // `[ft_out, l1_out]` = [in, out] とは逆順なので、l1f_w_grad の
+            // `sgemm_xt_y_rowmajor` 呼び出しとは m/n の割り当てが入れ替わる)。
+            //
+            // SAFETY: combined / dl1_total_shared / l1_w_grad は cudaMalloc 由来。
+            // 書き込み先オフセット `shared_idx * l1_out * ft_out` は
+            // `shared_idx < self.num_buckets` (= `bucket_mode.total_buckets()`) から
+            // `l1_w_grad` の確保サイズ (`num_buckets * l1_out * ft_out`) 内に収まる。
+            // `self.cublas` は `self.stream` に bind 済で同 stream 内 in-order 実行。
+            unsafe {
+                let grad_base = self.l1_w_grad.cu_deviceptr() as *mut f32;
+                self.cublas.sgemm_xt_y_rowmajor(
+                    l1_out as i32, // m = out_dim
+                    ft_out as i32, // n = in_dim
+                    b_u32 as i32,  // k = batch (reduce)
+                    dl1_total_shared.cu_deviceptr() as *const f32,
+                    self.ws.combined.cu_deviceptr() as *const f32,
+                    grad_base.add(shared_idx * l1_out * ft_out),
+                )?;
+            }
+
+            // L1 bias backward (共有bucket分、atomicAdd accumulate — 選択branch側の
+            // sorted kernel が書く他bucketのcellとは独立)。
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: bias_grad_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * l1_out),
+                    args: [
+                        slice(dl1_total_shared),
+                        slice(self.ws.shared_bucket_idx_dev.as_ref()
+                            .expect("shared_bucket_idx_dev is Some when bucket_mode.shared_bucket")),
+                        slice(self.l1_b_grad),
+                        b_u32, l1_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
+
+            // L1 input backward (共有branch分の dcombined):
+            // `dcombined_from_l1_shared[b][i] = Σ_o dl1_total_shared[b][o] * l1_w[shared_idx][o][i]`
+            // = `dl1_total_shared[batch,l1_out] @ l1_w[shared_idx][l1_out,ft_out]`
+            // (l1f_out の forward (`sgemm_fwd_rowmajor(batch, l1_out, ft_out, combined,
+            // l1f_w, l1f_out)`) と全く同じ形の matmul、重みを l1_w の共有bucket
+            // スライスに差し替えただけ)。
+            //
+            // SAFETY: 上と同様、`l1_w` の読み出しオフセットも `shared_idx * l1_out *
+            // ft_out` で `l1_w` の確保サイズ内に収まる。
+            unsafe {
+                let l1w_base = self.l1_w.cu_deviceptr() as *const f32;
+                self.cublas.sgemm_fwd_rowmajor(
+                    b_u32 as i32,  // m = batch
+                    ft_out as i32, // n = in_dim (out of this matmul)
+                    l1_out as i32, // k = out_dim (reduce)
+                    dl1_total_shared.cu_deviceptr() as *const f32,
+                    l1w_base.add(shared_idx * l1_out * ft_out),
+                    self.ws.dcombined_from_l1_shared.as_ref()
+                        .expect("dcombined_from_l1_shared is Some when bucket_mode.shared_bucket")
+                        .cu_deviceptr() as *mut f32,
+                )?;
+            }
+
+            // -- WSB: 選択branchの dcombined_from_l1 に共有branchの寄与を畳み込む --
+            // これで直後の `ft_post_perspective_grad_fused[_fp16]` (`dcombined_from_l1`
+            // + `dcombined_from_l1f` の2項をそのまま読む契約) が実質的に
+            // `dcombined_from_l1_selected + dcombined_from_l1_shared + dcombined_from_l1f`
+            // の3項の和を計算することになる。
+            unsafe {
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: add_inplace,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * ft_out),
+                    args: [
+                        slice_mut(self.ws.dcombined_from_l1),
+                        slice(self.ws.dcombined_from_l1_shared.as_ref()
+                            .expect("dcombined_from_l1_shared is Some when bucket_mode.shared_bucket")),
+                        (b * ft_out) as u32
+                    ]
+                }
+            }?;
+
+            prof_tick!("bwd_wsb_shared_l1");
+        }
 
         // dft (FT activation gradient) FP16 化の loss scaling 係数。dft ∝ 1/batch なので
         // batch 比例にして batch 非依存に f16 域へ載せる ([`FT_DFT_FP16_BASE_SCALE`])。

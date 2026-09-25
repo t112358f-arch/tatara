@@ -65,3 +65,5 @@ pub mod elementwise;
 pub mod ft_post_perspective;
 pub mod psqt;
 pub mod slice2d;
+#[cfg(test)]
+mod wsb_design_check;

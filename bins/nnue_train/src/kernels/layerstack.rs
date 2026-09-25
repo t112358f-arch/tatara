@@ -2510,6 +2510,59 @@ pub fn elementwise_add(a: &[f32], b: &[f32], mut c: DisjointSlice<f32>, n: u32) 
     }
 }
 
+/// In-place average of two buffers — `a[i] = 0.5 * (a[i] + b[i])`。1 thread = 1
+/// element。WSB (WithSharedBucket) の `net_output = 0.5 * (net_output_selected +
+/// net_output_shared)` に使う (`elementwise_add` は出力 `c: DisjointSlice` が
+/// 入力 `a`/`b` と host 側で同時に別 borrow (`slice` immutable + `slice_mut`
+/// mutable) を要求するため、`net_output` を読みながら同じ `net_output` に書く
+/// in-place 更新には使えない — こちらは書き込み先 `a` 自身を読むので1つの
+/// mutable borrow で完結する)。
+#[kernel]
+pub fn average_inplace(mut a: DisjointSlice<f32>, b: &[f32], n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let j = i.get();
+    if let Some(out) = a.get_mut(i) {
+        *out = 0.5 * (*out + b[j]);
+    }
+}
+
+/// In-place add — `a[i] += b[i]`。1 thread = 1 element。WSB
+/// (WithSharedBucket) で、選択bucket branchの `dcombined_from_l1` に共有bucket
+/// branchの `dcombined_from_l1_shared` を畳み込むのに使う (`ft_post_perspective_grad_fused`
+/// が `dcombined_from_l1 + dcombined_from_l1f` の2項をそのまま読む契約なので、
+/// 事前にこちらで3項目を`dcombined_from_l1`側へ畳んでおく)。`average_inplace` と
+/// 同じ理由で in-place 専用 kernel にしている。
+#[kernel]
+pub fn add_inplace(mut a: DisjointSlice<f32>, b: &[f32], n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    let j = i.get();
+    if let Some(out) = a.get_mut(i) {
+        *out += b[j];
+    }
+}
+
+/// In-place scalar scale — `a[i] *= scale`。1 thread = 1 element。WSB
+/// (WithSharedBucket) で、loss kernel が書いた `dy_net_output` を選択bucket・
+/// 共有bucket両branchの初期勾配として使う前に `0.5` 倍するのに使う (両branchとも
+/// 平均への寄与は0.5で対称なので、`dy_net_output`をここで1回0.5倍しておけば、
+/// 既存の選択branch側backwardコードは無変更のままこの値をそのまま読める)。
+#[kernel]
+pub fn scale_inplace(mut a: DisjointSlice<f32>, scale: f32, n: u32) {
+    let i = thread::index_1d();
+    if i.get() >= n as usize {
+        return;
+    }
+    if let Some(out) = a.get_mut(i) {
+        *out *= scale;
+    }
+}
+
 /// Extract a 2D slice — `dst[bi][oi] = src[bi*src_stride + src_offset + oi]`。
 /// 1 thread = 1 dst cell。l1_total (B×16) → l1_main (B×15) / l1_skip (B×1) 抽出に使用。
 #[allow(clippy::too_many_arguments)]

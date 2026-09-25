@@ -5,12 +5,17 @@
 //! する。`hand4/16/64/64z/256/1024` ・ `k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29` ・
 //! `progress2/3/4/8/16/32` を `_` 区切りで自由に複合でき (各カテゴリ最大1個)、
 //! `routerkpabs<N>` / `routerft<R>ft<R>` (どちらか一方のみ、最大1個) を追加できる。
+//! さらに末尾に `wsb` (WithSharedBucket) を置くと、常に選ばれる共有バケットを
+//! 1個追加できる。
 //!
 //! 合成順序 (バケットindexの桁の重み) は **hand → king → progress → router** の順に
 //! `idx = idx * category_buckets + category_index` を繰り返したもの。router 系は
 //! カテゴリの中で常に最後 (= 最下位桁) に合成される。これは YaneuraOu
 //! `evaluate_nnue.cpp` の `stack_index_for_nnue()` と完全に同じ規則 (このファイルは
-//! そのRust移植)。
+//! そのRust移植)。`wsb` は上記の合成には加わらない別枠で、hand/king/progress/router
+//! の合成バケット数 (`prefix_buckets() * router.bucket_count()`) に対して常に
+//! index = その総数 (=最後の1個) を追加する。この共有バケットの選択規則も
+//! `evaluate_nnue.cpp` の `NNUE_SFNN_USE_SHARED_BUCKET` 分岐と同じ (常に有効)。
 //!
 //! 保存形式は YaneuraOu の慣習 (このバケットindexの並び) を正として、tatara旧形式や
 //! yaneuraou-privateとは非互換。旧形式からの変換は `net_convert_bucket_layout`
@@ -135,10 +140,16 @@ pub struct BucketMode {
     /// 単に progress バケットを使わないことを表す)。
     pub progress: Option<u32>,
     pub router: Option<RouterSubMode>,
+    /// `wsb` (WithSharedBucket)。true のとき、hand/king/progress/router の合成
+    /// バケットに加えて「常に選ばれる共有バケット」を1個追加する
+    /// (index は常に `prefix_buckets() * router.bucket_count()`、すなわち
+    /// 合成バケット数そのもの = 最後の1個)。
+    pub shared_bucket: bool,
 }
 
 impl BucketMode {
-    pub const NONE: BucketMode = BucketMode { hand: None, king: None, progress: None, router: None };
+    pub const NONE: BucketMode =
+        BucketMode { hand: None, king: None, progress: None, router: None, shared_bucket: false };
 
     /// router以外 (hand/king/progress) の合成バケット数。router併用時、
     /// 合成後の総バケットindexから `prefix = idx / router.bucket_count()` で
@@ -162,8 +173,9 @@ impl BucketMode {
         self.router.map(RouterSubMode::bucket_count)
     }
 
-    /// 総バケット数 (hand * king * progress * router)。
-    pub fn total_buckets(&self) -> u32 {
+    /// hand/king/progress/router の合成バケット数 (`wsb` の共有バケットを含まない)。
+    /// `wsb` 有効時、共有バケットの index はこの値そのもの (= 合成バケットの直後)。
+    pub fn selectable_buckets(&self) -> u32 {
         let mut n = self.prefix_buckets();
         if let Some(r) = self.router {
             n *= r.bucket_count();
@@ -171,9 +183,21 @@ impl BucketMode {
         n
     }
 
+    /// 総バケット数 (hand * king * progress * router、`wsb` 有効時はさらに+1)。
+    pub fn total_buckets(&self) -> u32 {
+        self.selectable_buckets() + u32::from(self.shared_bucket)
+    }
+
+    /// `wsb` 有効時の共有バケットのindex (`selectable_buckets()` と同値)。
+    /// `wsb` 無効時に呼ぶのは呼び出し側のバグなので `None` を返す。
+    pub fn shared_bucket_index(&self) -> Option<u32> {
+        self.shared_bucket.then(|| self.selectable_buckets())
+    }
+
     /// YaneuraOu生成器の `NNUE_SFNN_*` マクロと同じ形の正準トークン列
     /// (`hand64z_k9k9_progress4_routerkpabs5` のように、hand→king→progress→routerの順)。
-    /// 空 (バケット無し) のときは `"NONE"`。
+    /// `wsb` は常に末尾に付与する。空 (バケット無し) のときは `"NONE"` (`wsb` 単独の
+    /// ときは `"WSB"`)。
     pub fn canonical_token(&self) -> String {
         let mut parts = Vec::new();
         if let Some(h) = self.hand {
@@ -188,6 +212,9 @@ impl BucketMode {
         if let Some(r) = self.router {
             parts.push(r.token());
         }
+        if self.shared_bucket {
+            parts.push("wsb".to_string());
+        }
         if parts.is_empty() {
             "NONE".to_string()
         } else {
@@ -197,7 +224,9 @@ impl BucketMode {
 
     /// `--bucket-mode` 文字列 (`_` 区切りトークン列、順不同、大文字小文字不問) をパースする。
     /// 各カテゴリ (hand/king/progress/router) は最大1個、router系
-    /// (routerkpabs/routerft{R}ft{R}) は互いに排他。
+    /// (routerkpabs/routerft{R}ft{R}) は互いに排他。`wsb` はどのトークンとも複合でき、
+    /// **文字列上、必ず最後のトークン**でなければならない (YaneuraOu
+    /// `nnue_arch_gen.py` の `wsb` 検証と同じ規則)。
     ///
     /// 空文字列 / `"none"` はバケット無し (`BucketMode::NONE`、常に bucket 0 の1バケット)
     /// を表す。
@@ -208,11 +237,19 @@ impl BucketMode {
         }
 
         let mut mode = BucketMode::NONE;
-        for raw_token in spec.split('_') {
-            if raw_token.is_empty() {
+        let raw_tokens: Vec<&str> = spec.split('_').filter(|t| !t.is_empty()).collect();
+        let last_index = raw_tokens.len().checked_sub(1);
+        for (i, raw_token) in raw_tokens.iter().enumerate() {
+            let token = normalize_token(raw_token);
+            if token == "WSB" {
+                if Some(i) != last_index {
+                    return Err(format!(
+                        "wsb (WithSharedBucket) must be the last token in bucket-mode {spec:?}"
+                    ));
+                }
+                mode.shared_bucket = true;
                 continue;
             }
-            let token = normalize_token(raw_token);
             if let Some(hand) = parse_hand_token(&token) {
                 if mode.hand.is_some() {
                     return Err(format!("duplicate hand bucket in bucket-mode {spec:?}"));
@@ -244,7 +281,7 @@ impl BucketMode {
                 continue;
             }
             return Err(format!(
-                "unknown bucket-mode token {raw_token:?} in {spec:?}; expected hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, progress2/3/4/8/16/32, routerkpabs<N>, or routerft<R>ft<R>"
+                "unknown bucket-mode token {raw_token:?} in {spec:?}; expected hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, progress2/3/4/8/16/32, routerkpabs<N>, routerft<R>ft<R>, or wsb"
             ));
         }
         Ok(mode)
@@ -592,6 +629,11 @@ pub fn prefix_index(mode: &BucketMode, board: &ShogiBoard, progress_bucket: Opti
 /// `BucketMode` 全体のバケットindexを、hand/king/progressの合成値 (router抜き) と
 /// router自身のバケットindexから合成する。router は必ず最後 (最下位桁)。
 ///
+/// 戻り値は常に `0..mode.selectable_buckets()` の範囲 (`wsb` の共有バケット index
+/// `mode.shared_bucket_index()` は含まない)。`wsb` 有効時、共有バケットは局面に
+/// 依らず常に選ばれる別枠のバケットなので、呼び出し側 (dataloader / trainer) が
+/// この関数の戻り値と `shared_bucket_index()` の両方を必要に応じて使う。
+///
 /// `progress_bucket` / `router_bucket` は呼び出し側 (progress8kpabs / RouterKPAbs /
 /// FT-by-FTのargmax) が計算した値を渡す — このcrateはFT重みや学習済みrouterの
 /// 重みを持たないため、progress・router自体のバケットindex計算はここでは行わない。
@@ -676,5 +718,54 @@ mod tests {
         let idx_r0 = combine_bucket_index(&mode, &board, None, Some(0));
         let idx_r1 = combine_bucket_index(&mode, &board, None, Some(1));
         assert_eq!(idx_r1 - idx_r0, 1, "router must be the least-significant digit");
+    }
+
+    #[test]
+    fn wsb_adds_one_shared_bucket() {
+        let mode = BucketMode::parse("hand4_k3k3_progress8_wsb").unwrap();
+        assert!(mode.shared_bucket);
+        let selectable = 4 * 9 * 8;
+        assert_eq!(mode.selectable_buckets(), selectable);
+        assert_eq!(mode.total_buckets(), selectable + 1);
+        assert_eq!(mode.shared_bucket_index(), Some(selectable));
+        assert_eq!(mode.canonical_token(), "hand4_k3k3_progress8_wsb");
+    }
+
+    #[test]
+    fn wsb_alone_is_none_plus_shared() {
+        let mode = BucketMode::parse("wsb").unwrap();
+        assert_eq!(mode.selectable_buckets(), 1);
+        assert_eq!(mode.total_buckets(), 2);
+        assert_eq!(mode.shared_bucket_index(), Some(1));
+        assert_eq!(mode.canonical_token(), "wsb");
+    }
+
+    #[test]
+    fn wsb_combines_with_router() {
+        let mode = BucketMode::parse("k3k3_routerkpabs9_wsb").unwrap();
+        assert_eq!(mode.selectable_buckets(), 9 * 9);
+        assert_eq!(mode.total_buckets(), 9 * 9 + 1);
+        // combine_bucket_index は wsb の有無に関わらず selectable の範囲のみを返す。
+        let board = ShogiBoard {
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        };
+        let idx = combine_bucket_index(&mode, &board, None, Some(3));
+        assert!(idx < mode.selectable_buckets());
+    }
+
+    #[test]
+    fn wsb_must_be_last_token() {
+        assert!(BucketMode::parse("wsb_k3k3").is_err());
+        assert!(BucketMode::parse("k3k3_wsb_progress4").is_err());
+        assert!(BucketMode::parse("k3k3_progress4_wsb").is_ok());
+    }
+
+    #[test]
+    fn no_shared_bucket_index_without_wsb() {
+        let mode = BucketMode::parse("k3k3").unwrap();
+        assert_eq!(mode.shared_bucket_index(), None);
+        assert_eq!(mode.total_buckets(), mode.selectable_buckets());
     }
 }

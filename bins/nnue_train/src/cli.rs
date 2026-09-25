@@ -999,6 +999,15 @@ pub(crate) struct LayerstackArgs {
     /// via `atomicAdd`, not a fixed-size register file, so they support any
     /// bucket count). Empty string (or `none`) means a single bucket (no
     /// LayerStack selection at all).
+    ///
+    /// A trailing `wsb` (WithSharedBucket, must be the last token) adds one
+    /// extra bucket that is always selected in addition to the position's
+    /// own bucket; at inference the two buckets' outputs are averaged (see
+    /// YaneuraOu's `NNUE_SFNN_USE_SHARED_BUCKET`,
+    /// `docs/decisions/2026-09-16-wsb-shared-bucket.md`). The GPU
+    /// forward/backward runs the selected bucket and the shared bucket
+    /// (index `total_buckets - 1`) through the L1/L2/L3 stack, averages the
+    /// two outputs, and splits the loss gradient 0.5/0.5 between them.
     #[arg(long, default_value = "progress8")]
     pub(crate) bucket_mode: String,
 

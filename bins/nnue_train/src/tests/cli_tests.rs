@@ -273,6 +273,16 @@ fn kingrank9_bucket_mode_validation() {
 }
 
 #[test]
+fn wsb_bucket_mode_is_accepted() {
+    // `wsb` (WithSharedBucket) はGPU forward/backwardで「選択バケット + 共有
+    // バケットの平均」を計算する (docs/decisions/2026-09-16-wsb-shared-bucket.md)。
+    let args = layerstack_args(&["--bucket-mode", "k3k3_wsb"]);
+    let mode = validate_bucket_mode(&args).expect("wsb should be accepted");
+    assert!(mode.shared_bucket);
+    assert_eq!(mode.total_buckets(), 9 + 1);
+}
+
+#[test]
 fn router_mode_defaults_to_hard_em_and_parses_backprop() {
     let default_args = layerstack_args(&["--bucket-mode", "router"]);
     assert_eq!(default_args.router_mode, RouterModeArg::HardEm);
