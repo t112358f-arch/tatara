@@ -2765,3 +2765,66 @@ extern "C" __global__ void bias_grad_bucket(
                   output_gradient[i]);
     }
 }
+
+// wsb (WithSharedBucket): 汎用 per-bucket weight backward。1 thread = 1 (bucket, oi, ii)
+// cell で、全 batch を scan して `bucket_idx[b] == bucket` の行だけ加算し、cell を
+// **上書き** する (Rust 版 `dense_mm_bwd_weight_bucket` と同じ)。wsb の共有バケット勾配を
+// compact な scratch (`num_buckets = outer_buckets`) に計算するのに使う。
+extern "C" __global__ void dense_mm_bwd_weight_bucket(
+    const float* x,
+    unsigned long long,
+    const float* dy,
+    unsigned long long,
+    const int* bucket_idx,
+    unsigned long long,
+    float* grad_w,
+    unsigned long long,
+    unsigned int batch,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int num_buckets
+) {
+    const unsigned long long tid =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long per_bucket = static_cast<unsigned long long>(out_dim) * in_dim;
+    const unsigned long long total = static_cast<unsigned long long>(num_buckets) * per_bucket;
+    if (tid >= total) {
+        return;
+    }
+    const int target_bucket = static_cast<int>(tid / per_bucket);
+    const unsigned long long rem = tid % per_bucket;
+    const unsigned int oi = static_cast<unsigned int>(rem / in_dim);
+    const unsigned int ii = static_cast<unsigned int>(rem % in_dim);
+    float sum = 0.0F;
+    for (unsigned int b = 0; b < batch; ++b) {
+        if (bucket_idx[b] == target_bucket) {
+            sum += x[static_cast<unsigned long long>(b) * in_dim + ii] *
+                   dy[static_cast<unsigned long long>(b) * out_dim + oi];
+        }
+    }
+    grad_w[tid] = sum;
+}
+
+// wsb: compact な共有バケット勾配 scratch (`outer_buckets` 個の `block_size` 要素 slab) を、
+// 実際の重み配列 (`output`) の `o * (inner_buckets + 1) + inner_buckets` 番目の slab へ
+// 書き戻す。書き込み先は thread ごとに相異なるので plain write。他の slab には触れない。
+extern "C" __global__ void scatter_shared_bucket_slabs(
+    const float* scratch,
+    unsigned long long,
+    float* output,
+    unsigned long long,
+    unsigned int outer_buckets,
+    unsigned int inner_buckets,
+    unsigned int block_size
+) {
+    const unsigned long long tid =
+        static_cast<unsigned long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const unsigned long long total = static_cast<unsigned long long>(outer_buckets) * block_size;
+    if (tid >= total) {
+        return;
+    }
+    const unsigned long long o = tid / block_size;
+    const unsigned long long k = tid % block_size;
+    const unsigned long long dst_slab = o * (static_cast<unsigned long long>(inner_buckets) + 1) + inner_buckets;
+    output[dst_slab * block_size + k] = scratch[tid];
+}

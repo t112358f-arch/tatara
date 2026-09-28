@@ -393,6 +393,13 @@ impl SimpleGpuTrainer {
         nnue_train::dataloader::BucketMode::NONE
     }
 
+    /// `--bucket-mode` の `wsb` (WithSharedBucket) は LayerStack アーキ
+    /// (`GpuTrainer`) 専用 (`--arch simple` では常に `BucketMode::NONE` なので
+    /// `wsb` を指定しようがない)。そのため `SimpleGpuTrainer` は
+    /// `trainer_backend_impl!` マクロが要求するこの hook をトレイト既定と
+    /// 同じ no-op stub で満たすだけでよい。
+    fn set_shared_bucket_idx(&mut self, _shared_bucket_idx: &[i32]) {}
+
     /// `--bucket-mode` の router 成分 (`routerkpabs<N>`/`routerft<R>ft<R>`) は
     /// LayerStack アーキ (`GpuTrainer`) 専用 (`--arch simple` では CLI 側で
     /// 拒否される)。そのため `SimpleGpuTrainer` は

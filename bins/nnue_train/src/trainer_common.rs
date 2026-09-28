@@ -329,6 +329,13 @@ macro_rules! trainer_backend_impl {
         resume_error: $resume_error:literal $(,)?
     ) => {
         impl nnue_train::trainer::TrainerBackend for $trainer {
+            fn set_shared_bucket_idx(&mut self, shared_bucket_idx: &[i32]) {
+                // 各 `$trainer` は同名 inherent method を持つ必要がある
+                // (`router_train_oracle_batch` 等、他の hook と同じ慣習)。`wsb`
+                // 非対応の backend (`SimpleGpuTrainer` 等) は no-op stub でよい。
+                self.set_shared_bucket_idx(shared_bucket_idx)
+            }
+
             fn train_step(
                 &mut self,
                 batch: &nnue_train::dataloader::Batch,

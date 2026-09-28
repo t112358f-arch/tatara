@@ -1895,7 +1895,51 @@ pub fn dense_mm_bwd_weight_bucket(
     }
 }
 
-/// L3 weight backward (specialized: `out_dim=1`, `num_buckets<=9`; `in_dim` は L2 の
+/// wsb (WithSharedBucket) の共有バケット勾配を、compactな scratch レイアウト
+/// (`outer_buckets` 個の `block_size` 要素 slab、0..outer_buckets-1 で連続して並ぶ、
+/// [`dense_mm_bwd_weight_bucket`] を `bucket_idx` に「共有バケットのouter index
+/// (`shared_bucket_idx / (inner_buckets+1)`)」を渡して計算した結果) から、
+/// 実際の重み/bias 配列 (`num_buckets = outer_buckets * (inner_buckets + 1)` 個の
+/// `block_size` 要素 slab のうち、outer block `o` の共有バケットは
+/// `o * (inner_buckets + 1) + inner_buckets` 番目の slab を占める) の対応する
+/// 位置へ書き戻す。
+///
+/// 1 thread = scratch の 1 element (`tid == scratch index`)。書き込み先
+/// (`dst_idx = (o*(inner_buckets+1)+inner_buckets) * block_size + k`) は thread
+/// ごとに相異なる (o, k) の単射から一意に決まるので data race は無く、plain write
+/// でよい (atomic 不要)。選択branch側が同じ `dst` バッファの他の slab
+/// (non-shared slot、`k' != inner_buckets (mod inner_buckets+1)` の位置) に書いた
+/// 値には一切触れない。
+///
+/// host 契約: `dst` は `num_buckets * block_size` 要素以上確保済み。
+/// `scratch` は `outer_buckets * block_size` 要素ちょうど。
+#[allow(clippy::too_many_arguments)]
+#[kernel]
+pub fn scatter_shared_bucket_slabs(
+    scratch: &[f32],
+    output: &[f32],
+    outer_buckets: u32,
+    inner_buckets: u32,
+    block_size: u32,
+) {
+    let tid = thread::index_1d();
+    let block_size_u = block_size as usize;
+    let total = (outer_buckets as usize) * block_size_u;
+    if tid.get() >= total {
+        return;
+    }
+    let o = tid.get() / block_size_u;
+    let k = tid.get() % block_size_u;
+    let dst_slab = o * (inner_buckets as usize + 1) + inner_buckets as usize;
+    let dst_idx = dst_slab * block_size_u + k;
+    // SAFETY: host 契約により `dst_idx < num_buckets * block_size == output.len()`。
+    // 上記の通り thread ごとに相異なる `dst_idx` へ書くので各 thread の write は
+    // disjoint (`inverse_permute_rows_f32` と同じ raw ptr write の慣習)。
+    unsafe {
+        let dst = output.as_ptr().add(dst_idx) as *mut f32;
+        *dst = scratch[tid.get()];
+    }
+}
 /// 出力次元で runtime arg)。`grad_w[buc][0][ii] = Σ_{b: bucket[b]==buc} x[b][ii] * dy[b][0]`。
 ///
 /// 列 `ii` を専有する thread を `R = block_dim / in_dim` 本持ち (`r = tid / in_dim`、`ii =

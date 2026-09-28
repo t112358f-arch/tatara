@@ -275,6 +275,14 @@ pub(crate) struct GpuTrainer {
     /// 起動時に決まり、以降不変。
     num_buckets: usize,
     bucket_mode: BucketMode,
+    /// `memcpy_htod_async` の host 側ソース (`[shared_bucket_idx, shared_outer_idx]`
+    /// を 2 step 分ping-pongで保持)。`memcpy_htod_async` は「stream 完了まで host
+    /// slice を生かし続ける」契約なので、step ローカルな `Vec` を直接
+    /// ソースにせず、lag-1 pipeline (step N の呼出時点で step N-1 の H2D は完了済、
+    /// したがって step N-2 のソースは確実に再利用可能) の保証に乗って 2 slot を
+    /// 交互に使う。
+    shared_host_ring: [[Vec<i32>; 2]; 2],
+    shared_host_ring_pos: usize,
     optimizer: OptimizerKind,
     step_count: u64,
     /// `--bucket-mode router` の GPU-resident 学習 state
@@ -429,15 +437,40 @@ pub(crate) struct GpuWorkspace {
 
     // -- WSB (WithSharedBucket) 用の共有bucket branch buffer --
     // `bucket_mode.shared_bucket` が true のときのみ確保する (`Some`、それ以外は
-    // 常に `None` で既存 baseline と完全に同じメモリ使用量・挙動)。共有bucketの
-    // `bucket_idx` (`shared_bucket_idx_dev`) は全行が同じ定数
-    // (`BucketMode::shared_bucket_index()`) なので、選択bucket側のような bucket
-    // sort/tile scratch (`bucket_counts_dev` 等) は使わず、L1 も L2/L3 と同じ plain
-    // per-bucket kernel (`dense_mm_fwd_bucket` 系) をそのまま使う
-    // (docs/decisions/2026-09-16-wsb-shared-bucket.md §2b の実装レシピ)。
-    /// batch: 全行 `BucketMode::shared_bucket_index()` の定数。`new` 時に1回だけ
-    /// host → device 転送する (学習中ずっと不変)。
+    // 常に `None` で既存 baseline と完全に同じメモリ使用量・挙動)。`wsb` が
+    // hand/king/progress/router の途中カテゴリに付く一般化された仕様では、共有
+    // bucketのindex (`shared_bucket_idx_dev`) は position ごとに異なりうる
+    // (`bucket_mode.outer_buckets() > 1`) ので、選択bucket側と同じく毎batch
+    // host → device 転送する。forward / bias backward / L1 input backward は
+    // 選択branchの L2/L3 と同じ plain per-bucket kernel (`dense_mm_fwd_bucket` /
+    // `bias_grad_bucket` / `dense_mm_bwd_input_bucket`) をそのまま使う (これらは
+    // 書き込み先が専有buffer、または atomic accumulate なので、`num_buckets`
+    // 全域を対象にしても選択branch側の書き込みと衝突しない)。L1 weight
+    // backward だけは書き込み先 (`l1_w_grad`) を選択branchと共有する
+    // (non-shared slotは選択branch、shared slotはこちらが書く) ので、
+    // `dense_mm_bwd_weight_bucket` を「共有バケットのouter index (compact
+    // 0..outer_buckets-1)」に対してだけ小さな scratch buffer
+    // (`l1_w_grad_shared_scratch`) へ計算してから、`scatter_shared_bucket_slabs`
+    // で `l1_w_grad` の対応する slot にだけ書き戻す (docs/decisions/
+    // 2026-09-16-wsb-shared-bucket.md §2b, §3 (2026-10 改訂: 一般化対応) の
+    // 実装レシピ)。
+    /// batch: 各行の共有バケット (`wsb`) の実際の重み配列index
+    /// (`bucket_mode.shared_bucket_index_for_board` / `dataloader::shared_bucket_board`
+    /// が計算)。選択branchの `bucket_idx_dev` と同じく毎batch host → device 転送
+    /// する (`outer_buckets()==1` のグローバル共有バケットでは全行同じ値になるが、
+    /// 一般化された仕様では position ごとに異なりうる)。
     shared_bucket_idx_dev: Option<DeviceBuffer<i32>>,
+    /// `shared_bucket_idx_dev` から導出した「共有バケットのouter index」
+    /// (`shared_bucket_idx / (inner_buckets+1)`、compactに0..outer_buckets()-1)。
+    /// L1 weight backward の scratch 計算 (`dense_mm_bwd_weight_bucket` を
+    /// `num_buckets = outer_buckets()` で起動) にだけ使う。
+    shared_outer_idx_dev: Option<DeviceBuffer<i32>>,
+    /// L1 weight backward の共有bucket分を計算する、compactな scratch buffer
+    /// (`outer_buckets() * l1_out * ft_out` 要素、0..outer_buckets()-1 で連続)。
+    /// `dense_mm_bwd_weight_bucket` で計算した後、`scatter_shared_bucket_slabs`
+    /// で `l1_w_grad` の実際の slot (`o*(inner_buckets+1)+inner_buckets`) へ
+    /// 書き戻す。
+    l1_w_grad_shared_scratch: Option<DeviceBuffer<f32>>,
     l1_bucket_shared: Option<DeviceBuffer<f32>>, // b × l1_out
     l1_total_shared: Option<DeviceBuffer<f32>>, // b × l1_out
     l1_main_shared: Option<DeviceBuffer<f32>>, // b × l1_effective
@@ -540,7 +573,8 @@ impl GpuWorkspace {
         ft_fp16_out: bool,
         tf32: bool,
         feature_set: FeatureSetSpec,
-        shared_bucket_index: Option<usize>,
+        shared_bucket: bool,
+        outer_buckets: usize,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         assert!(num_buckets >= 1, "GpuWorkspace requires num_buckets >= 1");
         let ft_in = feature_set.ft_in();
@@ -642,39 +676,41 @@ impl GpuWorkspace {
                 z(0)?
             },
             dl2_out_sorted: z(padded_sort_batch(batch, num_buckets) * l2_out)?,
-            shared_bucket_idx_dev: match shared_bucket_index {
-                Some(idx) => Some(DeviceBuffer::<i32>::from_host(
-                    stream,
-                    &vec![idx as i32; batch],
-                )?),
-                None => None,
-            },
-            l1_bucket_shared: shared_bucket_index.map(|_| z(batch * l1_out)).transpose()?,
-            l1_total_shared: shared_bucket_index.map(|_| z(batch * l1_out)).transpose()?,
-            l1_main_shared: shared_bucket_index.map(|_| z(batch * l1_effective)).transpose()?,
-            l1_skip_shared: shared_bucket_index.map(|_| z(batch * L1_SKIP)).transpose()?,
-            l1_sqr_shared: shared_bucket_index.map(|_| z(batch * l1_effective)).transpose()?,
-            l2_pre_shared: shared_bucket_index.map(|_| z(batch * l2_in)).transpose()?,
-            l2_input_shared: shared_bucket_index.map(|_| z(batch * l2_in)).transpose()?,
-            l2_dense_out_shared: shared_bucket_index.map(|_| z(batch * l2_out)).transpose()?,
-            l2_acted_shared: shared_bucket_index.map(|_| z(batch * l2_out)).transpose()?,
-            l3_out_shared: shared_bucket_index.map(|_| z(batch)).transpose()?,
-            net_output_shared: shared_bucket_index.map(|_| z(batch)).transpose()?,
-            dl2_acted_shared: shared_bucket_index.map(|_| z(batch * l2_out)).transpose()?,
-            dl2_out_shared: shared_bucket_index.map(|_| z(batch * l2_out)).transpose()?,
-            dl2_input_shared: shared_bucket_index.map(|_| z(batch * l2_in)).transpose()?,
-            dl2_pre_shared: shared_bucket_index.map(|_| z(batch * l2_in)).transpose()?,
-            dl1_sqr_shared: shared_bucket_index.map(|_| z(batch * l1_effective)).transpose()?,
-            dl1_main_from_concat_shared: shared_bucket_index
-                .map(|_| z(batch * l1_effective))
+            shared_bucket_idx_dev: shared_bucket
+                .then(|| DeviceBuffer::<i32>::zeroed(stream, batch))
                 .transpose()?,
-            dl1_main_from_sqr_shared: shared_bucket_index
-                .map(|_| z(batch * l1_effective))
+            shared_outer_idx_dev: shared_bucket
+                .then(|| DeviceBuffer::<i32>::zeroed(stream, batch))
                 .transpose()?,
-            dl1_main_shared: shared_bucket_index.map(|_| z(batch * l1_effective)).transpose()?,
-            dl1_total_shared: shared_bucket_index.map(|_| z(batch * l1_out)).transpose()?,
-            dcombined_from_l1_shared: shared_bucket_index.map(|_| z(batch * ft_out)).transpose()?,
-            dl1_total_summed: shared_bucket_index.map(|_| z(batch * l1_out)).transpose()?,
+            l1_w_grad_shared_scratch: shared_bucket
+                .then(|| z(outer_buckets * l1_out * ft_out))
+                .transpose()?,
+            l1_bucket_shared: shared_bucket.then(|| z(batch * l1_out)).transpose()?,
+            l1_total_shared: shared_bucket.then(|| z(batch * l1_out)).transpose()?,
+            l1_main_shared: shared_bucket.then(|| z(batch * l1_effective)).transpose()?,
+            l1_skip_shared: shared_bucket.then(|| z(batch * L1_SKIP)).transpose()?,
+            l1_sqr_shared: shared_bucket.then(|| z(batch * l1_effective)).transpose()?,
+            l2_pre_shared: shared_bucket.then(|| z(batch * l2_in)).transpose()?,
+            l2_input_shared: shared_bucket.then(|| z(batch * l2_in)).transpose()?,
+            l2_dense_out_shared: shared_bucket.then(|| z(batch * l2_out)).transpose()?,
+            l2_acted_shared: shared_bucket.then(|| z(batch * l2_out)).transpose()?,
+            l3_out_shared: shared_bucket.then(|| z(batch)).transpose()?,
+            net_output_shared: shared_bucket.then(|| z(batch)).transpose()?,
+            dl2_acted_shared: shared_bucket.then(|| z(batch * l2_out)).transpose()?,
+            dl2_out_shared: shared_bucket.then(|| z(batch * l2_out)).transpose()?,
+            dl2_input_shared: shared_bucket.then(|| z(batch * l2_in)).transpose()?,
+            dl2_pre_shared: shared_bucket.then(|| z(batch * l2_in)).transpose()?,
+            dl1_sqr_shared: shared_bucket.then(|| z(batch * l1_effective)).transpose()?,
+            dl1_main_from_concat_shared: shared_bucket
+                .then(|| z(batch * l1_effective))
+                .transpose()?,
+            dl1_main_from_sqr_shared: shared_bucket
+                .then(|| z(batch * l1_effective))
+                .transpose()?,
+            dl1_main_shared: shared_bucket.then(|| z(batch * l1_effective)).transpose()?,
+            dl1_total_shared: shared_bucket.then(|| z(batch * l1_out)).transpose()?,
+            dcombined_from_l1_shared: shared_bucket.then(|| z(batch * ft_out)).transpose()?,
+            dl1_total_summed: shared_bucket.then(|| z(batch * l1_out)).transpose()?,
         })
     }
 
@@ -1094,7 +1130,8 @@ impl GpuTrainer {
                 precision.ft_fp16_out,
                 precision.tf32,
                 feature_set,
-                bucket_mode.shared_bucket_index().map(|v| v as usize),
+                bucket_mode.shared_bucket,
+                bucket_mode.outer_buckets() as usize,
             )?,
             // loss + step
             loss_acc: DeviceBuffer::<f64>::zeroed(&stream, 1)?,
@@ -1114,6 +1151,8 @@ impl GpuTrainer {
             norm_scratch: DeviceBuffer::<f32>::zeroed(&stream, norm_scratch_len)?,
             num_buckets,
             bucket_mode,
+            shared_host_ring: Default::default(),
+            shared_host_ring_pos: 0,
             optimizer,
             step_count: 0,
             #[cfg(feature = "cuda-oxide")]
@@ -1740,6 +1779,48 @@ impl GpuTrainer {
     /// 含める。中間 activation / grad buffer は `GpuTrainer` 上の workspace に永続化
     /// しているので、`step_impl` で drop されるのは入力 H2D buffer (`stm_idx_dev` 等、
     /// position 数に比例した小さい buffer) だけになり、teardown tick は ~0 に落ちる。
+    /// `TrainerBackend::set_shared_bucket_idx` (互換のために残している hook)。
+    /// 共有バケットindexは `bucket_idx` から一意に導出できる
+    /// (`shared = (bucket / (inner+1)) * (inner+1) + inner`) ため、
+    /// `step_impl` は毎回 `upload_shared_bucket_idx` で導出し直す。渡された値は使わない。
+    pub(crate) fn set_shared_bucket_idx(&mut self, _shared_bucket_idx: &[i32]) {}
+
+    /// wsb: `bucket_idx` (選択側の実際の重み配列index、`0..num_buckets-1`) から、
+    /// 各行の共有バケットindex (`shared_bucket_idx_dev`) と共有バケットのouter index
+    /// (`shared_outer_idx_dev`、L1 weight backward の scratch 計算専用) を導出して
+    /// H2D する。`bucket_mode.shared_bucket` が `false` なら何もしない。
+    fn upload_shared_bucket_idx(&mut self, bucket_idx: &[i32]) -> Result<(), Box<dyn std::error::Error>> {
+        if !self.bucket_mode.shared_bucket {
+            return Ok(());
+        }
+        let block = self.bucket_mode.inner_buckets() as i32 + 1;
+        let inner = block - 1;
+        let slot = self.shared_host_ring_pos;
+        self.shared_host_ring_pos ^= 1;
+        {
+            let [idx_host, outer_host] = &mut self.shared_host_ring[slot];
+            idx_host.clear();
+            outer_host.clear();
+            for &v in bucket_idx {
+                let o = v / block;
+                idx_host.push(o * block + inner);
+                outer_host.push(o);
+            }
+        }
+        let shared_idx_dev = self.ws.shared_bucket_idx_dev.as_ref()
+            .expect("shared_bucket_idx_dev is Some when bucket_mode.shared_bucket");
+        let shared_outer_dev = self.ws.shared_outer_idx_dev.as_ref()
+            .expect("shared_outer_idx_dev is Some when bucket_mode.shared_bucket");
+        // SAFETY: ソースは `self.shared_host_ring[slot]` (2 slot ping-pong)。lag-1
+        // pipeline により、この slot を次に書き換える step N+2 の時点で H2D は完了済。
+        // 以降の kernel は全て同じ `self.stream` 上に enqueue される。
+        unsafe {
+            gpu_runtime::memcpy_htod_async(shared_idx_dev, &self.shared_host_ring[slot][0], &self.stream)?;
+            gpu_runtime::memcpy_htod_async(shared_outer_dev, &self.shared_host_ring[slot][1], &self.stream)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn step(
         &mut self,
         batch: &BatchData,
@@ -2266,6 +2347,10 @@ impl GpuTrainer {
         // 境界に整列し、bucket 末端 / 次 bucket 開始間に padding 行ができる。padding 行は
         // bucket=-1 で initialise (sorted kernel 側で skip)、perm も -1 sentinel (inverse
         // permute が skip)。
+        // wsb: `bucket_idx` (選択側の実際の重み配列index) から共有バケットindexを導出して
+        // H2D する (skip_ft の router sweep でも `bucket_idx` が候補ごとに変わるので
+        // 常にここで導出する)。
+        self.upload_shared_bucket_idx(batch.bucket_idx)?;
         memset_zero(&self.stream, &self.ws.bucket_counts_dev)?;
         memset_zero(&self.stream, &self.ws.bucket_write_ctr_dev)?;
         memset_minus_one_i32(&self.stream, &self.ws.bucket_perm_dev)?;
@@ -2663,9 +2748,9 @@ impl GpuTrainer {
 
         // -- WSB (WithSharedBucket): 共有bucket branch の forward --
         // 選択bucket側 (Forward step 4〜14) と全く同じ計算を、bucket_idx だけ
-        // `shared_bucket_idx_dev` (全行同じ定数 = `BucketMode::shared_bucket_index()`)
-        // に差し替えて行う。共有bucketのbucket_idxは全行同一で sort する意味が
-        // 無いので、L1もL2/L3と同じ plain `dense_mm_fwd_bucket` をそのまま使う
+        // `shared_bucket_idx_dev` (各行の共有バケットの実際の重み配列index、毎batch H2D)
+        // に差し替えて行う。共有bucketは書き込み先が専有bufferで sort が不要なので、
+        // L1もL2/L3と同じ plain `dense_mm_fwd_bucket` をそのまま使う
         // (選択branch側の bucket sort/tile scratch には一切触れない)。`l1f_out`
         // (bucket非依存の共有dense head) は選択branchで既に計算済みの
         // `self.ws.l1f_out` をそのまま再利用する (再計算不要 — combinedのみに
@@ -4121,47 +4206,67 @@ impl GpuTrainer {
         prof_tick!("bwd_L1");
 
         // -- WSB (WithSharedBucket): 共有bucket branch の L1 (per-bucket) backward --
-        // 共有bucketの bucket_idx は全行同一なので、選択branch側のような
-        // sort/tile 前提の kernel (`dense_mm_bwd_weight_bucket_tiled_l1_sorted` や、
-        // 9-bucket固定accumulatorを持つ旧 `dense_mm_bwd_weight_bucket_tiled_l1`)
-        // は使わず、全行が同じ1個のbucketであることを直接利用した cuBLAS の
-        // 単純な matmul (l1f と同じパターン) で計算する — bucket分岐が原理的に
-        // 不要なため、bucket数に一切依存しない。書き込み先は `l1_w_grad`/
-        // `l1_b_grad`/`l1f_w_grad` 等とは異なる、共有bucket専用のセル
-        // (`self.l1_w_grad` の `shared_bucket_index() * l1_out * ft_out` 以降)
-        // なので、選択branch側の書き込みとは衝突しない。
+        // 共有bucketの実際のindex (`shared_bucket_idx_dev`) は `outer_buckets()==1`
+        // (`wsb` が先頭トークン/単体、旧仕様のグローバル共有バケット) のときだけ
+        // 全行同一で、`wsb` が hand/king/progress/router の途中カテゴリに付く
+        // 一般化された仕様 (`outer_buckets()>1`) では局面ごとに異なりうる。
+        // bias backward (`bias_grad_bucket`、下記) と forward
+        // (`dense_mm_fwd_bucket`、fwd_L1 節) は元々 per-row 対応の汎用kernelを
+        // そのまま使っているので変更不要。L1 weight backward だけは書き込み先
+        // (`l1_w_grad`) を選択branchと共有するので、「共有バケットのouter index」
+        // (`shared_outer_idx_dev`、compactに0..outer_buckets()-1) に対して汎用
+        // per-bucket kernel `dense_mm_bwd_weight_bucket` で小さな scratch
+        // (`l1_w_grad_shared_scratch`) へ計算してから、`scatter_shared_bucket_slabs`
+        // で `l1_w_grad` の実際の slot (`o*(inner_buckets+1)+inner_buckets`) にだけ
+        // 書き戻す (選択branch側が書いた他のslotのcellには一切触れない)。
+        // L1 input backward (`dcombined_from_l1_shared`) は書き込み先が共有branch
+        // 専用の buffer なので、`shared_bucket_idx_dev` (実際の重み配列index、
+        // `self.num_buckets` 全域) をそのまま渡す汎用 `dense_mm_bwd_input_bucket`
+        // で計算してよい (衝突しない)。
         if self.bucket_mode.shared_bucket {
-            let shared_idx = self
-                .bucket_mode
-                .shared_bucket_index()
-                .expect("shared_bucket_index() is Some when bucket_mode.shared_bucket")
-                as usize;
             let dl1_total_shared = self.ws.dl1_total_shared.as_ref()
                 .expect("dl1_total_shared is Some when bucket_mode.shared_bucket");
+            let outer_buckets = self.bucket_mode.outer_buckets() as usize;
+            let inner_buckets = self.bucket_mode.inner_buckets() as usize;
 
-            // L1 weight backward (共有bucket分のみ、他bucketのcellには一切触れない):
-            // `l1_w_grad[shared_idx][o][i] = Σ_b dl1_total_shared[b][o] * combined[b][i]`
-            // = `dl1_total_shared^T[l1_out,batch] @ combined[batch,ft_out]`
-            // (l1_w の per-bucket layout は `[l1_out, ft_out]` = [out, in]、l1f_w の
-            // `[ft_out, l1_out]` = [in, out] とは逆順なので、l1f_w_grad の
-            // `sgemm_xt_y_rowmajor` 呼び出しとは m/n の割り当てが入れ替わる)。
-            //
-            // SAFETY: combined / dl1_total_shared / l1_w_grad は cudaMalloc 由来。
-            // 書き込み先オフセット `shared_idx * l1_out * ft_out` は
-            // `shared_idx < self.num_buckets` (= `bucket_mode.total_buckets()`) から
-            // `l1_w_grad` の確保サイズ (`num_buckets * l1_out * ft_out`) 内に収まる。
-            // `self.cublas` は `self.stream` に bind 済で同 stream 内 in-order 実行。
+            // L1 weight backward (共有bucket分のみ、compact scratch へ)。
+            let scratch = self.ws.l1_w_grad_shared_scratch.as_ref()
+                .expect("l1_w_grad_shared_scratch is Some when bucket_mode.shared_bucket");
+            let shared_outer_idx_dev = self.ws.shared_outer_idx_dev.as_ref()
+                .expect("shared_outer_idx_dev is Some when bucket_mode.shared_bucket");
             unsafe {
-                let grad_base = self.l1_w_grad.cu_deviceptr() as *mut f32;
-                self.cublas.sgemm_xt_y_rowmajor(
-                    l1_out as i32, // m = out_dim
-                    ft_out as i32, // n = in_dim
-                    b_u32 as i32,  // k = batch (reduce)
-                    dl1_total_shared.cu_deviceptr() as *const f32,
-                    self.ws.combined.cu_deviceptr() as *const f32,
-                    grad_base.add(shared_idx * l1_out * ft_out),
-                )?;
-            }
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_bwd_weight_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(outer_buckets * l1_out * ft_out),
+                    args: [
+                        slice(self.ws.combined),
+                        slice(dl1_total_shared),
+                        slice(shared_outer_idx_dev),
+                        slice_mut(scratch),
+                        b_u32, ft_out as u32, l1_out as u32, outer_buckets as u32
+                    ]
+                }
+            }?;
+            // scratch (compact 0..outer_buckets-1) を `l1_w_grad` の実際の slot へ
+            // 書き戻す (他のslotのcellには一切触れない、`scatter_shared_bucket_slabs`
+            // の doc 参照)。
+            unsafe {
+                cuda_launch! {
+                    kernel: scatter_shared_bucket_slabs,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(outer_buckets * l1_out * ft_out),
+                    args: [
+                        slice(scratch),
+                        slice(self.l1_w_grad),
+                        outer_buckets as u32, inner_buckets as u32, (l1_out * ft_out) as u32
+                    ]
+                }
+            }?;
 
             // L1 bias backward (共有bucket分、atomicAdd accumulate — 選択branch側の
             // sorted kernel が書く他bucketのcellとは独立)。
@@ -4183,28 +4288,27 @@ impl GpuTrainer {
                 }
             }?;
 
-            // L1 input backward (共有branch分の dcombined):
-            // `dcombined_from_l1_shared[b][i] = Σ_o dl1_total_shared[b][o] * l1_w[shared_idx][o][i]`
-            // = `dl1_total_shared[batch,l1_out] @ l1_w[shared_idx][l1_out,ft_out]`
-            // (l1f_out の forward (`sgemm_fwd_rowmajor(batch, l1_out, ft_out, combined,
-            // l1f_w, l1f_out)`) と全く同じ形の matmul、重みを l1_w の共有bucket
-            // スライスに差し替えただけ)。
-            //
-            // SAFETY: 上と同様、`l1_w` の読み出しオフセットも `shared_idx * l1_out *
-            // ft_out` で `l1_w` の確保サイズ内に収まる。
+            // L1 input backward (共有branch分の dcombined、専用bufferへの書き込み
+            // なので選択branchとは衝突しない)。
             unsafe {
-                let l1w_base = self.l1_w.cu_deviceptr() as *const f32;
-                self.cublas.sgemm_fwd_rowmajor(
-                    b_u32 as i32,  // m = batch
-                    ft_out as i32, // n = in_dim (out of this matmul)
-                    l1_out as i32, // k = out_dim (reduce)
-                    dl1_total_shared.cu_deviceptr() as *const f32,
-                    l1w_base.add(shared_idx * l1_out * ft_out),
-                    self.ws.dcombined_from_l1_shared.as_ref()
-                        .expect("dcombined_from_l1_shared is Some when bucket_mode.shared_bucket")
-                        .cu_deviceptr() as *mut f32,
-                )?;
-            }
+                // SAFETY: kernel signature と args の個数・順序・型は一致し、渡す buffer は
+                // stream の完了を待つ同期点まで生存する device allocation。
+                cuda_launch! {
+                    kernel: dense_mm_bwd_input_bucket,
+                    stream: self.stream,
+                    module: self.module,
+                    config: cfg_1d(b * ft_out),
+                    args: [
+                        slice(dl1_total_shared),
+                        slice(self.l1_w),
+                        slice(self.ws.shared_bucket_idx_dev.as_ref()
+                            .expect("shared_bucket_idx_dev is Some when bucket_mode.shared_bucket")),
+                        slice_mut(self.ws.dcombined_from_l1_shared.as_mut()
+                            .expect("dcombined_from_l1_shared is Some when bucket_mode.shared_bucket")),
+                        b_u32, ft_out as u32, l1_out as u32, self.num_buckets as u32
+                    ]
+                }
+            }?;
 
             // -- WSB: 選択branchの dcombined_from_l1 に共有branchの寄与を畳み込む --
             // これで直後の `ft_post_perspective_grad_fused[_fp16]` (`dcombined_from_l1`

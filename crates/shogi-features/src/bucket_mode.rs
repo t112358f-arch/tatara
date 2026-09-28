@@ -1,25 +1,65 @@
 //! `--bucket-mode` の複合バケット DSL。
 //!
-//! YaneuraOu (現行, `architectures/nnue_arch_gen.py` V1.03) の SFNN layer-stack
+//! YaneuraOu (現行, `architectures/nnue_arch_gen.py` V1.04) の SFNN layer-stack
 //! トークン列と **同じ文字列** ・**同じ合成規則** を tatara の学習側でも解釈できるように
 //! する。`hand4/16/64/64z/256/1024` ・ `k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29` ・
 //! `progress2/3/4/8/16/32` を `_` 区切りで自由に複合でき (各カテゴリ最大1個)、
 //! `routerkpabs<N>` / `routerft<R>ft<R>` (どちらか一方のみ、最大1個) を追加できる。
-//! さらに末尾に `wsb` (WithSharedBucket) を置くと、常に選ばれる共有バケットを
-//! 1個追加できる。
 //!
-//! 合成順序 (バケットindexの桁の重み) は **hand → king → progress → router** の順に
-//! `idx = idx * category_buckets + category_index` を繰り返したもの。router 系は
-//! カテゴリの中で常に最後 (= 最下位桁) に合成される。これは YaneuraOu
-//! `evaluate_nnue.cpp` の `stack_index_for_nnue()` と完全に同じ規則 (このファイルは
-//! そのRust移植)。`wsb` は上記の合成には加わらない別枠で、hand/king/progress/router
-//! の合成バケット数 (`prefix_buckets() * router.bucket_count()`) に対して常に
-//! index = その総数 (=最後の1個) を追加する。この共有バケットの選択規則も
-//! `evaluate_nnue.cpp` の `NNUE_SFNN_USE_SHARED_BUCKET` 分岐と同じ (常に有効)。
+//! # 合成順序 (`order` トークン)
+//!
+//! バケットindexの桁の重みを決める合成順序は、デフォルトでは
+//! **hand → king → progress → router** の順 (`idx = idx * category_buckets +
+//! category_index` を先頭カテゴリから順に繰り返す。実際に使われていない
+//! カテゴリはスキップされる)。この順序は `order<letters>` トークン
+//! (`H`=hand, `K`=king, `P`=progress, `R`=router の並び、例: `orderPRKH`) で
+//! 明示的に変更できる。`order` トークンは、実際に使われているカテゴリ
+//! ちょうど全部の順列でなければならず (使われていないカテゴリの文字が
+//! 混じっているとエラー)、バケット名の中に最大1個。省略時はデフォルト順序
+//! (`orderHKPR` 相当)。`order` トークンはバケットindexの合成順序だけを
+//! 変えるものであり、`wsb` の付く位置 (次項) とは独立。
+//!
+//! # `wsb` (WithSharedBucket) — 直前のバケット単位での共有バケット
+//!
+//! バケット名の中のどこかに `wsb` を置く (最大1個、文字列上の位置は自由) と、
+//! **`wsb` の直前のトークンに対応するカテゴリ以降 (=合成順序上、そのカテゴリの
+//! 桁からより下位の桁まで全部) を束ねたブロック** に、そのブロックの選択肢
+//! (＝そのブロックに属するカテゴリの合成バケット数の積) に加えてもう1個、
+//! 「常に選ばれる共有バケット」を追加する。`wsb` より外側 (合成順序上、より
+//! 上位の桁) のカテゴリはそのまま外側の乗数として残る。`wsb` がバケット名の
+//! 先頭トークン (＝直前のトークンが無い) の場合は、合成順序の一番外側から
+//! 全部をこのブロックとみなす — これは旧仕様 (`wsb` は常にバケット名の末尾、
+//! 常に全体で1個だけの共有バケット) と同じ挙動になる。
+//!
+//! 具体例 (`progress8` と `routerkpabs16` の複合、デフォルト合成順序
+//! progress→router):
+//! - `progress8_wsb_routerkpabs16`: `wsb` の直前は `progress8`。合成順序上
+//!   `progress` は一番外側の桁なので、ブロック = progress×router 全部。
+//!   常に有効な共有バケット1個 + 選択バケット `8*16` 個、合計
+//!   `1 + 8*16 = 129` バケット。
+//! - `progress8_routerkpabs16_wsb`: `wsb` の直前は `routerkpabs16`。ブロック
+//!   = router だけ (progress はブロックの外側)。progress の値ごとに
+//!   共有バケット1個 + 選択バケット16個を持つので、合計
+//!   `8 * (1 + 16) = 136` バケット。
+//!
+//! (`wsb` 単体、または `order` トークンだけ挟んで `wsb` を先頭に置いた場合は
+//! 旧仕様と同じ「グローバルに1個だけの共有バケット」になる。)
+//!
+//! `wsb` は、その直前のトークンとして (合成順序に関わらず) hand/king/progress/
+//! router のいずれのカテゴリトークンの直後にも置ける。`order` トークンの直後に
+//! `wsb` を置くことはできない (どのカテゴリを指すか曖昧なため; エラーになる)。
 //!
 //! 保存形式は YaneuraOu の慣習 (このバケットindexの並び) を正として、tatara旧形式や
 //! yaneuraou-privateとは非互換。旧形式からの変換は `net_convert_bucket_layout`
 //! (bins/net_convert_bucket_layout) を使う。
+//!
+//! # 破壊的変更に関する注記
+//!
+//! 本モジュールの `wsb` の意味論は、旧版 (`wsb` は常にバケット名の末尾のみ許可、
+//! 常に「グローバルに1個だけの共有バケット」を追加する仕様) から変更されている。
+//! 旧版で `..._wsb` として学習した net の挙動を再現したい場合は、`wsb` を
+//! バケット名の**先頭**に置く (`wsb_...`) こと。バケット名の末尾に置く
+//! `..._wsb` は、直前のカテゴリ単位の共有バケット (新仕様) に意味が変わる。
 
 use shogi_format::{Color, ShogiBoard, Square};
 
@@ -131,8 +171,45 @@ impl KingSubMode {
     }
 }
 
+/// バケットカテゴリの種類 (`order` トークンや `wsb` の付け根の指定に使う)。
+/// 実際のサブモード (`HandSubMode` 等) とは別に、「合成順序上のどのカテゴリか」
+/// だけを表す軽量な識別子。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Category {
+    Hand,
+    King,
+    Progress,
+    Router,
+}
+
+impl Category {
+    fn letter(self) -> char {
+        match self {
+            Category::Hand => 'H',
+            Category::King => 'K',
+            Category::Progress => 'P',
+            Category::Router => 'R',
+        }
+    }
+
+    fn from_letter(c: char) -> Option<Category> {
+        match c.to_ascii_uppercase() {
+            'H' => Some(Category::Hand),
+            'K' => Some(Category::King),
+            'P' => Some(Category::Progress),
+            'R' => Some(Category::Router),
+            _ => None,
+        }
+    }
+}
+
+/// `order` トークン省略時のデフォルト合成順序 (hand → king → progress → router、
+/// 従来の固定順序と同じ)。
+pub const DEFAULT_ORDER: [Category; 4] =
+    [Category::Hand, Category::King, Category::Progress, Category::Router];
+
 /// パース済みの `--bucket-mode` (複合可能な hand/king/progress/router)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BucketMode {
     pub hand: Option<HandSubMode>,
     pub king: Option<KingSubMode>,
@@ -140,66 +217,224 @@ pub struct BucketMode {
     /// 単に progress バケットを使わないことを表す)。
     pub progress: Option<u32>,
     pub router: Option<RouterSubMode>,
-    /// `wsb` (WithSharedBucket)。true のとき、hand/king/progress/router の合成
-    /// バケットに加えて「常に選ばれる共有バケット」を1個追加する
-    /// (index は常に `prefix_buckets() * router.bucket_count()`、すなわち
-    /// 合成バケット数そのもの = 最後の1個)。
+    /// バケットindexの合成順序 (桁の重み、最上位桁から順)。`order` トークンで
+    /// 明示しない限り `DEFAULT_ORDER`。実際に存在しないカテゴリのエントリは
+    /// 無視される。
+    pub order: [Category; 4],
+    /// `wsb` (WithSharedBucket) の有無。
     pub shared_bucket: bool,
+    /// `wsb` がトークン文字列上、直前に置かれていたカテゴリ。`shared_bucket`
+    /// が `false` のときは常に `None`。`shared_bucket` が `true` で、かつ
+    /// `wsb` が文字列の先頭 (直前トークンなし) だった場合も `None` になり、
+    /// この場合は合成順序の最上位桁からブロックが始まる (＝全体で1個だけの
+    /// グローバル共有バケット、旧仕様と同じ挙動)。
+    pub shared_bucket_after: Option<Category>,
 }
 
 impl BucketMode {
-    pub const NONE: BucketMode =
-        BucketMode { hand: None, king: None, progress: None, router: None, shared_bucket: false };
+    pub const NONE: BucketMode = BucketMode {
+        hand: None,
+        king: None,
+        progress: None,
+        router: None,
+        order: DEFAULT_ORDER,
+        shared_bucket: false,
+        shared_bucket_after: None,
+    };
 
-    /// router以外 (hand/king/progress) の合成バケット数。router併用時、
-    /// 合成後の総バケットindexから `prefix = idx / router.bucket_count()` で
-    /// 復元できる (router は必ず最後=最下位桁に合成されるため)。
-    pub fn prefix_buckets(&self) -> u32 {
-        let mut n = 1u32;
-        if let Some(h) = self.hand {
-            n *= h.bucket_count();
+    fn category_present(&self, cat: Category) -> bool {
+        match cat {
+            Category::Hand => self.hand.is_some(),
+            Category::King => self.king.is_some(),
+            Category::Progress => self.progress.is_some(),
+            Category::Router => self.router.is_some(),
         }
-        if let Some(k) = self.king {
-            n *= k.bucket_count();
-        }
-        if let Some(p) = self.progress {
-            n *= p;
-        }
-        n
     }
 
-    /// router 自身のバケット数 (kpabsならN、ft-by-ftならR*R)。router無しならNone。
-    pub fn router_bucket_count(&self) -> Option<u32> {
-        self.router.map(RouterSubMode::bucket_count)
+    fn category_bucket_count(&self, cat: Category) -> u32 {
+        match cat {
+            Category::Hand => self.hand.map(HandSubMode::bucket_count).unwrap_or(1),
+            Category::King => self.king.map(KingSubMode::bucket_count).unwrap_or(1),
+            Category::Progress => self.progress.unwrap_or(1),
+            Category::Router => self.router.map(RouterSubMode::bucket_count).unwrap_or(1),
+        }
     }
 
-    /// hand/king/progress/router の合成バケット数 (`wsb` の共有バケットを含まない)。
-    /// `wsb` 有効時、共有バケットの index はこの値そのもの (= 合成バケットの直後)。
+    /// 実際に使われているカテゴリだけを、合成順序 (`order`) 通りに並べたリスト
+    /// (最上位桁から順)。
+    pub fn present_order(&self) -> Vec<Category> {
+        self.order.iter().copied().filter(|&c| self.category_present(c)).collect()
+    }
+
+    /// `wsb` のブロック境界 (`present_order()` 中のindex、このindex以降が
+    /// 共有バケットのブロックに入る)。`shared_bucket` が `false` のときに
+    /// 呼ぶのは呼び出し側のバグなので 0 を返す (使われない前提)。
+    fn cut_position(&self, present: &[Category]) -> usize {
+        match self.shared_bucket_after {
+            None => 0,
+            Some(cat) => present.iter().position(|&c| c == cat).unwrap_or(0),
+        }
+    }
+
+    /// `wsb` のブロックより外側 (合成順序上、より上位の桁) のカテゴリの
+    /// 合成バケット数の積。`wsb` 無効時は常に1。
+    pub fn outer_buckets(&self) -> u32 {
+        if !self.shared_bucket {
+            return 1;
+        }
+        let present = self.present_order();
+        let p = self.cut_position(&present);
+        present[..p].iter().map(|&c| self.category_bucket_count(c)).product()
+    }
+
+    /// `wsb` のブロック (直前のカテゴリ以降、最下位桁まで) の合成バケット数の積
+    /// (共有バケット自体の+1は含まない)。`wsb` 無効時は全カテゴリの積
+    /// (＝ `selectable_buckets()` と同じ)。
+    pub fn inner_buckets(&self) -> u32 {
+        let present = self.present_order();
+        if !self.shared_bucket {
+            return present.iter().map(|&c| self.category_bucket_count(c)).product();
+        }
+        let p = self.cut_position(&present);
+        present[p..].iter().map(|&c| self.category_bucket_count(c)).product()
+    }
+
+    /// hand/king/progress/router の合成バケット数 (`wsb` の共有バケットを
+    /// 含まない、常に `outer_buckets() * inner_buckets()` に等しい)。
     pub fn selectable_buckets(&self) -> u32 {
-        let mut n = self.prefix_buckets();
-        if let Some(r) = self.router {
-            n *= r.bucket_count();
-        }
-        n
+        self.present_order().iter().map(|&c| self.category_bucket_count(c)).product()
     }
 
-    /// 総バケット数 (hand * king * progress * router、`wsb` 有効時はさらに+1)。
+    /// 総バケット数 (＝実際の重み配列のサイズ)。`wsb` 有効時は
+    /// `outer_buckets() * (inner_buckets() + 1)` (`outer_buckets()` 個のブロック
+    /// それぞれに共有バケットが1個ずつ挿入される)。`wsb` 無効時は
+    /// `selectable_buckets()` と同じ。
     pub fn total_buckets(&self) -> u32 {
-        self.selectable_buckets() + u32::from(self.shared_bucket)
+        if self.shared_bucket {
+            self.outer_buckets() * (self.inner_buckets() + 1)
+        } else {
+            self.selectable_buckets()
+        }
     }
 
-    /// `wsb` 有効時の共有バケットのindex (`selectable_buckets()` と同値)。
-    /// `wsb` 無効時に呼ぶのは呼び出し側のバグなので `None` を返す。
-    pub fn shared_bucket_index(&self) -> Option<u32> {
-        self.shared_bucket.then(|| self.selectable_buckets())
+    /// 合成順序 (`present_order()`) に従って各カテゴリのバケット値を
+    /// `idx = idx * count + sub` として合成した、隙間の無い密なindex
+    /// (`0..selectable_buckets()`)。`wsb` による+1の挿入は反映しない
+    /// (`remap_dense_index` / `shared_bucket_index_for` が行う)。
+    fn dense_selectable_index(
+        &self,
+        board: &ShogiBoard,
+        progress_bucket: Option<u32>,
+        router_bucket: Option<u32>,
+    ) -> u32 {
+        let mut idx = 0u32;
+        for cat in self.present_order() {
+            let (count, sub) = match cat {
+                Category::Hand => {
+                    let h = self.hand.expect("present_order only yields present categories");
+                    (h.bucket_count(), hand_bucket(h, board))
+                }
+                Category::King => {
+                    let k = self.king.expect("present_order only yields present categories");
+                    (k.bucket_count(), king_bucket(k, board))
+                }
+                Category::Progress => {
+                    let p = self.progress.expect("present_order only yields present categories");
+                    (p, progress_bucket.unwrap_or(0).min(p - 1))
+                }
+                Category::Router => {
+                    let r = self.router.expect("present_order only yields present categories");
+                    let rb = router_bucket.unwrap_or(0).min(r.bucket_count() - 1);
+                    (r.bucket_count(), rb)
+                }
+            };
+            idx = idx * count + sub;
+        }
+        idx
+    }
+
+    /// `dense_selectable_index` の密indexを、実際の重み配列index
+    /// (`0..total_buckets()`、`wsb` 有効時は各外側ブロックに共有バケット1個が
+    /// 挿入された形) に変換する。
+    fn remap_dense_index(&self, dense_idx: u32) -> u32 {
+        if !self.shared_bucket {
+            return dense_idx;
+        }
+        let inner = self.inner_buckets();
+        let outer_idx = dense_idx / inner;
+        let inner_idx = dense_idx % inner;
+        outer_idx * (inner + 1) + inner_idx
+    }
+
+    /// `dense_selectable_index` の密indexが属する外側ブロックの共有バケットの
+    /// 実際の重み配列index。`wsb` 無効時は `None`。
+    fn shared_bucket_index_for_dense(&self, dense_idx: u32) -> Option<u32> {
+        if !self.shared_bucket {
+            return None;
+        }
+        let inner = self.inner_buckets();
+        let outer_idx = dense_idx / inner;
+        Some(outer_idx * (inner + 1) + inner)
+    }
+
+    /// 局面に対応する、選択バケット側の実際の重み配列index
+    /// (`0..total_buckets()`)。
+    pub fn combine_bucket_index(
+        &self,
+        board: &ShogiBoard,
+        progress_bucket: Option<u32>,
+        router_bucket: Option<u32>,
+    ) -> u32 {
+        self.remap_dense_index(self.dense_selectable_index(board, progress_bucket, router_bucket))
+    }
+
+    /// 局面に対応する、共有バケット側の実際の重み配列index (同じ外側ブロック内
+    /// の共有バケットindex)。`wsb` 無効時は `None`。`outer_buckets() == 1`
+    /// (`wsb` が先頭トークン、または `wsb` 単体) のときは局面によらず常に同じ
+    /// 1つのindexを返す (旧仕様のグローバル共有バケットと同じ)。
+    pub fn shared_bucket_index_for_board(
+        &self,
+        board: &ShogiBoard,
+        progress_bucket: Option<u32>,
+        router_bucket: Option<u32>,
+    ) -> Option<u32> {
+        self.shared_bucket_index_for_dense(self.dense_selectable_index(
+            board,
+            progress_bucket,
+            router_bucket,
+        ))
+    }
+
+    /// `wsb` 有効時に、局面によらず常に同じ1個の共有バケットindexだけを持つか
+    /// (＝ `outer_buckets() == 1`)。GPU学習側の高速経路 (全行が同一bucketである
+    /// 前提の cuBLAS 直接呼び出し) が使えるかどうかの判定に使う。
+    pub fn has_single_global_shared_bucket(&self) -> bool {
+        self.shared_bucket && self.outer_buckets() == 1
+    }
+
+    /// `has_single_global_shared_bucket()` が `true` のときの、その唯一の共有
+    /// バケットの実際の重み配列index (常に `total_buckets() - 1`)。それ以外
+    /// (wsb無効、または `outer_buckets() > 1` で局面ごとに共有バケットindexが
+    /// 変わる場合) は `None`。GPU学習側の「バッチ全行が同じ共有バケット」を
+    /// 前提にした定数broadcast経路 (`GpuWorkspace` construction) が使う。
+    pub fn global_shared_bucket_index(&self) -> Option<u32> {
+        if self.has_single_global_shared_bucket() {
+            Some(self.inner_buckets())
+        } else {
+            None
+        }
     }
 
     /// YaneuraOu生成器の `NNUE_SFNN_*` マクロと同じ形の正準トークン列
-    /// (`hand64z_k9k9_progress4_routerkpabs5` のように、hand→king→progress→routerの順)。
-    /// `wsb` は常に末尾に付与する。空 (バケット無し) のときは `"NONE"` (`wsb` 単独の
-    /// ときは `"WSB"`)。
+    /// (`hand64z_k9k9_progress4_routerkpabs5` のように、hand→king→progress→routerの順、
+    /// `order` が非デフォルトならそれも含む)。`wsb` は元々置かれていた直前カテゴリの
+    /// 直後に挿入する (直前カテゴリが無かった場合は先頭)。空 (バケット無し) の
+    /// ときは `"NONE"` (`wsb` 単独のときは `"WSB"`)。
     pub fn canonical_token(&self) -> String {
         let mut parts = Vec::new();
+        if self.order != DEFAULT_ORDER && !self.selectable_buckets_is_trivial() {
+            parts.push(order_token(&self.present_order()));
+        }
         if let Some(h) = self.hand {
             parts.push(h.token().to_string());
         }
@@ -213,7 +448,21 @@ impl BucketMode {
             parts.push(r.token());
         }
         if self.shared_bucket {
-            parts.push("wsb".to_string());
+            match self.shared_bucket_after {
+                None => parts.insert(0, "wsb".to_string()),
+                Some(cat) => {
+                    let token = match cat {
+                        Category::Hand => self.hand.map(|h| h.token().to_string()),
+                        Category::King => self.king.map(|k| k.token().to_string()),
+                        Category::Progress => self.progress.map(|p| format!("progress{p}")),
+                        Category::Router => self.router.map(RouterSubMode::token),
+                    };
+                    match token.and_then(|t| parts.iter().position(|p| *p == t)) {
+                        Some(pos) => parts.insert(pos + 1, "wsb".to_string()),
+                        None => parts.push("wsb".to_string()),
+                    }
+                }
+            }
         }
         if parts.is_empty() {
             "NONE".to_string()
@@ -222,11 +471,20 @@ impl BucketMode {
         }
     }
 
-    /// `--bucket-mode` 文字列 (`_` 区切りトークン列、順不同、大文字小文字不問) をパースする。
-    /// 各カテゴリ (hand/king/progress/router) は最大1個、router系
-    /// (routerkpabs/routerft{R}ft{R}) は互いに排他。`wsb` はどのトークンとも複合でき、
-    /// **文字列上、必ず最後のトークン**でなければならない (YaneuraOu
-    /// `nnue_arch_gen.py` の `wsb` 検証と同じ規則)。
+    /// `order` トークンを出す意味が無いケース (使われているカテゴリが0か1個)
+    /// を検出する — 順序を並べ替えても何も変わらないので、canonical化のとき
+    /// ノイズになる `order` トークンを省く。
+    fn selectable_buckets_is_trivial(&self) -> bool {
+        self.present_order().len() <= 1
+    }
+
+    /// `--bucket-mode` 文字列 (`_` 区切りトークン列、順不同 [`order`/`wsb` の
+    /// 相対位置を除く]、大文字小文字不問) をパースする。各カテゴリ
+    /// (hand/king/progress/router) は最大1個、router系
+    /// (routerkpabs/routerft{R}ft{R}) は互いに排他。`order<letters>` は最大1個で、
+    /// 実際に使われているカテゴリちょうど全部の順列でなければならない。`wsb` は
+    /// 最大1個、どのカテゴリトークンの直後にも置ける (文字列上の位置は自由。
+    /// ただし `order` トークンの直後には置けない)。
     ///
     /// 空文字列 / `"none"` はバケット無し (`BucketMode::NONE`、常に bucket 0 の1バケット)
     /// を表す。
@@ -237,17 +495,26 @@ impl BucketMode {
         }
 
         let mut mode = BucketMode::NONE;
+        let mut explicit_order: Option<Vec<Category>> = None;
+        let mut wsb_after_token: Option<String> = None;
+        let mut wsb_seen = false;
         let raw_tokens: Vec<&str> = spec.split('_').filter(|t| !t.is_empty()).collect();
-        let last_index = raw_tokens.len().checked_sub(1);
         for (i, raw_token) in raw_tokens.iter().enumerate() {
             let token = normalize_token(raw_token);
             if token == "WSB" {
-                if Some(i) != last_index {
-                    return Err(format!(
-                        "wsb (WithSharedBucket) must be the last token in bucket-mode {spec:?}"
-                    ));
+                if wsb_seen {
+                    return Err(format!("wsb (WithSharedBucket) may appear at most once in bucket-mode {spec:?}"));
                 }
+                wsb_seen = true;
                 mode.shared_bucket = true;
+                wsb_after_token = i.checked_sub(1).map(|prev| normalize_token(raw_tokens[prev]));
+                continue;
+            }
+            if let Some(order) = parse_order_token(&token)? {
+                if explicit_order.is_some() {
+                    return Err(format!("order<letters> may appear at most once in bucket-mode {spec:?}"));
+                }
+                explicit_order = Some(order);
                 continue;
             }
             if let Some(hand) = parse_hand_token(&token) {
@@ -281,11 +548,112 @@ impl BucketMode {
                 continue;
             }
             return Err(format!(
-                "unknown bucket-mode token {raw_token:?} in {spec:?}; expected hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, progress2/3/4/8/16/32, routerkpabs<N>, routerft<R>ft<R>, or wsb"
+                "unknown bucket-mode token {raw_token:?} in {spec:?}; expected hand4/16/64/64z/256/1024, k3k3/k9k9/k9k9z/k13k13z/k21k21/k29k29, progress2/3/4/8/16/32, routerkpabs<N>, routerft<R>ft<R>, order<letters>, or wsb"
             ));
         }
+
+        // order トークンの検証: 実際に使われているカテゴリちょうど全部の順列であること
+        // (順列である事は parse_order_token 側で重複禁止により保証済みなので、ここでは
+        // 集合として一致するかだけ見ればよい)。
+        if let Some(order) = explicit_order {
+            let mut present: Vec<Category> = [Category::Hand, Category::King, Category::Progress, Category::Router]
+                .into_iter()
+                .filter(|&c| mode.category_present(c))
+                .collect();
+            present.sort_by_key(|c| c.letter());
+            let mut given_sorted = order.clone();
+            given_sorted.sort_by_key(|c| c.letter());
+            if given_sorted != present {
+                return Err(format!(
+                    "order<letters> must be a permutation of exactly the categories present in bucket-mode {spec:?}"
+                ));
+            }
+            // `order` フィールドは常に4要素の配列として持つ。使われていない
+            // カテゴリは (present_order() でどのみち除外されるので) デフォルト順で
+            // 末尾に埋めておくだけでよい。
+            let mut order4 = order;
+            for cat in DEFAULT_ORDER {
+                if !order4.contains(&cat) {
+                    order4.push(cat);
+                }
+            }
+            mode.order = [order4[0], order4[1], order4[2], order4[3]];
+        }
+
+        // wsb の直前トークンをカテゴリに解決する。
+        if mode.shared_bucket {
+            mode.shared_bucket_after = match wsb_after_token {
+                None => None,
+                Some(prev) if parse_order_token(&prev).ok().flatten().is_some() => {
+                    return Err(format!(
+                        "wsb (WithSharedBucket) cannot immediately follow an order<letters> token in bucket-mode {spec:?}"
+                    ));
+                }
+                Some(prev) => Some(category_of_token(&prev).ok_or_else(|| {
+                    format!("wsb (WithSharedBucket) must immediately follow a hand/king/progress/router token in bucket-mode {spec:?}")
+                })?),
+            };
+        }
+
         Ok(mode)
     }
+}
+
+/// `order<letters>` トークンの正準表記 (`order` + 実際に使われているカテゴリの
+/// 文字を合成順序通りに並べたもの)。
+fn order_token(present_order: &[Category]) -> String {
+    let mut s = String::from("order");
+    for c in present_order {
+        s.push(c.letter());
+    }
+    s
+}
+
+/// `order<letters>` トークンの中身をパースする。`letters` は使われている
+/// カテゴリの個数ぶんだけ (1〜4文字) 指定すればよい (例: progress/router しか
+/// 使わないなら `orderRP` の2文字でよい)。実際にその通り「使われている
+/// カテゴリちょうど全部」になっているかどうかは、他のトークンを全部見終わった
+/// 後で `BucketMode::parse` 側が検証する。
+fn parse_order_token(token: &str) -> Result<Option<Vec<Category>>, String> {
+    let Some(rest) = token.strip_prefix("ORDER") else {
+        return Ok(None);
+    };
+    let len = rest.chars().count();
+    if len == 0 || len > 4 {
+        return Err(format!(
+            "order<letters> must list 1 to 4 letters (a permutation of a subset of H/K/P/R), got \"order{rest}\""
+        ));
+    }
+    let mut cats = Vec::with_capacity(len);
+    let mut seen = std::collections::HashSet::new();
+    for c in rest.chars() {
+        let cat = Category::from_letter(c).ok_or_else(|| {
+            format!("order<letters> letters must be H/K/P/R, got \"order{rest}\"")
+        })?;
+        if !seen.insert(c.to_ascii_uppercase()) {
+            return Err(format!("order<letters> must not repeat a letter, got \"order{rest}\""));
+        }
+        cats.push(cat);
+    }
+    Ok(Some(cats))
+}
+
+/// トークン文字列 (正規化済み、大文字) がどのカテゴリに属するかを判定する
+/// (`wsb` の直前トークンをカテゴリへ解決するのに使う)。
+fn category_of_token(token: &str) -> Option<Category> {
+    if parse_hand_token(token).is_some() {
+        return Some(Category::Hand);
+    }
+    if parse_king_token(token).is_some() {
+        return Some(Category::King);
+    }
+    if parse_progress_token(token).is_some() {
+        return Some(Category::Progress);
+    }
+    if parse_router_token(token).ok().flatten().is_some() {
+        return Some(Category::Router);
+    }
+    None
 }
 
 fn normalize_token(token: &str) -> String {
@@ -364,6 +732,29 @@ fn parse_router_token(token: &str) -> Result<Option<RouterSubMode>, String> {
     }
     Ok(None)
 }
+
+/// 旧APIとの互換のため残しているフリー関数版。`mode.combine_bucket_index(...)`
+/// に委譲する (返り値は実際の重み配列index `0..mode.total_buckets()`)。
+pub fn combine_bucket_index(
+    mode: &BucketMode,
+    board: &ShogiBoard,
+    progress_bucket: Option<u32>,
+    router_bucket: Option<u32>,
+) -> u32 {
+    mode.combine_bucket_index(board, progress_bucket, router_bucket)
+}
+
+/// 旧APIとの互換のため残しているフリー関数版。
+/// `mode.shared_bucket_index_for_board(...)` に委譲する。
+pub fn shared_bucket_index_for_board(
+    mode: &BucketMode,
+    board: &ShogiBoard,
+    progress_bucket: Option<u32>,
+    router_bucket: Option<u32>,
+) -> Option<u32> {
+    mode.shared_bucket_index_for_board(board, progress_bucket, router_bucket)
+}
+
 
 // ============================================================
 //  hand / king バケット index の計算 (YaneuraOu evaluate_nnue.cpp を移植)
@@ -606,51 +997,6 @@ pub fn king_bucket(sub: KingSubMode, board: &ShogiBoard) -> u32 {
         KingSubMode::K29K29 => king29_by_king29_bucket(board),
     }
 }
-
-/// `mode` の router以外 (hand/king/progress) の合成バケットindex
-/// (`0..mode.prefix_buckets()`)。router自身の選択が決まる前に、まずこれを
-/// 求めてから `combine_bucket_index` に渡す (dataloaderのpush時と、router
-/// oracle sweepでの「同じprefixを保ったままrouterの候補だけ振る」用途の両方
-/// で使う)。
-pub fn prefix_index(mode: &BucketMode, board: &ShogiBoard, progress_bucket: Option<u32>) -> u32 {
-    let mut idx = 0u32;
-    if let Some(h) = mode.hand {
-        idx = hand_bucket(h, board);
-    }
-    if let Some(k) = mode.king {
-        idx = idx * k.bucket_count() + king_bucket(k, board);
-    }
-    if let Some(p) = mode.progress {
-        idx = idx * p + progress_bucket.unwrap_or(0).min(p - 1);
-    }
-    idx
-}
-
-/// `BucketMode` 全体のバケットindexを、hand/king/progressの合成値 (router抜き) と
-/// router自身のバケットindexから合成する。router は必ず最後 (最下位桁)。
-///
-/// 戻り値は常に `0..mode.selectable_buckets()` の範囲 (`wsb` の共有バケット index
-/// `mode.shared_bucket_index()` は含まない)。`wsb` 有効時、共有バケットは局面に
-/// 依らず常に選ばれる別枠のバケットなので、呼び出し側 (dataloader / trainer) が
-/// この関数の戻り値と `shared_bucket_index()` の両方を必要に応じて使う。
-///
-/// `progress_bucket` / `router_bucket` は呼び出し側 (progress8kpabs / RouterKPAbs /
-/// FT-by-FTのargmax) が計算した値を渡す — このcrateはFT重みや学習済みrouterの
-/// 重みを持たないため、progress・router自体のバケットindex計算はここでは行わない。
-pub fn combine_bucket_index(
-    mode: &BucketMode,
-    board: &ShogiBoard,
-    progress_bucket: Option<u32>,
-    router_bucket: Option<u32>,
-) -> u32 {
-    let mut idx = prefix_index(mode, board, progress_bucket);
-    if let Some(r) = mode.router {
-        let rb = router_bucket.unwrap_or(0).min(r.bucket_count() - 1);
-        idx = idx * r.bucket_count() + rb;
-    }
-    idx
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -705,11 +1051,10 @@ mod tests {
     }
 
     #[test]
-    fn router_always_combines_last() {
-        // hand4 * king(k3k3=9) * router(kpabs 5) の合成順で、router が最下位桁になることを確認。
+    fn router_always_last_by_default_order() {
+        // デフォルト合成順序 (hand→king→progress→router) では router が最下位桁になる。
         let mode = BucketMode::parse("hand4_k3k3_routerkpabs5").unwrap();
         assert_eq!(mode.total_buckets(), 4 * 9 * 5);
-        // combine_bucket_index の合成式そのものを直接検証 (盤面はダミーで hand=0/king=0 側)。
         let board = ShogiBoard {
             black_king_sq: Square::new(4, 8),
             white_king_sq: Square::new(4, 0),
@@ -717,55 +1062,175 @@ mod tests {
         };
         let idx_r0 = combine_bucket_index(&mode, &board, None, Some(0));
         let idx_r1 = combine_bucket_index(&mode, &board, None, Some(1));
-        assert_eq!(idx_r1 - idx_r0, 1, "router must be the least-significant digit");
+        assert_eq!(idx_r1 - idx_r0, 1, "router must be the least-significant digit by default");
     }
 
+    fn dummy_board() -> ShogiBoard {
+        ShogiBoard {
+            black_king_sq: Square::new(4, 8),
+            white_king_sq: Square::new(4, 0),
+            ..Default::default()
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // wsb: 直前のバケット単位での共有バケット (新仕様)
+    // ------------------------------------------------------------------
+
     #[test]
-    fn wsb_adds_one_shared_bucket() {
-        let mode = BucketMode::parse("hand4_k3k3_progress8_wsb").unwrap();
+    fn wsb_before_router_is_globally_shared() {
+        // progress8_wsb_routerkpabs16: wsb の直前は progress。デフォルト合成順序
+        // progress→router では progress が最上位桁 (=全体の先頭) なので、
+        // ブロック = progress×router 全部。共有バケットは1個だけ (グローバル)。
+        let mode = BucketMode::parse("progress8_wsb_routerkpabs16").unwrap();
         assert!(mode.shared_bucket);
-        let selectable = 4 * 9 * 8;
-        assert_eq!(mode.selectable_buckets(), selectable);
-        assert_eq!(mode.total_buckets(), selectable + 1);
-        assert_eq!(mode.shared_bucket_index(), Some(selectable));
-        assert_eq!(mode.canonical_token(), "hand4_k3k3_progress8_wsb");
+        assert_eq!(mode.shared_bucket_after, Some(Category::Progress));
+        assert_eq!(mode.selectable_buckets(), 8 * 16);
+        assert_eq!(mode.outer_buckets(), 1);
+        assert_eq!(mode.inner_buckets(), 8 * 16);
+        assert_eq!(mode.total_buckets(), 1 + 8 * 16);
+        assert!(mode.has_single_global_shared_bucket());
+
+        // 局面によらず共有バケットindexは常に同じ (selectable_buckets() の値)。
+        let b1 = dummy_board();
+        let mut b2 = dummy_board();
+        b2.black_king_sq = Square::new(0, 8);
+        assert_eq!(
+            mode.shared_bucket_index_for_board(&b1, Some(0), Some(0)),
+            Some(8 * 16)
+        );
+        assert_eq!(
+            mode.shared_bucket_index_for_board(&b2, Some(7), Some(15)),
+            Some(8 * 16)
+        );
     }
 
     #[test]
-    fn wsb_alone_is_none_plus_shared() {
+    fn wsb_after_router_is_shared_per_progress() {
+        // progress8_routerkpabs16_wsb: wsb の直前は router。ブロック = router
+        // だけなので、progress の値ごとに共有バケット1個+選択16個を持つ。
+        let mode = BucketMode::parse("progress8_routerkpabs16_wsb").unwrap();
+        assert!(mode.shared_bucket);
+        assert_eq!(mode.shared_bucket_after, Some(Category::Router));
+        assert_eq!(mode.selectable_buckets(), 8 * 16);
+        assert_eq!(mode.outer_buckets(), 8);
+        assert_eq!(mode.inner_buckets(), 16);
+        assert_eq!(mode.total_buckets(), 8 * (1 + 16));
+        assert!(!mode.has_single_global_shared_bucket());
+
+        // progress の値が違えば共有バケットindexも違う (progressブロックごとに1個)。
+        let board = dummy_board();
+        let shared_p0 = mode.shared_bucket_index_for_board(&board, Some(0), Some(3)).unwrap();
+        let shared_p1 = mode.shared_bucket_index_for_board(&board, Some(1), Some(9)).unwrap();
+        assert_eq!(shared_p0, 0 * 17 + 16);
+        assert_eq!(shared_p1, 1 * 17 + 16);
+        // 同じ progress なら router の値が違っても共有バケットindexは同じ。
+        let shared_p0_again = mode.shared_bucket_index_for_board(&board, Some(0), Some(12)).unwrap();
+        assert_eq!(shared_p0, shared_p0_again);
+
+        // 選択側のindexは、progressブロック内で router の値がそのまま (0..15) 使われる。
+        assert_eq!(mode.combine_bucket_index(&board, Some(0), Some(3)), 0 * 17 + 3);
+        assert_eq!(mode.combine_bucket_index(&board, Some(1), Some(9)), 1 * 17 + 9);
+    }
+
+    #[test]
+    fn wsb_alone_is_globally_shared() {
         let mode = BucketMode::parse("wsb").unwrap();
+        assert_eq!(mode.shared_bucket_after, None);
         assert_eq!(mode.selectable_buckets(), 1);
         assert_eq!(mode.total_buckets(), 2);
-        assert_eq!(mode.shared_bucket_index(), Some(1));
+        assert!(mode.has_single_global_shared_bucket());
         assert_eq!(mode.canonical_token(), "wsb");
     }
 
     #[test]
-    fn wsb_combines_with_router() {
-        let mode = BucketMode::parse("k3k3_routerkpabs9_wsb").unwrap();
-        assert_eq!(mode.selectable_buckets(), 9 * 9);
-        assert_eq!(mode.total_buckets(), 9 * 9 + 1);
-        // combine_bucket_index は wsb の有無に関わらず selectable の範囲のみを返す。
-        let board = ShogiBoard {
-            black_king_sq: Square::new(4, 8),
-            white_king_sq: Square::new(4, 0),
-            ..Default::default()
-        };
-        let idx = combine_bucket_index(&mode, &board, None, Some(3));
-        assert!(idx < mode.selectable_buckets());
+    fn wsb_first_token_is_globally_shared_like_old_behavior() {
+        // 先頭に wsb を置くと、旧仕様 (常にバケット名の末尾、常にグローバル
+        // 1個だけの共有バケット) と同じ挙動になる。
+        let mode = BucketMode::parse("wsb_hand4_k3k3_progress8").unwrap();
+        assert_eq!(mode.shared_bucket_after, None);
+        let selectable = 4 * 9 * 8;
+        assert_eq!(mode.selectable_buckets(), selectable);
+        assert_eq!(mode.total_buckets(), selectable + 1);
+        assert!(mode.has_single_global_shared_bucket());
     }
 
     #[test]
-    fn wsb_must_be_last_token() {
-        assert!(BucketMode::parse("wsb_k3k3").is_err());
-        assert!(BucketMode::parse("k3k3_wsb_progress4").is_err());
+    fn wsb_may_appear_anywhere_but_only_once() {
+        assert!(BucketMode::parse("wsb_k3k3").is_ok());
+        assert!(BucketMode::parse("k3k3_wsb_progress4").is_ok());
         assert!(BucketMode::parse("k3k3_progress4_wsb").is_ok());
+        assert!(BucketMode::parse("k3k3_wsb_progress4_wsb").is_err());
+    }
+
+    #[test]
+    fn wsb_cannot_follow_order_token() {
+        assert!(BucketMode::parse("orderPRKH_wsb_hand4_k3k3_progress8_routerkpabs4").is_err());
     }
 
     #[test]
     fn no_shared_bucket_index_without_wsb() {
         let mode = BucketMode::parse("k3k3").unwrap();
-        assert_eq!(mode.shared_bucket_index(), None);
+        let board = dummy_board();
+        assert_eq!(mode.shared_bucket_index_for_board(&board, None, None), None);
         assert_eq!(mode.total_buckets(), mode.selectable_buckets());
+    }
+
+    // ------------------------------------------------------------------
+    // order: 合成順序を任意に変更する
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn order_token_changes_digit_significance() {
+        // デフォルト (progress→router) では router が最下位桁。
+        let default_order = BucketMode::parse("progress4_routerkpabs5").unwrap();
+        assert_eq!(default_order.order, DEFAULT_ORDER);
+        let board = dummy_board();
+        let a = default_order.combine_bucket_index(&board, Some(0), Some(0));
+        let b = default_order.combine_bucket_index(&board, Some(0), Some(1));
+        assert_eq!(b - a, 1, "router should be least-significant by default");
+
+        // orderRP (router→progress) で桁の重みを逆転させると、今度は progress
+        // が最下位桁になる。
+        let swapped = BucketMode::parse("progress4_routerkpabs5_orderRP").unwrap();
+        assert_eq!(swapped.order[..2], [Category::Router, Category::Progress]);
+        let a2 = swapped.combine_bucket_index(&board, Some(0), Some(0));
+        let b2 = swapped.combine_bucket_index(&board, Some(1), Some(0));
+        assert_eq!(b2 - a2, 1, "progress should be least-significant after orderRP");
+        assert_eq!(swapped.total_buckets(), 4 * 5);
+    }
+
+    #[test]
+    fn order_token_must_be_permutation_of_present_categories() {
+        // hand/king が無いのに order トークンに H/K を含めるのはエラー。
+        assert!(BucketMode::parse("progress4_routerkpabs5_orderHKPR").is_err());
+        // 使われているカテゴリを全部含まないのもエラー。
+        assert!(BucketMode::parse("hand4_k3k3_progress4_orderPK").is_err());
+        // 重複した文字もエラー。
+        assert!(BucketMode::parse("progress4_routerkpabs5_orderPPPP").is_err());
+    }
+
+    #[test]
+    fn order_combines_with_wsb() {
+        // orderRP + wsb: router が最上位、progress が最下位。wsb の直前は
+        // progress (router→progressの順で書いたとき)、合成順序上 progress は
+        // 最下位桁 (かつ唯一そこから下のカテゴリ) なので、router の値ごとに
+        // 共有バケット1個+選択4個 (progressのbucket数) を持つ。
+        let mode = BucketMode::parse("routerkpabs5_progress4_wsb_orderRP").unwrap();
+        assert_eq!(mode.order[..2], [Category::Router, Category::Progress]);
+        assert_eq!(mode.shared_bucket_after, Some(Category::Progress));
+        assert_eq!(mode.outer_buckets(), 5); // router
+        assert_eq!(mode.inner_buckets(), 4); // progress
+        assert_eq!(mode.total_buckets(), 5 * (4 + 1));
+    }
+
+    #[test]
+    fn total_buckets_matches_example_from_spec() {
+        // ユーザーの例そのもの: progress8_WSB_router16 / progress8_router16_WSB
+        // (router は routerkpabs16 相当)。
+        let a = BucketMode::parse("progress8_wsb_routerkpabs16").unwrap();
+        assert_eq!(a.total_buckets(), 1 + 8 * 16);
+        let b = BucketMode::parse("progress8_routerkpabs16_wsb").unwrap();
+        assert_eq!(b.total_buckets(), 8 * (1 + 16));
     }
 }

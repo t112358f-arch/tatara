@@ -52,7 +52,7 @@ pub struct ValidationReport {
 pub struct HeldoutSet {
     /// `(Batch, per-position bucket)`。`bucket` は学習側 dataloader と同じく
     /// 学習側 dataloader と同じ [`BucketMode`] で計算する。
-    batches: Vec<(Batch, Vec<i32>)>,
+    batches: Vec<(Batch, Vec<i32>, Vec<i32>)>,
     /// 検証 position 総数 (`batches.len() * batch_size`)。
     n_positions: u64,
 }
@@ -166,9 +166,12 @@ impl HeldoutSet {
         assert!(num_buckets >= 1, "num_buckets must be >= 1");
         let bucket_mode = (*bucket_mode).into();
         let n_batches = test_positions.div_ceil(batch_size).max(1);
-        let mut batches: Vec<(Batch, Vec<i32>)> = Vec::with_capacity(n_batches);
+        let mut batches: Vec<(Batch, Vec<i32>, Vec<i32>)> = Vec::with_capacity(n_batches);
         let mut cur = Batch::with_capacity(batch_size, feature_set);
         let mut cur_buckets: Vec<i32> = Vec::with_capacity(batch_size);
+        let mut cur_shared_buckets: Vec<i32> = Vec::with_capacity(
+            if bucket_mode.shared_bucket { batch_size } else { 0 },
+        );
 
         while batches.len() < n_batches {
             let Some(mut board) = next_board(&mut loader)? else {
@@ -189,11 +192,27 @@ impl HeldoutSet {
             let pushed = cur.push_decoded(&board)?;
             debug_assert!(pushed, "Batch::push_decoded refused below batch_size");
             cur_buckets.push(crate::dataloader::bucket_board(bucket_mode, &board, None) as i32);
+            // wsb (WithSharedBucket): この position の共有バケットの実際の重み
+            // 配列index (`bucket_mode.shared_bucket` が `false` なら常に空のまま、
+            // `dataloader` の worker loop / `BucketedPrefetchedLoader` と同じ契約)。
+            // ft-by-ft router は held-out validation では未対応
+            // (`bucket_board` 呼出と同じく `ftbyft_ctx=None`) なので、`wsb` の
+            // ブロックに router (ft-by-ft) が含まれる構成の held-out validation は
+            // 現状 router 部分を bucket 0 扱いする近似になる。
+            if bucket_mode.shared_bucket {
+                let shared = crate::dataloader::shared_bucket_board(bucket_mode, &board, None)
+                    .expect("shared_bucket_board() is Some when bucket_mode.shared_bucket");
+                cur_shared_buckets.push(shared as i32);
+            }
             if cur.n_positions == batch_size {
                 let full =
                     std::mem::replace(&mut cur, Batch::with_capacity(batch_size, feature_set));
                 let full_buckets = std::mem::take(&mut cur_buckets);
-                batches.push((full, full_buckets));
+                let full_shared_buckets = std::mem::replace(
+                    &mut cur_shared_buckets,
+                    Vec::with_capacity(if bucket_mode.shared_bucket { batch_size } else { 0 }),
+                );
+                batches.push((full, full_buckets, full_shared_buckets));
             }
         }
 
@@ -235,7 +254,10 @@ impl HeldoutSet {
         let mut sum_sq_err = 0.0_f64;
         let mut n_correct = 0_u64;
         let mut n_counted = 0_u64;
-        for (batch, buckets) in &self.batches {
+        for (batch, buckets, shared_buckets) in &self.batches {
+            if !shared_buckets.is_empty() {
+                backend.set_shared_bucket_idx(shared_buckets);
+            }
             let out = backend.validate_step(batch, buckets, wdl_lambda, loss)?;
             sum_sq_err += out.sum_sq_err;
             let (correct, counted) = sign_agreement(&out.net_output, batch);
@@ -456,7 +478,7 @@ mod tests {
             9,
         )
         .expect("load held-out set");
-        for (batch, _) in &set.batches {
+        for (batch, _, _) in &set.batches {
             for bi in 0..batch.n_positions {
                 assert!(
                     batch.score[bi].abs() <= 10.0,

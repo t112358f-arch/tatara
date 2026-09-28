@@ -273,6 +273,17 @@ pub struct ValidationStepOutput {
 /// `bins/nnue_train::GpuTrainer` が impl する。本 trait を介すことで loop driver
 /// を GPU 非依存に保ち (CPU-only crate に置ける)、mock backend で単体テストできる。
 pub trait TrainerBackend {
+    /// 次の `train_step`/`validate_step` 呼出で使う、各行の共有バケット (`wsb`)
+    /// の実際の重み配列index (`batch.n_positions` 個、`0..num_buckets-1`) を
+    /// セットする。`--bucket-mode` に `wsb` が無いbackendや、`wsb` はあっても
+    /// このbackendがまだ対応していない場合は default 実装 (no-op) のままでよい。
+    ///
+    /// caller (本 crate の [`run`] / `validation.rs`) は `bucket_mode.shared_bucket`
+    /// が `true` のときだけ、`train_step`/`validate_step` の直前に毎回呼ぶ契約
+    /// (dataloader が返す `shared_buckets`、`dataloader::shared_bucket_board` 由来、
+    /// をそのまま渡す)。
+    fn set_shared_bucket_idx(&mut self, _shared_bucket_idx: &[i32]) {}
+
     /// 1 batch 分 (forward → loss kernel → backward → optimizer step) を実行し、
     /// batch 全体で累積した二乗誤差 (`Σ err²`、まだ position 数で割っていない値)
     /// を返す。caller が報告時に position 数で割って平均 loss にする。
@@ -1029,7 +1040,7 @@ where
     // 直前 batch を `prev_pending` に保持し、次 `train_step` が queue 済 H2D を消化
     // した時点で recycle する (次 step の event sync が直前 batch の full pipeline
     // 完了を保証する)。同期 backend では実害なしだが、async backend を含めて統一形。
-    let mut prev_pending: Option<(Batch, Vec<i32>, Vec<Vec<u32>>)> = None;
+    let mut prev_pending: Option<(Batch, Vec<i32>, Vec<Vec<u32>>, Vec<i32>)> = None;
 
     // router成分 (routerkpabs<N>) の hard-EM router 学習 state。他 bucket mode
     // では未使用 (`router_adam = None`)。`RouterKPAbs` の重み自体は
@@ -1111,12 +1122,17 @@ where
             let lr = lr_scheduler.lr(batch_idx, sb);
             let wdl = wdl_scheduler.blend(batch_idx, sb, cfg.end_superbatch);
 
-            let (batch, buckets, router_indices) = loader.next_batch()?.ok_or_else(|| {
+            let (batch, buckets, router_indices, shared_buckets) = loader.next_batch()?.ok_or_else(|| {
                 io::Error::other(
                     "dataloader stopped supplying batches unexpectedly (workers exited without an error)",
                 )
             })?;
             let n_pos = batch.n_positions;
+            // wsb: 共有バケットindexは、この batch に対する **最初の** forward
+            // (下の router oracle sweep の `validate_step*` を含む) より前にセットする。
+            if !shared_buckets.is_empty() {
+                backend.set_shared_bucket_idx(&shared_buckets);
+            }
 
             // router (hard-EM/backprop 共通): bucket_mode 自体
             // (`bucket_mode.bucket_board` 経由で dataloader が既に割り当てた
@@ -1320,7 +1336,7 @@ where
             if let Some(prev) = prev_pending.take() {
                 loader.recycle(prev);
             }
-            prev_pending = Some((batch, buckets, router_indices));
+            prev_pending = Some((batch, buckets, router_indices, shared_buckets));
             sb_loss += loss;
             sb_positions += n_pos as u64;
 

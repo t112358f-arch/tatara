@@ -144,6 +144,50 @@ pub fn bucket_board(
     combine_bucket_index(&mode, board, progress_bucket, router_bucket)
 }
 
+/// `bucket_board` と同じ局面に対応する、共有バケット (`wsb`) 側の実際の重み配列
+/// index。`mode.shared_bucket` が `false` のときは `None`。
+///
+/// 旧仕様 (`wsb` は常にバケット名の末尾、常にグローバルに1個だけの共有バケット、
+/// `mode.has_single_global_shared_bucket() == true`) では局面によらず常に同じ
+/// 値を返すが、`wsb` が hand/king/progress/router の途中カテゴリに付いている
+/// 新仕様の場合は、局面ごとに異なる (`outer_buckets()` 通りの) 値を返しうる。
+/// これが `bucket_idx` と同様、位置ごとに GPU へ転送すべき値になる
+/// (`BatchData::shared_bucket_idx` / `Trainer::step` 参照)。
+#[inline]
+pub fn shared_bucket_board(
+    mode: BucketMode,
+    board: &ShogiBoard,
+    ftbyft_ctx: Option<RouterFtByFtContext<'_>>,
+) -> Option<u32> {
+    use shogi_features::bucket_mode::{RouterSubMode, shared_bucket_index_for_board};
+
+    if !mode.shared_bucket {
+        return None;
+    }
+
+    let progress_bucket = mode
+        .progress
+        .map(|n| u32::from(ShogiProgressKPAbs.bucket_board(board, n as usize)));
+
+    let router_bucket = mode.router.map(|router| match router {
+        RouterSubMode::Kpabs { n } => u32::from(RouterKPAbs.bucket_board(board, n as usize)),
+        RouterSubMode::FtByFt { r } => {
+            let ctx = ftbyft_ctx.as_ref().expect(
+                "bucket_mode has a routerft<R>ft<R> component but shared_bucket_board() was \
+                 called without a RouterFtByFtContext (dataloader worker bug: ft-by-ft needs \
+                 this position's stm/nstm active indices + the current router-ftbyft snapshot)",
+            );
+            let s = ctx.snapshot.forward_logits(ctx.stm_row);
+            let n = ctx.snapshot.forward_logits(ctx.nstm_row);
+            let combined = shogi_features::router_ftbyft::loss::predict_bucket(&s, &n) as u32;
+            debug_assert!(combined < r * r, "ft-by-ft predict_bucket out of range");
+            combined
+        }
+    });
+
+    shared_bucket_index_for_board(&mode, board, progress_bucket, router_bucket)
+}
+
 // =============================================================================
 // Batch 構造体 (loss / sparse_ft_forward kernel 入力と整合)
 // =============================================================================
@@ -797,7 +841,12 @@ fn prefetch_depth_for(num_workers: usize) -> usize {
 /// hard-EM oracle 学習 (`trainer::run` 内) がこの後で `bucket_board` と同じ
 /// board から再度 forward するのに使う。`Batch` 自体は HalfKA_hm 系の sparse
 /// index しか持たないため、KP-absolute 側の index は別途持ち回る必要がある。
-type BatchSlot = (Batch, Vec<i32>, Vec<Vec<u32>>);
+/// `(Batch, bucket_idx, router_indices, shared_bucket_idx)`。`shared_bucket_idx` は
+/// `bucket_mode.shared_bucket` が `false` のとき常に空 (`router_indices` が
+/// `bucket_mode.router.is_none()` のとき空になるのと同じ契約)。`bucket_mode.shared_bucket`
+/// が `true` のときは `batch.n_positions` と同じ長さで、`shared_bucket_board` が
+/// 計算した「その position の共有バケット (`wsb`) の実際の重み配列index」を持つ。
+type BatchSlot = (Batch, Vec<i32>, Vec<Vec<u32>>, Vec<i32>);
 
 /// 共有 reader (`PsvEpochReader`) を `--threads` 本の worker で読み、各 worker が
 /// 「PSV パース + feature sparse 抽出 + position bucket 計算」を
@@ -932,6 +981,7 @@ impl BucketedPrefetchedLoader {
                 } else {
                     0
                 }),
+                Vec::with_capacity(if bucket_mode.shared_bucket { batch_size } else { 0 }),
             );
             pool_tx
                 .send(slot)
@@ -957,7 +1007,7 @@ impl BucketedPrefetchedLoader {
                     .map(|_| vec![0u64; feature_set.max_active() + 1]);
                 loop {
                     // 空の batch slot を pool から借りる。
-                    let (mut batch, mut buckets, mut router_indices) = {
+                    let (mut batch, mut buckets, mut router_indices, mut shared_buckets) = {
                         let rx = pool_rx.lock().expect("pool_rx mutex poisoned");
                         match rx.recv() {
                             Ok(slot) => slot,
@@ -967,6 +1017,7 @@ impl BucketedPrefetchedLoader {
                     batch.reset();
                     buckets.clear();
                     router_indices.clear();
+                    shared_buckets.clear();
 
                     // 短い critical section: 共有 reader から batch_size 件を
                     // scratch に詰める (I/O のみ、decode はしない)。
@@ -1055,6 +1106,31 @@ impl BucketedPrefetchedLoader {
                             });
                             let bucket: u32 = bucket_board(bucket_mode, &board, ftbyft_ctx);
                             buckets.push(bucket as i32);
+                            // wsb (WithSharedBucket): この position の共有バケットの
+                            // 実際の重み配列index (`bucket_mode.shared_bucket` が
+                            // `false` なら常に空のまま)。旧仕様 (グローバルに1個だけの
+                            // 共有バケット) では全 position 同じ値になるが、`wsb` が
+                            // hand/king/progress/router の途中カテゴリに付く一般化
+                            // された仕様では position ごとに異なりうる
+                            // (`GpuTrainer::set_shared_bucket_idx` 参照)。
+                            if bucket_mode.shared_bucket {
+                                let ftbyft_ctx_shared =
+                                    router_ftbyft_snapshot.as_ref().map(|snapshot| {
+                                        let max_active = batch.max_active;
+                                        RouterFtByFtContext {
+                                            snapshot,
+                                            stm_row: &batch.stm_indices[row_idx * max_active
+                                                ..(row_idx + 1) * max_active],
+                                            nstm_row: &batch.nstm_indices[row_idx * max_active
+                                                ..(row_idx + 1) * max_active],
+                                        }
+                                    });
+                                let shared = shared_bucket_board(bucket_mode, &board, ftbyft_ctx_shared)
+                                    .expect(
+                                        "shared_bucket_board() is Some when bucket_mode.shared_bucket",
+                                    );
+                                shared_buckets.push(shared as i32);
+                            }
                             // kpabs の M step (`RouterKPAbs::train_oracle_batch` 等)
                             // は KP-absolute 疎入力上の active index 列
                             // (`RouterKPAbs::active_indices_board`) を別途必要と
@@ -1082,6 +1158,11 @@ impl BucketedPrefetchedLoader {
                             || !compute_bucket
                             || router_indices.len() == batch_size
                     );
+                    debug_assert!(
+                        !bucket_mode.shared_bucket
+                            || !compute_bucket
+                            || shared_buckets.len() == batch_size
+                    );
 
                     // batch-local histogram を共有 accumulator に flush して 0 に戻す
                     // (batch 単位の lock)。`active_hist` / `local_hist` は同時に
@@ -1098,7 +1179,7 @@ impl BucketedPrefetchedLoader {
                     }
 
                     // main へ。受信側が落ちていたら (loader drop) 終了。
-                    if result_tx.send((batch, buckets, router_indices)).is_err() {
+                    if result_tx.send((batch, buckets, router_indices, shared_buckets)).is_err() {
                         break;
                     }
                 }
@@ -1576,8 +1657,8 @@ mod tests {
             false,
         )
         .unwrap();
-        let (batch, buckets, router_indices) = off.next_batch().unwrap().expect("a batch");
-        off.recycle((batch, buckets, router_indices));
+        let (batch, buckets, router_indices, shared_buckets) = off.next_batch().unwrap().expect("a batch");
+        off.recycle((batch, buckets, router_indices, shared_buckets));
         assert!(
             off.active_histogram_snapshot().is_none(),
             "flag off では histogram を確保・集計しない"
@@ -1603,9 +1684,9 @@ mod tests {
         .unwrap();
         let mut consumed = 0u64;
         for _ in 0..5 {
-            let (batch, buckets, router_indices) = on.next_batch().unwrap().expect("a batch");
+            let (batch, buckets, router_indices, shared_buckets) = on.next_batch().unwrap().expect("a batch");
             consumed += batch.n_positions as u64;
-            on.recycle((batch, buckets, router_indices));
+            on.recycle((batch, buckets, router_indices, shared_buckets));
         }
         let hist = on.active_histogram_snapshot().expect("histogram present");
         assert_eq!(hist.len(), test_spec().max_active() + 1);
@@ -1744,7 +1825,7 @@ mod tests {
         // epoch wrap するので何 batch でも取れる。30 batch ぶん検査して recycle で
         // 回す。
         for _ in 0..30 {
-            let (batch, buckets, router_indices) = loader
+            let (batch, buckets, router_indices, shared_buckets) = loader
                 .next_batch()
                 .unwrap()
                 .expect("epoch wraps, should never be None");
@@ -1765,7 +1846,7 @@ mod tests {
             }
             let active = batch.stm_indices.iter().filter(|&&i| i >= 0).count();
             assert!(active > 0, "実局面なので active features > 0");
-            loader.recycle((batch, buckets, router_indices));
+            loader.recycle((batch, buckets, router_indices, shared_buckets));
         }
         drop(loader); // worker は channel close で抜ける (hang しない)。
     }
@@ -1802,14 +1883,14 @@ mod tests {
             false,
         )
         .expect("spawn KingRank9 loader");
-        let (batch, buckets, router_indices) = loader
+        let (batch, buckets, router_indices, shared_buckets) = loader
             .next_batch()
             .expect("load batch")
             .expect("full batch");
         assert_eq!(batch.n_positions, 16);
         assert_eq!(buckets, expected);
         assert!(buckets.iter().all(|&bucket| (0..9).contains(&bucket)));
-        loader.recycle((batch, buckets, router_indices));
+        loader.recycle((batch, buckets, router_indices, shared_buckets));
     }
 
     #[test]
@@ -1841,9 +1922,10 @@ mod tests {
             false,
         )
         .unwrap();
-        let (batch, buckets, router_indices) = loader.next_batch().unwrap().expect("a batch");
+        let (batch, buckets, router_indices, shared_buckets) = loader.next_batch().unwrap().expect("a batch");
         assert_eq!(batch.n_positions, 8);
         assert_eq!(buckets.len(), 8);
+        let _ = (router_indices, shared_buckets);
     }
 
     #[test]
@@ -1872,7 +1954,7 @@ mod tests {
             false,
         )
         .unwrap();
-        let (batch, _buckets) = ok_loader.next_batch().unwrap().expect("a batch");
+        let (batch, _buckets, _router_indices, _shared_buckets) = ok_loader.next_batch().unwrap().expect("a batch");
         assert_eq!(batch.n_positions, 8);
         drop(ok_loader);
 
@@ -1920,13 +2002,13 @@ mod tests {
         )
         .unwrap();
         for _ in 0..30 {
-            let (batch, buckets, router_indices) = loader
+            let (batch, buckets, router_indices, shared_buckets) = loader
                 .next_batch()
                 .unwrap()
                 .expect("epoch wraps within capped range");
             assert_eq!(batch.n_positions, 8);
             assert_eq!(buckets.len(), 8);
-            loader.recycle((batch, buckets, router_indices));
+            loader.recycle((batch, buckets, router_indices, shared_buckets));
         }
     }
 
