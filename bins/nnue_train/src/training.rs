@@ -26,7 +26,7 @@ use nnue_train::trainer::TrainingConfig;
 #[cfg(feature = "gpu")]
 use nnue_train::trainer::RouterTrainingConfig;
 #[cfg(feature = "gpu")]
-use crate::cli::RouterModeArg;
+use crate::cli::{RouterBalanceModeArg, RouterModeArg};
 #[cfg(feature = "gpu")]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
 #[cfg(feature = "gpu")]
@@ -670,12 +670,22 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                             .into(),
                     );
                 }
+                if layerstack.router_balance_mode == RouterBalanceModeArg::BiasFree {
+                    return Err(
+                        "--router-balance-mode bias-free is only implemented for --bucket-mode \
+                         routerkpabs<N>; use --router-balance-mode aux-loss (the default) with \
+                         routerft<R>ft<R>"
+                            .into(),
+                    );
+                }
                 validate_router_top_k(router_n_value, layerstack.top_k, layerstack.top_k_min)?;
                 Some(RouterTrainingConfig {
                     arch: shogi_features::router_ftbyft::RouterArch::FtByFt,
                     lr: layerstack.router_lr as f64,
                     weight_decay: layerstack.router_weight_decay as f64,
                     balance_weight: layerstack.router_balance_weight as f64,
+                    balance_mode: layerstack.router_balance_mode.into(),
+                    bias_update_rate: layerstack.router_bias_update_rate as f64,
                     mode: layerstack.router_mode.into(),
                     refresh_interval: layerstack.router_refresh_interval.max(1),
                     lr_gamma: layerstack.router_lr_gamma as f64,
@@ -742,11 +752,23 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
                         layerstack.top_k_min
                     );
                 }
+                if layerstack.router_balance_mode == RouterBalanceModeArg::BiasFree
+                    && !(layerstack.router_bias_update_rate.is_finite()
+                        && layerstack.router_bias_update_rate >= 0.0)
+                {
+                    return Err(format!(
+                        "--router-bias-update-rate must be finite and >= 0 (got {})",
+                        layerstack.router_bias_update_rate
+                    )
+                    .into());
+                }
                 Some(RouterTrainingConfig {
                     arch: shogi_features::router_ftbyft::RouterArch::Kpabs,
                     lr: layerstack.router_lr as f64,
                     weight_decay: layerstack.router_weight_decay as f64,
                     balance_weight: layerstack.router_balance_weight as f64,
+                    balance_mode: layerstack.router_balance_mode.into(),
+                    bias_update_rate: layerstack.router_bias_update_rate as f64,
                     mode: layerstack.router_mode.into(),
                     refresh_interval: layerstack.router_refresh_interval.max(1),
                     lr_gamma: layerstack.router_lr_gamma as f64,

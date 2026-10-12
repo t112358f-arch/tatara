@@ -61,7 +61,9 @@ use std::time::Instant;
 use shogi_features::FeatureSetSpec;
 #[cfg(test)]
 use shogi_features::progress_kpabs::ShogiProgressKPAbs;
-use shogi_features::router_kpabs::{RouterAdamState, RouterKPAbs, RouterMode};
+use shogi_features::router_kpabs::{
+    RouterAdamState, RouterBalance, RouterBalanceMode, RouterKPAbs, RouterMode,
+};
 use shogi_features::router_ftbyft::{
     RouterArch, RouterFtByFt, RouterFtByFtAdamState,
 };
@@ -431,7 +433,7 @@ pub trait TrainerBackend {
         _adam: &RouterAdamState,
         _lr: f64,
         _weight_decay: f64,
-        _balance_weight: f64,
+        _balance: RouterBalance,
     ) -> io::Result<Option<shogi_features::router_kpabs::RouterTrainStats>> {
         Ok(None)
     }
@@ -445,7 +447,7 @@ pub trait TrainerBackend {
         _adam: &RouterAdamState,
         _lr: f64,
         _weight_decay: f64,
-        _balance_weight: f64,
+        _balance: RouterBalance,
         _top_k: usize,
     ) -> io::Result<Option<shogi_features::router_kpabs::RouterTrainStats>> {
         Ok(None)
@@ -512,6 +514,18 @@ pub struct RouterTrainingConfig {
     /// リスクあり)。詳細は [`shogi_features::router_kpabs::RouterKPAbsWeights::train_oracle_batch`]
     /// のドキュメントを参照。
     pub balance_weight: f64,
+    /// 負荷分散の方式 (`--router-balance-mode`)。[`RouterBalanceMode::AuxLoss`]
+    /// (既定) は `balance_weight` の補助損失、[`RouterBalanceMode::BiasFree`] は
+    /// 補助損失を使わず bucket ごとの dispatch 用 bias を更新する
+    /// (Auxiliary-Loss-Free Load Balancing)。`BiasFree` では `balance_weight` /
+    /// `balance_weight_gamma` / `balance_weight_min` は無視される。bias は
+    /// export 時に推論側の重みへ畳み込まれる
+    /// ([`shogi_features::router_kpabs::RouterKPAbsWeights::weights_with_folded_bias`])。
+    pub balance_mode: RouterBalanceMode,
+    /// [`RouterBalanceMode::BiasFree`] の bias 更新幅 `u` (`--router-bias-update-rate`)。
+    /// 1 step ごとに `bias[k] += u * sign(1/N - f_k)` を適用する。
+    /// `AuxLoss` では未使用。
+    pub bias_update_rate: f64,
     /// router の M step の切替 (`--router-mode`)。[`RouterMode::HardEm`]
     /// (既定) は oracle ターゲット EM 手続き、[`RouterMode::Backprop`] は
     /// oracle ターゲットを経由しない通常の誤差逆伝播。`top_k` /
@@ -581,6 +595,19 @@ pub struct RouterTrainingConfig {
     /// の「最後」の桁の基数) を表す。`bucket_mode`にrouter成分が無いときは
     /// このconfig自体が`None`なので参照されない。
     pub router_n: usize,
+}
+
+impl RouterTrainingConfig {
+    /// 現在の `balance_weight` の実効値 (decay 済) から、kpabs router の
+    /// 学習関数へ渡す [`RouterBalance`] を作る。
+    fn kpabs_balance(&self, current_balance_weight: f64) -> RouterBalance {
+        match self.balance_mode {
+            RouterBalanceMode::AuxLoss => RouterBalance::AuxLoss { weight: current_balance_weight },
+            RouterBalanceMode::BiasFree => {
+                RouterBalance::BiasFree { update_rate: self.bias_update_rate }
+            }
+        }
+    }
 }
 
 /// `rc` (CLI で指定された router の base 値) から、`start_superbatch` の直前
@@ -1222,7 +1249,7 @@ where
                             adam,
                             current_router_lr,
                             rc.weight_decay,
-                            current_router_balance_weight,
+                            rc.kpabs_balance(current_router_balance_weight),
                         )? {
                             Some(stats) => stats,
                             None => RouterKPAbs::train_oracle_batch(
@@ -1231,7 +1258,7 @@ where
                                 adam,
                                 current_router_lr,
                                 rc.weight_decay,
-                                current_router_balance_weight,
+                                rc.kpabs_balance(current_router_balance_weight),
                             ),
                         }
                     }
@@ -1241,7 +1268,7 @@ where
                         adam,
                         current_router_lr,
                         rc.weight_decay,
-                        current_router_balance_weight,
+                        rc.kpabs_balance(current_router_balance_weight),
                         current_top_k,
                     )? {
                         Some(stats) => stats,
@@ -1251,7 +1278,7 @@ where
                             adam,
                             current_router_lr,
                             rc.weight_decay,
-                            current_router_balance_weight,
+                            rc.kpabs_balance(current_router_balance_weight),
                             current_top_k,
                         ),
                     },
@@ -1445,7 +1472,8 @@ where
             // 負荷分散 loss (`N * Σ f_i * P_i`、min=1.0 で完全均等、max=N で
             // 1 bucket に完全集中) と、直近 refresh 時点での bucket 使用率
             // (router 自身の argmax の分布) を出す。1 bucket に偏り続けている
-            // 場合は `--router-balance-weight` を上げる目安になる。
+            // 場合は `--router-balance-weight` (`--router-balance-mode bias-free`
+            // では `--router-bias-update-rate`) を上げる目安になる。
             let usage_str = stats
                 .bucket_usage
                 .iter()
@@ -1457,13 +1485,18 @@ where
                 RouterMode::HardEm => format!("hard-em top_k={current_top_k}"),
                 RouterMode::Backprop => format!("backprop top_k={current_top_k}"),
             };
+            let balance_str = match cfg.router.map(|rc| rc.balance_mode).unwrap_or_default() {
+                RouterBalanceMode::AuxLoss => "aux-loss",
+                RouterBalanceMode::BiasFree => "bias-free",
+            };
             eprintln!(
-                "[router] sb={} loss={:.4} balance_loss={:.4} (min=1.0,max={}) mode={} usage=[{}]",
+                "[router] sb={} loss={:.4} balance_loss={:.4} (min=1.0,max={}) mode={} balance={} usage=[{}]",
                 sb,
                 stats.cross_entropy_loss,
                 stats.balance_loss,
                 stats.bucket_usage.len(),
                 mode_str,
+                balance_str,
                 usage_str,
             );
         }
@@ -1634,7 +1667,15 @@ where
                     balance_loss: stats.balance_loss,
                     usage: stats.bucket_usage.clone(),
                     lr: current_router_lr,
-                    balance_weight: current_router_balance_weight,
+                    // `BiasFree` は補助損失を使わないので実効値は 0。
+                    balance_weight: if matches!(
+                        cfg.router.map(|rc| rc.balance_mode),
+                        Some(RouterBalanceMode::BiasFree)
+                    ) {
+                        0.0
+                    } else {
+                        current_router_balance_weight
+                    },
                 });
             }
             if let Some(stats) = last_router_ftbyft_stats.as_ref() {
@@ -3040,6 +3081,8 @@ mod tests {
             lr: 1.0,
             weight_decay: 0.0,
             balance_weight: 1.0,
+            balance_mode: RouterBalanceMode::AuxLoss,
+            bias_update_rate: 0.001,
             mode: RouterMode::HardEm,
             refresh_interval: 1,
             lr_gamma: 0.5,

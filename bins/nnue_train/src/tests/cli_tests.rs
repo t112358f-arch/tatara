@@ -325,6 +325,36 @@ fn router_mode_converts_to_shogi_features_router_mode() {
 }
 
 #[test]
+fn router_balance_mode_defaults_to_aux_loss_and_parses_bias_free() {
+    let default_args = layerstack_args(&["--bucket-mode", "router"]);
+    assert_eq!(default_args.router_balance_mode, RouterBalanceModeArg::AuxLoss);
+    assert!((default_args.router_bias_update_rate - 0.001).abs() < 1e-9);
+
+    let bias_free_args = layerstack_args(&[
+        "--bucket-mode",
+        "router",
+        "--router-balance-mode",
+        "bias-free",
+        "--router-bias-update-rate",
+        "0.005",
+    ]);
+    assert_eq!(bias_free_args.router_balance_mode, RouterBalanceModeArg::BiasFree);
+    assert!((bias_free_args.router_bias_update_rate - 0.005).abs() < 1e-9);
+}
+
+#[test]
+fn router_balance_mode_converts_to_shogi_features_router_balance_mode() {
+    assert_eq!(
+        shogi_features::router_kpabs::RouterBalanceMode::from(RouterBalanceModeArg::AuxLoss),
+        shogi_features::router_kpabs::RouterBalanceMode::AuxLoss,
+    );
+    assert_eq!(
+        shogi_features::router_kpabs::RouterBalanceMode::from(RouterBalanceModeArg::BiasFree),
+        shogi_features::router_kpabs::RouterBalanceMode::BiasFree,
+    );
+}
+
+#[test]
 fn validate_router_top_k_accepts_defaults_and_widened_range() {
     assert!(validate_router_top_k(9, 1, 1).is_ok());
     assert!(validate_router_top_k(9, 9, 1).is_ok());

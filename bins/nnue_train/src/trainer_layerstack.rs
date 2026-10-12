@@ -5172,12 +5172,12 @@ impl GpuTrainer {
         adam: &shogi_features::router_kpabs::RouterAdamState,
         lr: f64,
         weight_decay: f64,
-        balance_weight: f64,
+        balance: shogi_features::router_kpabs::RouterBalance,
     ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
     {
         let state = self.ensure_router_gpu(adam)?;
         let stats =
-            state.train_oracle_batch(indices_batch, oracle_targets, lr, weight_decay, balance_weight)?;
+            state.train_oracle_batch(indices_batch, oracle_targets, lr, weight_decay, balance)?;
         Ok(Some(stats))
     }
 
@@ -5189,7 +5189,7 @@ impl GpuTrainer {
         adam: &shogi_features::router_kpabs::RouterAdamState,
         lr: f64,
         weight_decay: f64,
-        balance_weight: f64,
+        balance: shogi_features::router_kpabs::RouterBalance,
         top_k: usize,
     ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
     {
@@ -5199,7 +5199,7 @@ impl GpuTrainer {
             errs_batch,
             lr,
             weight_decay,
-            balance_weight,
+            balance,
             top_k,
         )?;
         Ok(Some(stats))
@@ -5218,6 +5218,7 @@ impl GpuTrainer {
         };
         let (w, m, v, t) = state.sync_to_host()?;
         shogi_features::router_kpabs::RouterKPAbs::overwrite_weights(w);
+        shogi_features::router_kpabs::RouterKPAbs::overwrite_bias(state.bias().to_vec());
         adam.m_w_mut().copy_from_slice(&m);
         adam.v_w_mut().copy_from_slice(&v);
         adam.set_t(t);
@@ -5234,7 +5235,7 @@ impl GpuTrainer {
         _adam: &shogi_features::router_kpabs::RouterAdamState,
         _lr: f64,
         _weight_decay: f64,
-        _balance_weight: f64,
+        _balance: shogi_features::router_kpabs::RouterBalance,
     ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
     {
         Ok(None)
@@ -5248,7 +5249,7 @@ impl GpuTrainer {
         _adam: &shogi_features::router_kpabs::RouterAdamState,
         _lr: f64,
         _weight_decay: f64,
-        _balance_weight: f64,
+        _balance: shogi_features::router_kpabs::RouterBalance,
         _top_k: usize,
     ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
     {

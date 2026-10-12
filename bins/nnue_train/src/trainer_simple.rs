@@ -412,7 +412,7 @@ impl SimpleGpuTrainer {
         _adam: &shogi_features::router_kpabs::RouterAdamState,
         _lr: f64,
         _weight_decay: f64,
-        _balance_weight: f64,
+        _balance: shogi_features::router_kpabs::RouterBalance,
     ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
     {
         Ok(None)
@@ -426,7 +426,7 @@ impl SimpleGpuTrainer {
         _adam: &shogi_features::router_kpabs::RouterAdamState,
         _lr: f64,
         _weight_decay: f64,
-        _balance_weight: f64,
+        _balance: shogi_features::router_kpabs::RouterBalance,
         _top_k: usize,
     ) -> Result<Option<shogi_features::router_kpabs::RouterTrainStats>, Box<dyn std::error::Error>>
     {

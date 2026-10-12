@@ -489,7 +489,7 @@ macro_rules! trainer_backend_impl {
                 adam: &shogi_features::router_kpabs::RouterAdamState,
                 lr: f64,
                 weight_decay: f64,
-                balance_weight: f64,
+                balance: shogi_features::router_kpabs::RouterBalance,
             ) -> std::io::Result<Option<shogi_features::router_kpabs::RouterTrainStats>> {
                 self.router_train_oracle_batch_gpu(
                     indices_batch,
@@ -497,7 +497,7 @@ macro_rules! trainer_backend_impl {
                     adam,
                     lr,
                     weight_decay,
-                    balance_weight,
+                    balance,
                 )
                 .map_err(|e| std::io::Error::other(format!("router GPU train_oracle_batch failed: {e}")))
             }
@@ -509,7 +509,7 @@ macro_rules! trainer_backend_impl {
                 adam: &shogi_features::router_kpabs::RouterAdamState,
                 lr: f64,
                 weight_decay: f64,
-                balance_weight: f64,
+                balance: shogi_features::router_kpabs::RouterBalance,
                 top_k: usize,
             ) -> std::io::Result<Option<shogi_features::router_kpabs::RouterTrainStats>> {
                 self.router_train_backprop_batch_gpu(
@@ -518,7 +518,7 @@ macro_rules! trainer_backend_impl {
                     adam,
                     lr,
                     weight_decay,
-                    balance_weight,
+                    balance,
                     top_k,
                 )
                 .map_err(|e| std::io::Error::other(format!("router GPU train_backprop_batch failed: {e}")))

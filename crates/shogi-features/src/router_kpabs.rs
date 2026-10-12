@@ -99,6 +99,19 @@
 //! 負荷分散補助損失は [`RouterKPAbsWeights::train_oracle_batch`] と同じ式を
 //! そのまま加算する ([`RouterKPAbsWeights::train_backprop_batch`] 参照)。
 //!
+//! ## 負荷分散 (`--router-balance-mode`)
+//!
+//! expert collapse を抑える方式は [`RouterBalance`] で切り替える。
+//! - [`RouterBalance::AuxLoss`]: Switch Transformer 式の補助損失を損失へ足す。
+//! - [`RouterBalance::BiasFree`]: Auxiliary-Loss-Free Load Balancing。補助損失は
+//!   使わず、bucket ごとの bias ([`RouterKPAbsWeights::bias`]) を dispatch の
+//!   argmax にだけ加え、使用率に応じて更新する ([`update_dispatch_bias`])。
+//!
+//! 推論側は bias 項を持たない重み和のみなので、export 時は bias を
+//! [`ROUTER_ACTIVE_INDICES_PER_POSITION`] で割って全重みへ加算する
+//! ([`RouterKPAbsWeights::weights_with_folded_bias`])。詳細は
+//! `docs/decisions/2026-09-30-router-aux-loss-free-balancing.md`。
+//!
 //! ## プロセス全体で 1 個
 //!
 //! `progress_kpabs::ShogiProgressKPAbs` と同様、重みはプロセス global
@@ -118,6 +131,22 @@ use crate::progress_kpabs::{SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS, ShogiProgressKPAb
 /// ヘッダ付きにして、次元違いの取り違えを防ぐ。
 const ROUTER_BIN_MAGIC: u32 = 0x526f_396b; // "Ro9k" 由来 (バケット数 9 固定だった頃の名残、値はそのまま維持)
 
+/// bias 付き raw 保存形式のマジックナンバー。ヘッダは [`ROUTER_BIN_MAGIC`] と同じで、
+/// `w` の直後に bucket ごとの bias (f64 LE × `num_buckets`) が続く。
+/// `write_to` は常にこちらで書き、`read_from` は両方を受け付ける
+/// (bias の無い形式は bias = 0 として読む)。
+const ROUTER_BIN_MAGIC_WITH_BIAS: u32 = 0x526f_396c;
+
+/// 1 局面あたりの active な KP-absolute index の個数。
+///
+/// `ShogiProgressKPAbs::for_each_active_index_board` は玉以外の駒 1 枚
+/// (盤上・持ち駒を問わない) につき 2 個 (先手視点・後手視点) の index を
+/// 出す。将棋は 40 枚 (玉 2 + 玉以外 38) が必ず盤上か持ち駒のどちらかに
+/// 存在するので、玉が両方盤上にある局面では常に `38 * 2 = 76` 個になる。
+/// router の bias を推論側 (重み和のみ、bias 項なし) へ渡すときは、この個数で
+/// 割った値を全 index の重みに加算する ([`RouterKPAbsWeights::weights_with_folded_bias`])。
+pub const ROUTER_ACTIVE_INDICES_PER_POSITION: usize = 76;
+
 /// router (bias 無しの重み和 × N 出力) の重み一式。`progress.bin` と同じ f64
 /// 精度。
 ///
@@ -125,10 +154,70 @@ const ROUTER_BIN_MAGIC: u32 = 0x526f_396b; // "Ro9k" 由来 (バケット数 9 �
 /// KP-absolute 特徴 index、`k` はバケット/クラス番号 `[0, num_buckets)`)。
 /// `progress_kpabs` の重みテーブル (`[SQ_NB][fe_end] -> f64` 1 個、bias 無し)
 /// を `num_buckets` 個並べたのと同じ形。
+///
+/// `bias` は bucket ごとの dispatch 用 bias (長さ `num_buckets`)。dispatch
+/// (実際に選ばれるバケット) は `argmax_k (logits[k] + bias[k])` で決まるが、
+/// softmax / 損失の勾配は bias を含まない `logits` から計算する
+/// ([`RouterBalance::BiasFree`] が更新する)。`bias` が全 0 なら bias の無い
+/// 従来の router と同じ動作になる。推論側 (YaneuraOu) は bias 項を持たない
+/// ため、export 時に [`RouterKPAbsWeights::weights_with_folded_bias`] で重みへ
+/// 畳み込む。
 #[derive(Clone, Debug)]
 pub struct RouterKPAbsWeights {
     pub num_buckets: usize,
     pub w: Vec<f64>,
+    pub bias: Vec<f64>,
+}
+
+/// router の負荷分散の方式 (`--router-balance-mode`) と、その方式が使う
+/// ハイパーパラメータ。`train_oracle_batch` / `train_backprop_batch` の
+/// 引数として渡す。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RouterBalance {
+    /// Switch Transformer 式の負荷分散補助損失 `L_balance = N · Σ_i f_i · P_i`
+    /// を損失に足す。`weight` は係数 `λ` (`0.0` で無効)。bias は更新しない。
+    AuxLoss { weight: f64 },
+    /// Auxiliary-Loss-Free Load Balancing (Wang et al. 2024、DeepSeek-V3 で
+    /// 採用)。補助損失は使わず、bucket ごとの bias を dispatch の argmax に
+    /// だけ加え、1 step ごとに使用率 `f_k` が均等 (`1/N`) より高い bucket の
+    /// bias を `update_rate` だけ下げ、低い bucket の bias を上げる
+    /// (`bias[k] += update_rate * sign(1/N - f_k)`)。bias は勾配を受け取らない。
+    BiasFree { update_rate: f64 },
+}
+
+impl RouterBalance {
+    /// 補助損失の係数。[`Self::BiasFree`] では補助損失を使わないので `0.0`。
+    pub fn aux_loss_weight(self) -> f64 {
+        match self {
+            Self::AuxLoss { weight } => weight,
+            Self::BiasFree { .. } => 0.0,
+        }
+    }
+}
+
+/// [`RouterBalance::BiasFree`] の bias 更新。`usage[k]` はこの batch で
+/// dispatch されたバケット `k` の比率 (合計 1.0)。
+/// `bias[k] += update_rate * sign(1/N - usage[k])` を適用したあと、argmax に
+/// 影響しない平均成分を引いて bias が一方向にドリフトしないよう中心化する。
+pub fn update_dispatch_bias(bias: &mut [f64], usage: &[f64], update_rate: f64) {
+    assert_eq!(bias.len(), usage.len(), "bias / usage length mismatch");
+    let n = bias.len();
+    if n == 0 {
+        return;
+    }
+    let target = 1.0 / n as f64;
+    for (b, &f) in bias.iter_mut().zip(usage.iter()) {
+        let err = target - f;
+        if err > 0.0 {
+            *b += update_rate;
+        } else if err < 0.0 {
+            *b -= update_rate;
+        }
+    }
+    let mean = bias.iter().sum::<f64>() / n as f64;
+    for b in bias.iter_mut() {
+        *b -= mean;
+    }
 }
 
 /// router の M step の切替 (`--router-mode`)。E step (N 個の bucket それぞれに
@@ -146,6 +235,17 @@ pub enum RouterMode {
     /// ついて直接微分する、通常の誤差逆伝播
     /// ([`RouterKPAbsWeights::train_backprop_batch`])。
     Backprop,
+}
+
+/// router の負荷分散方式の選択 (`--router-balance-mode`)。ハイパーパラメータは
+/// 持たない選択肢だけの enum で、実際に学習関数へ渡す値は [`RouterBalance`]。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RouterBalanceMode {
+    /// 負荷分散補助損失 ([`RouterBalance::AuxLoss`])。
+    #[default]
+    AuxLoss,
+    /// Auxiliary-Loss-Free Load Balancing ([`RouterBalance::BiasFree`])。
+    BiasFree,
 }
 
 /// `RouterKPAbsWeights::train_oracle_batch` / `train_backprop_batch` の
@@ -257,6 +357,7 @@ impl RouterKPAbsWeights {
         Self {
             num_buckets,
             w: vec![0.0; SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS * num_buckets],
+            bias: vec![0.0; num_buckets],
         }
     }
 
@@ -273,7 +374,7 @@ impl RouterKPAbsWeights {
         for v in w.iter_mut() {
             *v = rng.next_f64_symmetric(bound);
         }
-        Self { num_buckets, w }
+        Self { num_buckets, w, bias: vec![0.0; num_buckets] }
     }
 
     /// 指定 active index 集合から N 個の logit (= 重み和、bias 無し) を forward
@@ -327,16 +428,56 @@ impl RouterKPAbsWeights {
         (best_k as u32, best_p, probs)
     }
 
-    /// 局面 1 つ分の bucket (`0..num_buckets`) を返す。
+    /// dispatch されるバケット (`argmax_k (logits[k] + bias[k])`) を返す。
+    /// 同点は最小の `k` を選ぶ。`bias` が全 0 なら `logits` の argmax
+    /// ([`Self::bucket_and_probs`] の第 1 戻り値) と一致する。
+    pub fn dispatch_bucket(logits: &[f64], bias: &[f64]) -> u32 {
+        debug_assert_eq!(logits.len(), bias.len());
+        let mut best_k = 0usize;
+        let mut best = f64::NEG_INFINITY;
+        for (k, (&l, &b)) in logits.iter().zip(bias.iter()).enumerate() {
+            let v = l + b;
+            if v > best {
+                best = v;
+                best_k = k;
+            }
+        }
+        best_k as u32
+    }
+
+    /// 局面 1 つ分の bucket (`0..num_buckets`) を返す (bias 込みの dispatch)。
     pub fn bucket_from_indices(&self, indices: &[u32]) -> u32 {
         let logits = self.forward_logits(indices);
-        Self::bucket_and_probs(&logits).0
+        Self::dispatch_bucket(&logits, &self.bias)
     }
 
     /// `bucket_from_indices` の `ShogiBoard` 版。
     pub fn bucket_board(&self, board: &ShogiBoard) -> u32 {
         let logits = self.forward_board(board);
-        Self::bucket_and_probs(&logits).0
+        Self::dispatch_bucket(&logits, &self.bias)
+    }
+
+    /// 推論側 (重み和のみで bias 項を持たない YaneuraOu の `RouterKPAbs`) 向けに、
+    /// bias を重みへ畳み込んだ重みテーブル (`w` と同レイアウト) を返す。
+    ///
+    /// 推論側は 1 局面につき常に [`ROUTER_ACTIVE_INDICES_PER_POSITION`] 個の重み
+    /// を足すので、bucket `k` の bias を全 index の `w[idx][k]` へ
+    /// `bias[k] / ROUTER_ACTIVE_INDICES_PER_POSITION` ずつ加算すれば、重み和は
+    /// ちょうど `logits[k] + bias[k]` になる。量子化はこの結果に対して行う
+    /// (先に量子化してから足すと丸め誤差が個数倍になるため)。
+    pub fn weights_with_folded_bias(&self) -> Vec<f64> {
+        let per_index: Vec<f64> = self
+            .bias
+            .iter()
+            .map(|&b| b / ROUTER_ACTIVE_INDICES_PER_POSITION as f64)
+            .collect();
+        let mut out = self.w.clone();
+        for row in out.chunks_exact_mut(self.num_buckets) {
+            for (w, &d) in row.iter_mut().zip(per_index.iter()) {
+                *w += d;
+            }
+        }
+        out
     }
 
     /// oracle ターゲット分布 (E step で求める、詳細は
@@ -370,8 +511,11 @@ impl RouterKPAbsWeights {
     /// - `P_i` = この batch での softmax 確率 `P(bucket=i)` の平均 (微分可能)
     ///
     /// `f_i = P_i = 1/N` (完全に均等) のとき最小値 `1.0` を取り、偏るほど増える。
-    /// `balance_weight` (`λ`) でこの項の強さを調整する (`0.0` で無効化、
-    /// cross entropy のみの従来動作に戻る)。
+    /// `balance` が [`RouterBalance::AuxLoss`] のとき `weight` (`λ`) でこの項の
+    /// 強さを調整する (`0.0` で無効化、cross entropy のみの従来動作に戻る)。
+    /// [`RouterBalance::BiasFree`] のときは補助損失を足さず、代わりに
+    /// この batch の使用率 `f` から dispatch 用 bias を更新する
+    /// ([`update_dispatch_bias`])。`f` は bias 込みの dispatch で数える。
     pub fn train_oracle_batch(
         &mut self,
         indices_batch: &[Vec<u32>],
@@ -379,8 +523,9 @@ impl RouterKPAbsWeights {
         adam: &mut RouterAdamState,
         lr: f64,
         weight_decay: f64,
-        balance_weight: f64,
+        balance: RouterBalance,
     ) -> RouterTrainStats {
+        let balance_weight = balance.aux_loss_weight();
         assert_eq!(indices_batch.len(), oracle_targets.len());
         assert_eq!(
             adam.num_buckets, self.num_buckets,
@@ -404,7 +549,8 @@ impl RouterKPAbsWeights {
         let mut dispatch_count = vec![0u32; num_buckets];
         for indices in indices_batch {
             let logits = self.forward_logits(indices);
-            let (dispatch_bucket, _, probs) = Self::bucket_and_probs(&logits);
+            let (_, _, probs) = Self::bucket_and_probs(&logits);
+            let dispatch_bucket = Self::dispatch_bucket(&logits, &self.bias);
             dispatch_count[dispatch_bucket as usize] += 1;
             all_probs.push(probs);
         }
@@ -468,6 +614,9 @@ impl RouterKPAbsWeights {
 
         adam.t += 1;
         adam_step(&mut self.w, &grad_w, &mut adam.m_w, &mut adam.v_w, lr, weight_decay, adam.t);
+        if let RouterBalance::BiasFree { update_rate } = balance {
+            update_dispatch_bias(&mut self.bias, &f, update_rate);
+        }
 
         let balance_loss: f64 =
             num_buckets as f64 * f.iter().zip(avg_probs.iter()).map(|(&fi, &pi)| fi * pi).sum::<f64>();
@@ -514,9 +663,10 @@ impl RouterKPAbsWeights {
         adam: &mut RouterAdamState,
         lr: f64,
         weight_decay: f64,
-        balance_weight: f64,
+        balance: RouterBalance,
         top_k: usize,
     ) -> RouterTrainStats {
+        let balance_weight = balance.aux_loss_weight();
         assert_eq!(indices_batch.len(), errs_batch.len());
         assert_eq!(
             adam.num_buckets, self.num_buckets,
@@ -541,7 +691,8 @@ impl RouterKPAbsWeights {
         let mut dispatch_count = vec![0u32; num_buckets];
         for indices in indices_batch {
             let logits = self.forward_logits(indices);
-            let (dispatch_bucket, _, probs) = Self::bucket_and_probs(&logits);
+            let (_, _, probs) = Self::bucket_and_probs(&logits);
+            let dispatch_bucket = Self::dispatch_bucket(&logits, &self.bias);
             dispatch_count[dispatch_bucket as usize] += 1;
             all_probs.push(probs);
         }
@@ -603,6 +754,9 @@ impl RouterKPAbsWeights {
 
         adam.t += 1;
         adam_step(&mut self.w, &grad_w, &mut adam.m_w, &mut adam.v_w, lr, weight_decay, adam.t);
+        if let RouterBalance::BiasFree { update_rate } = balance {
+            update_dispatch_bias(&mut self.bias, &f, update_rate);
+        }
 
         let balance_loss: f64 =
             num_buckets as f64 * f.iter().zip(avg_probs.iter()).map(|(&fi, &pi)| fi * pi).sum::<f64>();
@@ -615,23 +769,25 @@ impl RouterKPAbsWeights {
     }
 
     /// raw 形式で書き出す: magic(u32) / num_weights(u32) / num_buckets(u32) /
-    /// w(f64 LE)。`progress.bin` と同じ f64 精度。progress8kpabs 同様 bias は
-    /// 無いので、これだけで完結する。
+    /// w(f64 LE) / bias(f64 LE × num_buckets)。`progress.bin` と同じ f64 精度。
+    /// bias は dispatch 用で、推論側へは畳み込み済みの重みとして渡す
+    /// ([`Self::weights_with_folded_bias`])。
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        writer.write_all(&ROUTER_BIN_MAGIC.to_le_bytes())?;
+        writer.write_all(&ROUTER_BIN_MAGIC_WITH_BIAS.to_le_bytes())?;
         writer.write_all(&(SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS as u32).to_le_bytes())?;
         writer.write_all(&(self.num_buckets as u32).to_le_bytes())?;
         write_f64_slice(writer, &self.w)?;
+        write_f64_slice(writer, &self.bias)?;
         Ok(())
     }
 
-    /// `write_to` の逆。`num_weights` 不一致は `Err` (KP-absolute 特徴の次元は
+    /// `write_to` の逆 (bias の無い旧形式も読め、その場合 bias は 0)。`num_weights` 不一致は `Err` (KP-absolute 特徴の次元は
     /// 常に固定なので)。`num_buckets` は書かれていた値をそのまま使う (呼び出し
     /// 側で期待値と照合すること、`RouterKPAbs::load_from_bin` 等は行わない —
     /// これは `bins/nnue_train` 側で `--num-buckets` と突き合わせる)。
     pub fn read_from<R: Read>(reader: &mut R) -> io::Result<Self> {
         let magic = read_u32(reader)?;
-        if magic != ROUTER_BIN_MAGIC {
+        if magic != ROUTER_BIN_MAGIC && magic != ROUTER_BIN_MAGIC_WITH_BIAS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("router weights magic mismatch: got {magic:#x}"),
@@ -654,7 +810,12 @@ impl RouterKPAbsWeights {
             ));
         }
         let w = read_f64_vec(reader, num_weights * num_buckets)?;
-        Ok(Self { num_buckets, w })
+        let bias = if magic == ROUTER_BIN_MAGIC_WITH_BIAS {
+            read_f64_vec(reader, num_buckets)?
+        } else {
+            vec![0.0; num_buckets]
+        };
+        Ok(Self { num_buckets, w, bias })
     }
 }
 
@@ -772,6 +933,21 @@ impl RouterKPAbs {
         w.w = new_w;
     }
 
+    /// [`Self::overwrite_weights`] の bias 版。GPU-resident 学習が host 側で
+    /// 更新した dispatch 用 bias を process-global state へ書き戻す
+    /// (dataloader worker の bucket 割当が読む)。長さは `num_buckets`。
+    pub fn overwrite_bias(new_bias: Vec<f64>) {
+        let mut w = Self::state().write().unwrap();
+        assert_eq!(
+            new_bias.len(),
+            w.bias.len(),
+            "router GPU sync-back bias length mismatch: expected {}, got {}",
+            w.bias.len(),
+            new_bias.len(),
+        );
+        w.bias = new_bias;
+    }
+
     /// 現在の重みを `.bin` に保存する。
     pub fn save_to_bin(path: &Path) -> io::Result<()> {
         let mut file = std::fs::File::create(path)?;
@@ -866,10 +1042,10 @@ impl RouterKPAbs {
         adam: &mut RouterAdamState,
         lr: f64,
         weight_decay: f64,
-        balance_weight: f64,
+        balance: RouterBalance,
     ) -> RouterTrainStats {
         let mut w = Self::state().write().unwrap();
-        w.train_oracle_batch(indices_batch, oracle_targets, adam, lr, weight_decay, balance_weight)
+        w.train_oracle_batch(indices_batch, oracle_targets, adam, lr, weight_decay, balance)
     }
 
     /// `--router-mode backprop` の M step。詳細は
@@ -880,11 +1056,11 @@ impl RouterKPAbs {
         adam: &mut RouterAdamState,
         lr: f64,
         weight_decay: f64,
-        balance_weight: f64,
+        balance: RouterBalance,
         top_k: usize,
     ) -> RouterTrainStats {
         let mut w = Self::state().write().unwrap();
-        w.train_backprop_batch(indices_batch, errs_batch, adam, lr, weight_decay, balance_weight, top_k)
+        w.train_backprop_batch(indices_batch, errs_batch, adam, lr, weight_decay, balance, top_k)
     }
 }
 
@@ -943,6 +1119,8 @@ pub fn oracle_targets_from_errors(errs: &[f64], top_k: usize) -> Vec<f64> {
 mod tests {
     use super::*;
     use shogi_format::Color;
+
+    const NO_AUX: RouterBalance = RouterBalance::AuxLoss { weight: 0.0 };
 
     fn sample_board() -> ShogiBoard {
         let mut board = ShogiBoard {
@@ -1006,10 +1184,10 @@ mod tests {
         let batch = vec![indices.clone(), indices.clone(), indices];
         let target = vec![one_hot(9, 3), one_hot(9, 3), one_hot(9, 3)];
 
-        let stats0 = w.train_oracle_batch(&batch, &target, &mut adam, 0.05, 0.0, 0.0);
+        let stats0 = w.train_oracle_batch(&batch, &target, &mut adam, 0.05, 0.0, NO_AUX);
         let mut last = stats0.cross_entropy_loss;
         for _ in 0..20 {
-            last = w.train_oracle_batch(&batch, &target, &mut adam, 0.05, 0.0, 0.0).cross_entropy_loss;
+            last = w.train_oracle_batch(&batch, &target, &mut adam, 0.05, 0.0, NO_AUX).cross_entropy_loss;
         }
         assert!(
             last < stats0.cross_entropy_loss,
@@ -1033,11 +1211,11 @@ mod tests {
         errs[3] = 0.0;
         let errs_batch = vec![errs.clone(), errs.clone(), errs];
 
-        let stats0 = w.train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, 0.0, 9);
+        let stats0 = w.train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, NO_AUX, 9);
         let mut last = stats0.cross_entropy_loss;
         for _ in 0..40 {
             last = w
-                .train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, 0.0, 9)
+                .train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, NO_AUX, 9)
                 .cross_entropy_loss;
         }
         assert!(
@@ -1063,7 +1241,7 @@ mod tests {
         let errs = vec![0.0, 0.1, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 1.0];
         let errs_batch = vec![errs];
 
-        w.train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, 0.0, 2);
+        w.train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, NO_AUX, 2);
 
         for &idx in &indices {
             let base = idx as usize * 9;
@@ -1090,7 +1268,7 @@ mod tests {
         errs[3] = 0.0;
         let errs_batch = vec![errs];
 
-        let stats = w.train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, 0.0, 1);
+        let stats = w.train_backprop_batch(&batch, &errs_batch, &mut adam, 0.05, 0.0, NO_AUX, 1);
         assert_eq!(w.w, w_before, "top_k=1 should leave router weights unchanged");
         assert_eq!(stats.cross_entropy_loss, 0.0, "top_k=1 expected loss collapses to the sole selected bucket's error");
     }
@@ -1109,7 +1287,7 @@ mod tests {
         let batch = vec![indices.clone(), indices.clone(), indices];
         let target = vec![one_hot(9, 0), one_hot(9, 1), one_hot(9, 2)];
         let mut w2 = w.clone();
-        let stats = w2.train_oracle_batch(&batch, &target, &mut adam, 0.0, 0.0, 0.0);
+        let stats = w2.train_oracle_batch(&batch, &target, &mut adam, 0.0, 0.0, NO_AUX);
         assert!(
             stats.balance_loss > 1.0,
             "fully skewed usage should have balance_loss > 1.0 (min at perfectly uniform usage), got {}",
@@ -1156,5 +1334,151 @@ mod tests {
         RouterKPAbs::init_with_weights(RouterKPAbsWeights::zeroed(9)).unwrap_or(()); // 既に他 test で init 済のことがあるので握り潰す
         let board = sample_board();
         let _ = RouterKPAbs.bucket_board(&board, 8);
+    }
+
+    #[test]
+    fn raw_round_trip_preserves_bias() {
+        let mut w = RouterKPAbsWeights::random(5, 11);
+        w.bias = vec![0.25, -0.5, 0.0, 1.5, -1.25];
+        let mut buf = Vec::new();
+        w.write_to(&mut buf).unwrap();
+        let reloaded = RouterKPAbsWeights::read_from(&mut buf.as_slice()).unwrap();
+        assert_eq!(reloaded.w, w.w);
+        assert_eq!(reloaded.bias, w.bias);
+    }
+
+    #[test]
+    fn read_from_accepts_the_format_without_bias() {
+        let w = RouterKPAbsWeights::random(4, 3);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&ROUTER_BIN_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&(SHOGI_PROGRESS_KP_ABS_NUM_WEIGHTS as u32).to_le_bytes());
+        buf.extend_from_slice(&(w.num_buckets as u32).to_le_bytes());
+        write_f64_slice(&mut buf, &w.w).unwrap();
+        let reloaded = RouterKPAbsWeights::read_from(&mut buf.as_slice()).unwrap();
+        assert_eq!(reloaded.w, w.w);
+        assert_eq!(reloaded.bias, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn dispatch_bucket_adds_bias_and_ties_pick_lowest_index() {
+        assert_eq!(RouterKPAbsWeights::dispatch_bucket(&[1.0, 2.0, 0.5], &[0.0, 0.0, 0.0]), 1);
+        assert_eq!(RouterKPAbsWeights::dispatch_bucket(&[1.0, 2.0, 0.5], &[2.0, 0.0, 0.0]), 0);
+        assert_eq!(RouterKPAbsWeights::dispatch_bucket(&[1.0, 1.0, 1.0], &[0.0, 0.0, 0.0]), 0);
+    }
+
+    #[test]
+    fn update_dispatch_bias_lowers_overloaded_and_raises_underloaded_buckets() {
+        let mut bias = vec![0.0; 4];
+        // 均等使用率は 1/4。bucket 0, 1 は使われ過ぎ、bucket 2, 3 は使われ不足。
+        update_dispatch_bias(&mut bias, &[0.7, 0.3, 0.0, 0.0], 0.1);
+        assert!(bias[0] < 0.0 && bias[1] < 0.0);
+        assert!(bias[2] > 0.0 && bias[3] > 0.0);
+        // 中心化されているので合計は 0。
+        assert!(bias.iter().sum::<f64>().abs() < 1e-12);
+    }
+
+    #[test]
+    fn update_dispatch_bias_leaves_a_perfectly_balanced_usage_unchanged() {
+        let mut bias = vec![0.3, -0.1, -0.2];
+        let before = bias.clone();
+        update_dispatch_bias(&mut bias, &[1.0 / 3.0; 3], 0.5);
+        for (a, b) in bias.iter().zip(before.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn folded_bias_reproduces_biased_logits_for_a_constant_active_count() {
+        let mut w = RouterKPAbsWeights::random(4, 21);
+        w.bias = vec![0.5, -0.25, 0.125, -0.375];
+        // 常に ROUTER_ACTIVE_INDICES_PER_POSITION 個の index を足す局面を模した入力。
+        let indices: Vec<u32> = (0..ROUTER_ACTIVE_INDICES_PER_POSITION as u32).map(|i| i * 97 + 5).collect();
+
+        let biased: Vec<f64> = w
+            .forward_logits(&indices)
+            .iter()
+            .zip(w.bias.iter())
+            .map(|(&l, &b)| l + b)
+            .collect();
+
+        let folded = RouterKPAbsWeights {
+            num_buckets: w.num_buckets,
+            w: w.weights_with_folded_bias(),
+            bias: vec![0.0; w.num_buckets],
+        };
+        let folded_logits = folded.forward_logits(&indices);
+        for (a, b) in biased.iter().zip(folded_logits.iter()) {
+            assert!((a - b).abs() < 1e-9, "folded {b} vs biased {a}");
+        }
+        assert_eq!(
+            RouterKPAbsWeights::dispatch_bucket(&w.forward_logits(&indices), &w.bias),
+            folded.bucket_from_indices(&indices),
+        );
+    }
+
+    #[test]
+    fn every_sample_position_has_the_constant_active_index_count() {
+        // 畳み込みは「常に同じ個数の重みを足す」ことが前提。実局面 (sample.psv)
+        // の全 record で個数が一定であることを確認する。
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../shogi-format/tests/data/sample.psv"
+        ))
+        .expect("sample.psv must be readable");
+        assert_eq!(bytes.len() % 40, 0);
+        for (i, chunk) in bytes.chunks_exact(40).enumerate() {
+            let mut psv = PackedSfenValue::default();
+            psv.as_bytes_mut().copy_from_slice(chunk);
+            let indices = RouterKPAbs::active_indices_board(&psv.decode());
+            assert_eq!(
+                indices.len(),
+                ROUTER_ACTIVE_INDICES_PER_POSITION,
+                "record {i}: unexpected active index count"
+            );
+        }
+    }
+
+    #[test]
+    fn bias_free_training_lowers_the_bias_of_the_over_used_bucket() {
+        // 全 logits が 0 の router は全 position を bucket 0 へ dispatch する
+        // (使用率 [1, 0, 0, 0])。1 step で bucket 0 の bias だけが他より下がる。
+        let mut w = RouterKPAbsWeights::zeroed(4);
+        let mut adam = RouterAdamState::zeros(4);
+        let batch = vec![vec![0u32, 1, 2], vec![3u32, 4, 5]];
+        let target = vec![one_hot(4, 0), one_hot(4, 0)];
+        let bal = RouterBalance::BiasFree { update_rate: 0.01 };
+        let stats = w.train_oracle_batch(&batch, &target, &mut adam, 0.0, 0.0, bal);
+        assert_eq!(stats.bucket_usage, vec![1.0, 0.0, 0.0, 0.0]);
+        assert!(w.bias[0] < 0.0, "over-used bucket 0 should get a negative bias: {:?}", w.bias);
+        assert!(w.bias[1] > 0.0 && w.bias[2] > 0.0 && w.bias[3] > 0.0);
+        assert!(w.bias.iter().sum::<f64>().abs() < 1e-12);
+    }
+
+    #[test]
+    fn bias_free_training_moves_dispatch_away_from_a_collapsed_bucket() {
+        // 重みを動かさない (lr = 0) 状態でも、bias の更新だけで dispatch 先が
+        // 一度 bucket 0 から他の bucket へ移る。
+        let mut w = RouterKPAbsWeights::zeroed(3);
+        let mut adam = RouterAdamState::zeros(3);
+        let batch = vec![vec![0u32], vec![1u32], vec![2u32]];
+        let target = vec![one_hot(3, 0); 3];
+        let bal = RouterBalance::BiasFree { update_rate: 0.05 };
+        let mut min_usage_of_bucket0 = 1.0_f64;
+        for _ in 0..10 {
+            let stats = w.train_oracle_batch(&batch, &target, &mut adam, 0.0, 0.0, bal);
+            min_usage_of_bucket0 = min_usage_of_bucket0.min(stats.bucket_usage[0]);
+        }
+        assert!(min_usage_of_bucket0 < 1.0);
+    }
+
+    #[test]
+    fn aux_loss_mode_never_touches_bias() {
+        let mut w = RouterKPAbsWeights::zeroed(4);
+        let mut adam = RouterAdamState::zeros(4);
+        let batch = vec![vec![0u32, 1, 2]];
+        let target = vec![one_hot(4, 0)];
+        w.train_oracle_batch(&batch, &target, &mut adam, 0.05, 0.0, RouterBalance::AuxLoss { weight: 1.0 });
+        assert_eq!(w.bias, vec![0.0; 4]);
     }
 }

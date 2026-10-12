@@ -793,6 +793,28 @@ impl From<RouterModeArg> for shogi_features::router_kpabs::RouterMode {
     }
 }
 
+/// `--router-balance-mode` の選択肢。`--bucket-mode`にrouter成分がなければ無視される。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub(crate) enum RouterBalanceModeArg {
+    /// Switch Transformer 式の負荷分散補助損失 (`--router-balance-weight`)。
+    #[default]
+    #[value(name = "aux-loss")]
+    AuxLoss,
+    /// Auxiliary-Loss-Free Load Balancing: 補助損失を使わず、bucket ごとの
+    /// dispatch 用 bias を使用率に応じて更新する (`--router-bias-update-rate`)。
+    #[value(name = "bias-free")]
+    BiasFree,
+}
+
+impl From<RouterBalanceModeArg> for shogi_features::router_kpabs::RouterBalanceMode {
+    fn from(value: RouterBalanceModeArg) -> Self {
+        match value {
+            RouterBalanceModeArg::AuxLoss => Self::AuxLoss,
+            RouterBalanceModeArg::BiasFree => Self::BiasFree,
+        }
+    }
+}
+
 /// `--ft-fp16-out` が `--ft-fp16` を要求する制約を **実効値** (`--all-optim` の含意込み)
 /// で検証する。`true` を返したら制約違反 = error (FT activation FP16 が ON だが
 /// FT weight FP16 が OFF)。
@@ -1041,10 +1063,36 @@ pub(crate) struct LayerstackArgs {
     pub(crate) router_lr_gamma: f32,
 
     /// `router` only: L2 weight decay applied to the router's weight
-    /// table (`RouterKPAbsWeights::w`; there is no bias term) during its Adam
-    /// step. Ignored for other bucket modes.
+    /// table (`RouterKPAbsWeights::w`) during its Adam step. The dispatch bias
+    /// used by `--router-balance-mode bias-free` is not decayed. Ignored for
+    /// other bucket modes.
     #[arg(long, default_value_t = 1.0e-5)]
     pub(crate) router_weight_decay: f32,
+
+    /// `router` only: how the router is kept from collapsing onto a small
+    /// subset of its own buckets. `aux-loss` (default) adds the
+    /// Switch-Transformer-style auxiliary loss controlled by
+    /// `--router-balance-weight`. `bias-free` is Auxiliary-Loss-Free Load
+    /// Balancing: no auxiliary loss is used, and a per-bucket bias that only
+    /// affects which bucket is dispatched (not the softmax / gradients) is
+    /// nudged after every router step by `--router-bias-update-rate` toward
+    /// equal usage. At export time the bias is divided by the fixed number of
+    /// weights the engine sums per position (76) and added to every router
+    /// weight before quantisation, so the engine-side reader is unchanged.
+    /// With `bias-free`, `--router-balance-weight`,
+    /// `--router-balance-weight-gamma` and `--router-balance-weight-min` are
+    /// ignored. Only supported for `--bucket-mode ...routerkpabs<N>`. Ignored
+    /// for other bucket modes.
+    #[arg(long, value_enum, default_value_t = RouterBalanceModeArg::AuxLoss)]
+    pub(crate) router_balance_mode: RouterBalanceModeArg,
+
+    /// `router` only, used with `--router-balance-mode bias-free`: step size
+    /// `u` (in router-logit units) of the per-bucket dispatch bias update
+    /// `bias[k] += u * sign(1/N - usage_k)`, applied once per router step.
+    /// Larger values balance faster but make dispatch noisier. Ignored for
+    /// `--router-balance-mode aux-loss` and for other bucket modes.
+    #[arg(long, default_value_t = 0.001)]
+    pub(crate) router_bias_update_rate: f32,
 
     /// `router` only: coefficient `λ` for the Switch-Transformer-style
     /// load-balancing auxiliary loss (`L_balance = N * Σ_i f_i * P_i`, added to
@@ -1055,7 +1103,8 @@ pub(crate) struct LayerstackArgs {
     /// `--router-balance-weight-gamma` decay (and the
     /// `--router-balance-weight-min` clamp) fast-forwarded by the number of
     /// superbatches already completed, matching an uninterrupted run.
-    /// Ignored for other bucket modes.
+    /// Only used with `--router-balance-mode aux-loss`. Ignored for other
+    /// bucket modes.
     #[arg(long, default_value_t = 0.01)]
     pub(crate) router_balance_weight: f32,
 

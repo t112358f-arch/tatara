@@ -71,7 +71,10 @@
 use std::sync::Arc;
 
 use gpu_runtime::{CudaContext, CudaModule, CudaStream, DeviceBuffer, Result as GpuResult, cuda_launch};
-use shogi_features::router_kpabs::{RouterAdamState, RouterKPAbsWeights, RouterTrainStats, top_k_error_ranked_indices};
+use shogi_features::router_kpabs::{
+    RouterAdamState, RouterBalance, RouterKPAbsWeights, RouterTrainStats, top_k_error_ranked_indices,
+    update_dispatch_bias,
+};
 
 // `cuda_launch!` は `#[kernel]` marker 型 (`__<name>_CudaKernel`) を
 // 呼出側 module から bare 名で解決する (`kernels` module 内で `pub(crate) use
@@ -158,6 +161,12 @@ pub(crate) struct RouterGpuState {
     d_logits_buf: GrowBuffer<f64>,
     /// Adam の step 数 (host 側で管理、bias correction の事前計算に使う)。
     t: u64,
+    /// bucket ごとの dispatch 用 bias (`RouterKPAbsWeights::bias` と同じ意味、
+    /// 長さ `num_buckets`)。数 KB 未満なので device には置かず host が持つ。
+    /// dispatch の argmax にだけ加え、[`RouterBalance::BiasFree`] のときだけ
+    /// 1 step ごとに更新する。dataloader 側の bucket 割当へは
+    /// [`Self::bias`] を `RouterKPAbs::overwrite_bias` で書き戻して反映する。
+    bias: Vec<f64>,
 }
 
 impl RouterGpuState {
@@ -197,6 +206,7 @@ impl RouterGpuState {
             logits_buf,
             d_logits_buf,
             t: adam.t(),
+            bias: weights.bias.clone(),
         })
     }
 
@@ -355,8 +365,9 @@ impl RouterGpuState {
         oracle_targets: &[Vec<f64>],
         lr: f64,
         weight_decay: f64,
-        balance_weight: f64,
+        balance: RouterBalance,
     ) -> GpuResult<RouterTrainStats> {
+        let balance_weight = balance.aux_loss_weight();
         debug_assert_eq!(indices_batch.len(), oracle_targets.len());
         let n = indices_batch.len();
         let num_buckets = self.num_buckets;
@@ -377,7 +388,8 @@ impl RouterGpuState {
         let mut dispatch_count = vec![0u32; num_buckets];
         for bi in 0..n {
             let logits_i = &logits[bi * num_buckets..(bi + 1) * num_buckets];
-            let (dispatch_bucket, _, probs) = RouterKPAbsWeights::bucket_and_probs(logits_i);
+            let (_, _, probs) = RouterKPAbsWeights::bucket_and_probs(logits_i);
+            let dispatch_bucket = RouterKPAbsWeights::dispatch_bucket(logits_i, &self.bias);
             dispatch_count[dispatch_bucket as usize] += 1;
             all_probs.push(probs);
         }
@@ -429,6 +441,9 @@ impl RouterGpuState {
         }
 
         self.backward_and_adam(n, max_active, &d_logits_flat, lr, weight_decay)?;
+        if let RouterBalance::BiasFree { update_rate } = balance {
+            update_dispatch_bias(&mut self.bias, &f, update_rate);
+        }
 
         let balance_loss: f64 =
             num_buckets as f64 * f.iter().zip(avg_probs.iter()).map(|(&fi, &pi)| fi * pi).sum::<f64>();
@@ -445,9 +460,10 @@ impl RouterGpuState {
         errs_batch: &[Vec<f64>],
         lr: f64,
         weight_decay: f64,
-        balance_weight: f64,
+        balance: RouterBalance,
         top_k: usize,
     ) -> GpuResult<RouterTrainStats> {
+        let balance_weight = balance.aux_loss_weight();
         debug_assert_eq!(indices_batch.len(), errs_batch.len());
         let n = indices_batch.len();
         let num_buckets = self.num_buckets;
@@ -467,7 +483,8 @@ impl RouterGpuState {
         let mut dispatch_count = vec![0u32; num_buckets];
         for bi in 0..n {
             let logits_i = &logits[bi * num_buckets..(bi + 1) * num_buckets];
-            let (dispatch_bucket, _, probs) = RouterKPAbsWeights::bucket_and_probs(logits_i);
+            let (_, _, probs) = RouterKPAbsWeights::bucket_and_probs(logits_i);
+            let dispatch_bucket = RouterKPAbsWeights::dispatch_bucket(logits_i, &self.bias);
             dispatch_count[dispatch_bucket as usize] += 1;
             all_probs.push(probs);
         }
@@ -521,6 +538,9 @@ impl RouterGpuState {
         }
 
         self.backward_and_adam(n, max_active, &d_logits_flat, lr, weight_decay)?;
+        if let RouterBalance::BiasFree { update_rate } = balance {
+            update_dispatch_bias(&mut self.bias, &f, update_rate);
+        }
 
         let balance_loss: f64 =
             num_buckets as f64 * f.iter().zip(avg_probs.iter()).map(|(&fi, &pi)| fi * pi).sum::<f64>();
@@ -530,6 +550,12 @@ impl RouterGpuState {
             balance_loss,
             bucket_usage: f,
         })
+    }
+
+    /// 現在の dispatch 用 bias (host が保持)。[`Self::sync_to_host`] と同じ
+    /// タイミングで process-global へ書き戻す (`RouterKPAbs::overwrite_bias`)。
+    pub(crate) fn bias(&self) -> &[f64] {
+        &self.bias
     }
 
     /// GPU 上の重み / Adam moment / step 数を host へ read back する。

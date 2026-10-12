@@ -72,8 +72,9 @@ fn write_progress_block<W: Write>(writer: &mut W, bucket_mode: BucketMode) -> io
     Ok(())
 }
 
-/// `RouterKPAbsWeights` (bias無し、`w[idx * num_buckets + bucket]`、
-/// `idx = sq * FE_END + piece` の f64 flat 配列) を、C++側
+/// `RouterKPAbsWeights` (`w[idx * num_buckets + bucket]`、
+/// `idx = sq * FE_END + piece` の f64 flat 配列。dispatch 用 bias は重みへ
+/// 畳み込む) を、C++側
 /// `RouterKPAbs::Parameters::ReadParameters` が期待する生の
 /// `weights_q16_[SQ_NB][FE_END][num_buckets]` (Q16.16固定小数点、bias無し)
 /// 形式で書く。
@@ -98,7 +99,11 @@ fn write_router_kpabs_block<W: Write>(
             expected_len
         ));
     }
-    for &w in &router.w {
+    // 推論側は bias 項を持たず、1 局面につき常に
+    // `ROUTER_ACTIVE_INDICES_PER_POSITION` 個の重みを足すだけなので、学習時の
+    // dispatch 用 bias は `bias / ROUTER_ACTIVE_INDICES_PER_POSITION` を全重みへ
+    // 加算してから量子化する (bias が全 0 なら `router.w` そのまま)。
+    for w in router.weights_with_folded_bias() {
         writer.write_all(&quantize_q16(w).to_le_bytes())?;
     }
     Ok(())
@@ -982,5 +987,37 @@ mod tests {
         let err = save_yaneuraou_combined(&mut out, &weights, &layout, &router_w, &router_b)
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    /// router の dispatch 用 bias は、推論側が足す重みの個数
+    /// (`ROUTER_ACTIVE_INDICES_PER_POSITION`) で割って全重みへ加算した上で
+    /// 量子化される。bias が全 0 なら従来の出力 (重みだけの量子化) と同一。
+    #[test]
+    fn router_block_folds_bias_into_weights_before_quantising() {
+        use shogi_features::router_kpabs::ROUTER_ACTIVE_INDICES_PER_POSITION;
+
+        let n = 4;
+        let mut router = RouterKPAbsWeights::zeroed(n);
+        router.w[0] = 0.5;
+        let mut plain = Vec::new();
+        write_router_kpabs_block(&mut plain, &router).unwrap();
+
+        let per_position = ROUTER_ACTIVE_INDICES_PER_POSITION as f64;
+        router.bias = vec![0.0, per_position * 0.25, 0.0, -per_position * 0.125];
+        let mut folded = Vec::new();
+        write_router_kpabs_block(&mut folded, &router).unwrap();
+
+        assert_eq!(plain.len(), folded.len());
+        let read = |buf: &[u8], i: usize| i32::from_le_bytes(buf[i * 4..i * 4 + 4].try_into().unwrap());
+        // 先頭 index の 4 bucket 分: 重み 0.5 / 0 / 0 / 0 に bias/76 が加わる。
+        assert_eq!(read(&plain, 0), quantize_q16(0.5));
+        assert_eq!(read(&folded, 0), quantize_q16(0.5));
+        assert_eq!(read(&folded, 1), quantize_q16(0.25));
+        assert_eq!(read(&folded, 2), 0);
+        assert_eq!(read(&folded, 3), quantize_q16(-0.125));
+        // 最後の index (bias 加算は全 index に対して行われる)。
+        let last = SQ_NB * FE_END * n - n;
+        assert_eq!(read(&folded, last + 1), quantize_q16(0.25));
+        assert_eq!(read(&plain, last + 1), 0);
     }
 }
