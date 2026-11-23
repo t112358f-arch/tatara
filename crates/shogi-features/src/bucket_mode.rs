@@ -405,6 +405,48 @@ impl BucketMode {
         ))
     }
 
+    /// 選択側の実際の重み配列index `bucket_idx` について、router成分だけを候補
+    /// `k` (`0..router.bucket_count()`) に差し替えた実際の重み配列indexを返す
+    /// (hand/king/progress成分は不変)。router の E-step (oracle sweep) が使う。
+    ///
+    /// `wsb` 有効時は各外側ブロックが `inner+1` 個 (末尾が共有バケット) なので、
+    /// 単純な `bucket_idx / N * N + k` では添字がずれる。いったん密index
+    /// (`dense_selectable_index` の空間) に戻して router の桁だけ差し替え、
+    /// `remap_dense_index` で戻す。`wsb` 無しでは従来の `prefix*N + k` と一致する
+    /// (router が最下位桁のとき)。router成分が無い場合は `bucket_idx` をそのまま返す。
+    pub fn with_router_candidate(&self, bucket_idx: i32, k: usize) -> i32 {
+        let Some(router) = self.router else {
+            return bucket_idx;
+        };
+        let n = router.bucket_count();
+        debug_assert!((k as u32) < n, "router candidate {k} out of range (n={n})");
+        let b = bucket_idx as u32;
+        let dense = if self.shared_bucket {
+            let inner = self.inner_buckets();
+            let block = inner + 1;
+            debug_assert!(
+                b % block < inner,
+                "bucket_idx {b} is a shared bucket, not a selectable one"
+            );
+            (b / block) * inner + (b % block)
+        } else {
+            b
+        };
+        // router の桁より下位にあるカテゴリのバケット数の積 (router が最下位なら 1)。
+        let present = self.present_order();
+        let pos = present
+            .iter()
+            .position(|&c| c == Category::Router)
+            .expect("router present");
+        let stride: u32 = present[pos + 1..]
+            .iter()
+            .map(|&c| self.category_bucket_count(c))
+            .product();
+        let cur = (dense / stride) % n;
+        let new_dense = dense - cur * stride + (k as u32) * stride;
+        self.remap_dense_index(new_dense) as i32
+    }
+
     /// `wsb` 有効時に、局面によらず常に同じ1個の共有バケットindexだけを持つか
     /// (＝ `outer_buckets() == 1`)。GPU学習側の高速経路 (全行が同一bucketである
     /// 前提の cuBLAS 直接呼び出し) が使えるかどうかの判定に使う。
@@ -1131,6 +1173,46 @@ mod tests {
         // 選択側のindexは、progressブロック内で router の値がそのまま (0..15) 使われる。
         assert_eq!(mode.combine_bucket_index(&board, Some(0), Some(3)), 0 * 17 + 3);
         assert_eq!(mode.combine_bucket_index(&board, Some(1), Some(9)), 1 * 17 + 9);
+    }
+
+    #[test]
+    fn with_router_candidate_matches_layout() {
+        let board = dummy_board();
+        for spec in [
+            "progress8_routerkpabs16_wsb", // progressごとの共有 (inner+1 = 17 の隙間あり)
+            "progress8_wsb_routerkpabs16", // 全体共有
+            "progress8_routerkpabs16",     // wsb無し
+            "hand4_progress8_routerkpabs16_wsb",
+        ] {
+            let mode = BucketMode::parse(spec).unwrap();
+            let n = mode.router.unwrap().bucket_count();
+            for p in 0..8u32 {
+                for r in 0..n {
+                    let cur = mode.combine_bucket_index(&board, Some(p), Some(r)) as i32;
+                    for k in 0..n as usize {
+                        let want = mode.combine_bucket_index(&board, Some(p), Some(k as u32)) as i32;
+                        assert_eq!(mode.with_router_candidate(cur, k), want, "{spec} p={p} r={r} k={k}");
+                        assert!((want as u32) < mode.total_buckets());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn with_router_candidate_non_last_router_order() {
+        let board = dummy_board();
+        let mode = BucketMode::parse("orderRP_progress4_routerkpabs3_wsb").unwrap();
+        let n = mode.router.unwrap().bucket_count();
+        for p in 0..4u32 {
+            for r in 0..n {
+                let cur = mode.combine_bucket_index(&board, Some(p), Some(r)) as i32;
+                for k in 0..n as usize {
+                    let want = mode.combine_bucket_index(&board, Some(p), Some(k as u32)) as i32;
+                    assert_eq!(mode.with_router_candidate(cur, k), want);
+                }
+            }
+        }
     }
 
     #[test]

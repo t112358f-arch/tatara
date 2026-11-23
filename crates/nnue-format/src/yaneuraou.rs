@@ -3,11 +3,14 @@
 use std::io::{self, Write};
 
 use shogi_features::FeatureSet;
+use shogi_features::ThreatProfile;
 use shogi_features::bucket_mode::BucketMode;
 use shogi_features::router_kpabs::RouterKPAbsWeights;
 
 use crate::LayerStackWeights;
-use crate::layerstack_weights::{QA, QB, write_leb128_tensor_i16};
+use crate::layerstack_weights::{
+    QA, QB, clamp_i8_symmetric, warn_if_i8_saturates, write_leb128_tensor_i16,
+};
 
 const YO_VERSION: u32 = 0x7af3_2f16;
 const YO_TOP_HASH: u32 = 0x3c20_3b32;
@@ -243,7 +246,13 @@ pub fn save_yaneuraou<W: Write>(
 
     write_u32(writer, YO_FT_HASH)?;
     write_leb128_tensor_i16(writer, &quantize_i16(&weights.ft_b, QA as f64))?;
-    write_leb128_tensor_i16(writer, &quantize_i16(&weights.ft_w, QA as f64))?;
+    // FT 重みは base 部分 (i16, LEB128) のみ。Threat 部分は直後に別 block (raw i8) で書く。
+    let base_ft_w_len = arch.feature_set.spec().base_ft_in() * ft_out;
+    write_leb128_tensor_i16(
+        writer,
+        &quantize_i16(&weights.ft_w[..base_ft_w_len], QA as f64),
+    )?;
+    write_threat_block(writer, &arch, &weights.ft_w[base_ft_w_len..])?;
 
     write_progress_block(writer, bucket_mode)?;
 
@@ -345,6 +354,12 @@ pub fn save_yaneuraou_combined<W: Write>(
     if weights.psqt_w.is_some() {
         return invalid_input("PSQT models are not representable in YaneuraOu SFNN");
     }
+    if weights.feature_set.threat_profile().is_some() {
+        // FT 列を router 列と物理結合する形式では Threat の列配置が定義されていない。
+        return invalid_input(
+            "Threat features are not supported together with routerft<R>ft<R> in YaneuraOu export",
+        );
+    }
     if weights.num_buckets != layout.num_buckets {
         return invalid_input(format!(
             "weights.num_buckets ({}) does not match layout.num_buckets ({})",
@@ -411,6 +426,7 @@ pub fn save_yaneuraou_combined<W: Write>(
     validate_weights(
         &Architecture {
             feature_set,
+            threat: None,
             ft_out: ft_out_nominal,
             l1_out,
             l2_out,
@@ -433,6 +449,7 @@ pub fn save_yaneuraou_combined<W: Write>(
     write_u32(writer, YO_TOP_HASH)?;
     let arch = Architecture {
         feature_set,
+        threat: None,
         ft_out: ft_out_nominal,
         l1_out,
         l2_out,
@@ -494,6 +511,9 @@ fn ft_by_ft_arch_string(arch: &Architecture, bucket_mode: BucketMode) -> String 
 #[derive(Debug)]
 struct Architecture {
     feature_set: FeatureSet,
+    /// Threat 特徴量 (`--threat-profile`)。`None` なら Threat 無し。
+    /// `feature_set` は Threat を含まない base feature set (YaneuraOu の RawFeatures に対応)。
+    threat: Option<ThreatProfile>,
     ft_out: usize,
     l1_out: usize,
     l2_out: usize,
@@ -501,9 +521,18 @@ struct Architecture {
 }
 
 fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
+    // Threat は base feature set に連結される modifier なので、base の spec に weights と同じ
+    // profile を付けて比較し、YaneuraOu の feature を探す。
+    let threat = weights.feature_set.threat_profile();
     let feature_set = FeatureSet::ALL
         .into_iter()
-        .find(|feature_set| feature_set.spec() == weights.feature_set)
+        .find(|feature_set| {
+            let spec = match threat {
+                Some(profile) => feature_set.spec().with_threat_profile(profile),
+                None => feature_set.spec(),
+            };
+            spec == weights.feature_set
+        })
         .ok_or_else(|| invalid_input_err("feature set is not representable in YaneuraOu SFNN"))?;
     let ft_out = weights.ft_b.len();
     let l1_out = weights.l1f_b.len();
@@ -516,6 +545,7 @@ fn architecture(weights: &LayerStackWeights) -> io::Result<Architecture> {
     let l2_out = weights.l2_b.len().checked_div(num_buckets).unwrap_or(0);
     Ok(Architecture {
         feature_set,
+        threat,
         ft_out,
         l1_out,
         l2_out,
@@ -560,9 +590,22 @@ fn arch_string(arch: &Architecture, bucket_mode: BucketMode) -> String {
         )
         .to_ascii_uppercase()
     };
+    // Threat token は rshogi / tatara 形式と同じ (`Threat=<dims>`、profile id が 0 以外のときだけ
+    // `ThreatProfile=<id>` を付ける)。`[input_size->...]` は Threat を含まない base の次元数。
+    // YaneuraOu 側 (`FeatureTransformer::GetStructureString`) が同じ位置に同じ表記を出す。
+    let threat_token = match arch.threat {
+        None => String::new(),
+        Some(profile) => {
+            let dims = shogi_features::threat_dimensions_of(profile);
+            if profile.profile_id() == 0 {
+                format!(",Threat={dims}")
+            } else {
+                format!(",Threat={dims},ThreatProfile={}", profile.profile_id())
+            }
+        }
+    };
     format!(
-        "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2],Network={network}{{LayerStack={}}}",
-
+        "ModelType=SFNNWithoutPsqt;Features={}(Friend)[{input_size}->{}x2]{threat_token},Network={network}{{LayerStack={}}}",
         feature.yo_name, arch.ft_out, arch.num_buckets
     )
 }
@@ -622,10 +665,12 @@ fn validate_weights(
         ));
     }
     let l2_in = (arch.l1_out - 1) * 2;
-    let spec = arch.feature_set.spec();
+    // ft_w は base 行に Threat 行を連結したもの (`weights.feature_set.ft_in()` と一致するはず)。
+    let ft_in_with_threat = arch.feature_set.spec().base_ft_in()
+        + arch.threat.map_or(0, shogi_features::threat_dimensions_of);
     let lengths = [
         ("ft_b", weights.ft_b.len(), arch.ft_out),
-        ("ft_w", weights.ft_w.len(), spec.ft_in() * arch.ft_out),
+        ("ft_w", weights.ft_w.len(), ft_in_with_threat * arch.ft_out),
         (
             "l1_b",
             weights.l1_b.len(),
@@ -698,6 +743,35 @@ where
         return invalid_input("affine weight iterator has extra values");
     }
     Ok(())
+}
+
+/// Threat 重み block (`arch.threat == None` では何も書かない)。
+///
+/// レイアウトは rshogi / tatara 形式と同じ: profile id が 0 以外のときだけ **u32 LE の profile id**
+/// を書き、続けて Threat 重みを **raw i8 (feature-major)** で書く。量子化スケールは base FT と
+/// 同じ `QA` (YaneuraOu / rshogi は Threat の i8 を base FT と同じ i16 accumulator に直接加算
+/// するため、別係数を入れると評価が壊れる)。値は ±127 に clamp する。
+///
+/// 配置は FT 重み (LEB128) の直後・progress / router / network 群の前。YaneuraOu 側は
+/// `FeatureTransformer::ReadParameters` がこの block まで読む。
+fn write_threat_block<W: Write>(
+    writer: &mut W,
+    arch: &Architecture,
+    threat_w: &[f32],
+) -> io::Result<()> {
+    let Some(profile) = arch.threat else {
+        debug_assert!(threat_w.is_empty());
+        return Ok(());
+    };
+    warn_if_i8_saturates("threat_ft_w", threat_w, QA as f64);
+    if profile.profile_id() != 0 {
+        write_u32(writer, profile.profile_id())?;
+    }
+    let bytes: Vec<u8> = threat_w
+        .iter()
+        .map(|&v| clamp_i8_symmetric((QA as f64 * v as f64).round()) as u8)
+        .collect();
+    writer.write_all(&bytes)
 }
 
 fn quantize_i16(values: &[f32], scale: f64) -> Vec<i16> {

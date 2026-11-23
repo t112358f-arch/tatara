@@ -1192,9 +1192,9 @@ where
                 let target_scale = oracle_target_scale(cfg.loss);
                 // `errs[k][i]` = このpositionの合成bucketのうち router 成分だけを
                 // 候補 k に固定し、hand/king/progress由来のprefixはそのpositionの
-                // 実際の値のまま (= `buckets[i] / rc.router_n`) forward したときの
+                // 実際の値のまま (= `buckets[i]` の router 桁以外) forward したときの
                 // 誤差。router は必ず最後 (最下位桁) に合成するので、
-                // `full_bucket = prefix * rc.router_n + k`。Top-K/soft-EM
+                // `full_bucket = BucketMode::with_router_candidate(buckets[i], k)`。Top-K/soft-EM
                 // ターゲットを作るには router_n 個すべての候補の誤差が要る
                 // (hard-EM の argmin だけでは足りない)。
                 //
@@ -1207,14 +1207,16 @@ where
                 // (対応しない backend ではデフォルト実装が `validate_step` に
                 // そのまま委譲するので、数値結果は常に同一)。
                 let router_n = rc.router_n;
-                let prefixes: Vec<i32> = buckets[..n_pos]
-                    .iter()
-                    .map(|&b| b / router_n as i32)
-                    .collect();
+                // wsb (局面ごとの共有バケット) 有効時は重み配列indexに共有バケットの
+                // 隙間が入るので、`b / router_n * router_n + k` ではずれる。
+                // `BucketMode::with_router_candidate` が実際のレイアウトで router の
+                // 桁だけを k に差し替える。
                 let mut errs: Vec<Vec<f64>> = Vec::with_capacity(router_n);
                 for k in 0..router_n {
-                    let k_buckets: Vec<i32> =
-                        prefixes.iter().map(|&p| p * router_n as i32 + k as i32).collect();
+                    let k_buckets: Vec<i32> = buckets[..n_pos]
+                        .iter()
+                        .map(|&b| resolved_bucket_mode.with_router_candidate(b, k))
+                        .collect();
                     let out = if k == 0 {
                         backend.validate_step(&batch, &k_buckets, wdl, cfg.loss)?
                     } else {
@@ -1302,14 +1304,16 @@ where
                 let pred_scale = oracle_pred_scale(cfg.loss);
                 let target_scale = oracle_target_scale(cfg.loss);
                 let router_n = rc.router_n;
-                let prefixes: Vec<i32> = buckets[..n_pos]
-                    .iter()
-                    .map(|&b| b / router_n as i32)
-                    .collect();
+                // wsb (局面ごとの共有バケット) 有効時は重み配列indexに共有バケットの
+                // 隙間が入るので、`b / router_n * router_n + k` ではずれる。
+                // `BucketMode::with_router_candidate` が実際のレイアウトで router の
+                // 桁だけを k に差し替える。
                 let mut errs: Vec<Vec<f64>> = Vec::with_capacity(router_n);
                 for k in 0..router_n {
-                    let k_buckets: Vec<i32> =
-                        prefixes.iter().map(|&p| p * router_n as i32 + k as i32).collect();
+                    let k_buckets: Vec<i32> = buckets[..n_pos]
+                        .iter()
+                        .map(|&b| resolved_bucket_mode.with_router_candidate(b, k))
+                        .collect();
                     let out = if k == 0 {
                         backend.validate_step(&batch, &k_buckets, wdl, cfg.loss)?
                     } else {

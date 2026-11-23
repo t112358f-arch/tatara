@@ -1315,7 +1315,7 @@ fn clamp_i8(v: f64) -> i8 {
 /// threat block 用の symmetric clamp (`[-127, 127]`)。base FT と同じ QA=127 スケールで
 /// 量子化するため i8 の非対称下限 (-128) は使わず ±127 に揃える。飽和モニタ
 /// (`i8_saturation_stats` の ±127 判定) と契約コメント (「±127 に clamp」) を一致させる。
-fn clamp_i8_symmetric(v: f64) -> i8 {
+pub(crate) fn clamp_i8_symmetric(v: f64) -> i8 {
     if v < -127.0 {
         -127
     } else if v > 127.0 {
@@ -1401,7 +1401,7 @@ fn i8_saturation_stats(values: &[f32], scale: f64) -> (usize, f64) {
 /// threat weight の i8 量子化で飽和が起きていれば stderr に warn (発生 0 なら無出力)。
 /// clamp 発生率と max-abs を出して「i8 で表現力十分か」を実 run で裏取りできるように
 /// する (threat は base FT と同一スケールのため別係数で逃げられない)。
-fn warn_if_i8_saturates(name: &str, values: &[f32], scale: f64) {
+pub(crate) fn warn_if_i8_saturates(name: &str, values: &[f32], scale: f64) {
     let (n, max_abs) = i8_saturation_stats(values, scale);
     if n > 0 {
         let bound = i8::MAX as f64 / scale;

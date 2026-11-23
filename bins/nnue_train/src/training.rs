@@ -412,10 +412,12 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     };
     let effect_bucket_config = parse_effect_bucket_config(&layerstack.effect_bucket_config)?;
     if cli.output_format == OutputFormatArg::Yaneuraou
-        && (layerstack.psqt || threat_profile.is_some() || effect_bucket_config.is_some())
+        && (layerstack.psqt || effect_bucket_config.is_some())
     {
+        // threat-profile は表現できる (FT 直後に i8 の Threat block を置く。
+        // 形式は nnue-format の `save_yaneuraou` と YaneuraOu の `threat.h` を参照)。
         return Err(
-            "--output-format yaneuraou supports plain LayerStack only; PSQT, threat-profile, and effect-bucket models are not representable in YaneuraOu SFNN"
+            "--output-format yaneuraou supports LayerStack (optionally with --threat-profile) only; PSQT and effect-bucket models are not representable in YaneuraOu SFNN"
                 .into(),
         );
     }
@@ -490,6 +492,15 @@ pub(crate) fn run_training(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> 
     let num_buckets = bucket_mode.total_buckets() as usize;
     validate_output_format(cli.output_format, bucket_mode)?;
     let ft_by_ft_layout = validate_router_arch(bucket_mode, layerstack.ft_out)?;
+    if cli.output_format == OutputFormatArg::Yaneuraou
+        && threat_profile.is_some()
+        && ft_by_ft_layout.is_some()
+    {
+        return Err(
+            "--output-format yaneuraou cannot combine --threat-profile with routerft<R>ft<R> (FT column layout for Threat is not defined)"
+                .into(),
+        );
+    }
     if let Some(layout) = ft_by_ft_layout {
         println!(
             "[train] router-arch=ft-by-ft: R={}, per-perspective accumulator {} -> {} \

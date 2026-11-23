@@ -350,3 +350,17 @@ end-to-endケース (`--bucket-mode k3k3_wsb` 等で数stepのforward/backward�
 実行し、`net_output`が2branchの単純平均と一致すること、
 `--bucket-mode k3k3` (wsb無し) の既存学習結果に一切変化が無いこと (回帰
 確認) の両方) を追加してから実運用の学習に使うこと。
+
+## 追記: 仕様変更と router E-step の添字 (修正済)
+
+現行の `BucketMode` では `wsb` は直前カテゴリ単位の共有バケットになり (詳細は
+`crates/shogi-features/src/bucket_mode.rs` の冒頭doc)、`progress8_routerkpabs16_wsb`
+のような配置では外側ブロックごとに共有バケットが挟まる (重み配列indexは
+`outer*(inner+1)+inner_idx`)。本文の「共有バケットは常に最後の1個」は
+`wsb` を先頭に置いた場合 (全体共有) のみ該当する。
+
+router の E-step は以前 `b / N * N + k` で候補バケットを作っていたため、
+progressごとの共有 (`..._routerkpabs16_wsb`) では添字がずれ、候補 k が別バケット
+(共有バケットを含む) を評価して router の教師信号が壊れていた。現在は
+`BucketMode::with_router_candidate` で実際のレイアウトに沿って router の桁だけを
+差し替える。

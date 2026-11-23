@@ -32,10 +32,45 @@ cargo run --release -p nnue-trainer -- \
   --bucket-mode kingrank9
 ```
 
-`--output-format` の既定値は `tatara`。`yaneuraou` は plain LayerStack と KingRank9 の
-組合せだけを受理し、`progress8kpabs`、Simple、PSQT、Threat、EffectBucket は明示的に
-エラーにする。学習 config から bucket routing mode を判定できるため、この経路では
+`--output-format` の既定値は `tatara`。`yaneuraou` は plain LayerStack (`--threat-profile`
+付きも可、後述) を受理し、Simple、PSQT、EffectBucket は明示的にエラーにする。
+`--threat-profile` と `routerft<R>ft<R>` の併用もエラー (FT 列の物理結合に Threat 列の配置が
+定義されていないため)。学習 config から bucket routing mode を判定できるため、この経路では
 `--assume-kingrank9` は不要。
+
+### Threat 特徴量付きの YaneuraOu 出力
+
+`--output-format yaneuraou --threat-profile <profile>` で、Threat 特徴量付きの
+YaneuraOu 形式 `nn.bin` を直接出力できる。profile は全種類 (`full`, `same-class`,
+`same-class-major-pawn`, `step-attacker`, `full-symdedup`, `cross-side`) に対応する。
+
+- **Threat 部分のレイアウトは rshogi / tatara と同一**: FT の LEB128 重み (base 部分のみ)
+  の直後に、profile id が 0 (`full`) 以外のときだけ `u32 LE` の profile id、続けて
+  Threat 重みを `i8` の raw (feature-major `[threat_index][ft_out]`) で置く。
+  量子化は base FT と同じ `QA` (=127)、±127 に clamp する。
+- **それ以外は YaneuraOu 形式を維持する**: ヘッダ (version / hash / arch 文字列)、
+  FT hash、FT の LEB128 分割、progress / router block、`LayerStack` の fc 群は
+  Threat 無しの出力と同一。Threat block は FT と progress / router block の間に入る。
+- arch 文字列は `Features=HalfKA_hm2(Friend)[73305->1536x2],Threat=216720[,ThreatProfile=<id>],Network=...`
+  となる (`[..]` は Threat を含まない base の次元数。profile 0 では `ThreatProfile=` を省略)。
+
+| profile | id | Threat 次元数 |
+|---|---|---|
+| `full` | 0 | 216720 |
+| `same-class` | 1 | 192640 |
+| `same-class-major-pawn` | 2 | 173568 |
+| `step-attacker` | 3 | 33408 |
+| `full-symdedup` | 4 | 216720 |
+| `cross-side` | 10 | 96320 |
+
+YaneuraOu 側は、アーキテクチャ名に `threat` (profile 0) または `threat<id>`
+(例: `threat4`) を付けたエディションでビルドする。
+例: `YANEURAOU_EDITION=YANEURAOU_ENGINE_SFNN_halfkahm2_1536_15_32_progress8_threat4`。
+nn.bin の `Threat=` / `ThreatProfile=` とビルドの profile が食い違うと、読み込み時に
+エラーになる。幅は全幅 (Threat 重みの列数 = `ft_out`) のみ対応。
+
+> `net_to_yo` / `net_from_yo` による後変換はまだ Threat 非対応。Threat 付き net を
+> YaneuraOu 形式にするには、学習時に `--output-format yaneuraou` を指定する。
 
 ## `net_from_yo` — YaneuraOu → tatara
 
